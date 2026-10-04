@@ -12,7 +12,7 @@ pub mod clock;
 pub mod index;
 pub mod policy;
 
-pub use clock::{Clock, FakeClock, SystemClock, now_unix_secs};
+pub use clock::{now_unix_secs, Clock, FakeClock, SystemClock};
 pub use index::{CacheIndex, CacheRecord, EntryState};
 pub use policy::{ActiveGuard, EvictionOutcome, Evictor, LiveState};
 
