@@ -1,9 +1,9 @@
 //! Worker -> UI event channel and the bounded diagnostic log.
 //! All events are real worker facts; nothing is fabricated by timers.
 
+use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
@@ -29,26 +29,61 @@ pub struct LogLine {
 pub enum AppEvent {
     Connecting,
     Connected,
-    ConnectFailed { reason: String },
+    ConnectFailed {
+        reason: String,
+    },
     SignInRequired,
 
     CatalogueLoading,
-    CatalogueLoaded { platforms: usize, roms: usize, skipped_unsupported: usize },
-    CatalogueFailed { reason: String },
+    CatalogueLoaded {
+        platforms: usize,
+        roms: usize,
+        skipped_unsupported: usize,
+    },
+    CatalogueFailed {
+        reason: String,
+    },
 
-    MountStarting { path: String },
-    MountStarted { path: String },
-    MountFailed { reason: String },
+    MountStarting {
+        path: String,
+    },
+    MountStarted {
+        path: String,
+    },
+    MountFailed {
+        reason: String,
+    },
     MountStopping,
     MountStopped,
 
-    DownloadStarted { rom_id: u64, file_name: String, total: Option<u64> },
-    DownloadProgress { rom_id: u64, received: u64, total: Option<u64> },
-    DownloadFinished { rom_id: u64, file_name: String },
-    DownloadFailed { rom_id: u64, file_name: String, reason: String },
+    DownloadStarted {
+        rom_id: u64,
+        file_name: String,
+        total: Option<u64>,
+    },
+    DownloadProgress {
+        rom_id: u64,
+        received: u64,
+        total: Option<u64>,
+    },
+    DownloadFinished {
+        rom_id: u64,
+        file_name: String,
+    },
+    DownloadFailed {
+        rom_id: u64,
+        file_name: String,
+        reason: String,
+    },
 
-    Evicted { rom_id: u64, file_name: String },
-    EvictFailed { rom_id: u64, reason: String },
+    Evicted {
+        rom_id: u64,
+        file_name: String,
+    },
+    EvictFailed {
+        rom_id: u64,
+        reason: String,
+    },
 
     /// A diagnostic line for the log view.
     Log(LogLine),
@@ -126,7 +161,10 @@ pub struct LogBuffer {
 
 impl LogBuffer {
     pub fn new(cap: usize) -> Self {
-        Self { cap: cap.max(16), lines: VecDeque::new() }
+        Self {
+            cap: cap.max(16),
+            lines: VecDeque::new(),
+        }
     }
     pub fn push(&mut self, line: LogLine) {
         if self.lines.len() == self.cap {

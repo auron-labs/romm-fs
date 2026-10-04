@@ -680,12 +680,10 @@ impl RommfsWindow {
 
         // Worker events arrive on the channel; poll it on the UI executor —
         // every applied event is a real fact, nothing fabricated (R5).
-        cx.spawn(async move |this: WeakEntity<RommfsWindow>, cx| {
-            loop {
-                Timer::after(POLL_INTERVAL).await;
-                if this.update(cx, |view, cx| view.drain_events(cx)).is_err() {
-                    break;
-                }
+        cx.spawn(async move |this: WeakEntity<RommfsWindow>, cx| loop {
+            Timer::after(POLL_INTERVAL).await;
+            if this.update(cx, |view, cx| view.drain_events(cx)).is_err() {
+                break;
             }
         })
         .detach();
