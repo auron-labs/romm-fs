@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rommfs-core",
+    "crates/rommfs-fixture",
+    "crates/rommfs-fsk",
+    "crates/rommfs-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+isahc = { version = "1.8", features = ["json"] }
+parking_lot = "0.12"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tracing = "0.1"
+fsk = "0.0.9"
+gpui = "0.2.2"
+rommfs-core = { path = "crates/rommfs-core" }
+rommfs-fixture = { path = "crates/rommfs-fixture" }
+windows-sys = { version = "0.61", features = [
+    "Win32_Storage_ProjectedFileSystem",
+    "Win32_Foundation",
+    "Win32_System_Memory",
+] }
