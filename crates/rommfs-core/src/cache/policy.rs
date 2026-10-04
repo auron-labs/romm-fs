@@ -77,7 +77,7 @@ impl LiveState {
     /// the whole removal so no acquire can interleave mid-delete.
     fn map_lock_if_inactive<R>(&self, key: &RomKey, action: impl FnOnce() -> R) -> Option<R> {
         let map = self.active.lock().unwrap();
-        if map.get(&key).copied().unwrap_or(0) > 0 {
+        if map.get(key).copied().unwrap_or(0) > 0 {
             return None;
         }
         Some(action())

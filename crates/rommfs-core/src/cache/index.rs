@@ -274,5 +274,5 @@ impl CacheIndex {
 }
 
 fn sqlite(e: rusqlite::Error) -> crate::error::Error {
-    crate::error::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+    crate::error::Error::Io(std::io::Error::other(e))
 }

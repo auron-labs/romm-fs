@@ -147,7 +147,7 @@ fn ensure_ready_fetches_once_then_serves_the_cached_bin() {
         gate: None,
         entered: None,
     });
-    let (dm, _rx) = manager(source.clone(), dir.path(), &[e.clone()]);
+    let (dm, _rx) = manager(source.clone(), dir.path(), std::slice::from_ref(&e));
 
     let path = dm.ensure_ready(&e).unwrap();
     assert_eq!(source.calls.load(Ordering::SeqCst), 1);
@@ -186,7 +186,7 @@ fn concurrent_callers_share_a_single_fetch() {
         gate: Some(gate.clone()),
         entered: Some(entered_tx),
     });
-    let (dm, _rx) = manager(source.clone(), dir.path(), &[e.clone()]);
+    let (dm, _rx) = manager(source.clone(), dir.path(), std::slice::from_ref(&e));
 
     let mut handles = Vec::new();
     for _ in 0..N {
@@ -228,7 +228,7 @@ fn failed_download_leaves_no_ready_entry_and_retry_succeeds() {
         calls: AtomicUsize::new(0),
         broken: AtomicBool::new(true),
     });
-    let (dm, rx) = manager(source.clone(), dir.path(), &[e.clone()]);
+    let (dm, rx) = manager(source.clone(), dir.path(), std::slice::from_ref(&e));
 
     let err = dm.ensure_ready(&e).unwrap_err();
     assert_eq!(source.calls.load(Ordering::SeqCst), 1);
@@ -264,7 +264,7 @@ fn short_write_is_reported_as_truncated_not_ready() {
         bytes: short.to_vec(),
         calls: AtomicUsize::new(0),
     });
-    let (dm, _rx) = manager(source.clone(), dir.path(), &[e.clone()]);
+    let (dm, _rx) = manager(source.clone(), dir.path(), std::slice::from_ref(&e));
 
     let err = dm.ensure_ready(&e).unwrap_err();
     match err {
@@ -299,7 +299,7 @@ fn real_client_fetches_through_the_content_source_impl() {
     let dir = tempfile::tempdir().unwrap();
     let k = key(7, 70);
     let e = entry(k.clone(), "Game.nes", BYTES.len() as u64, Some("v1"));
-    let (dm, _rx) = manager(Arc::new(client), dir.path(), &[e.clone()]);
+    let (dm, _rx) = manager(Arc::new(client), dir.path(), std::slice::from_ref(&e));
 
     let path = dm.ensure_ready(&e).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), BYTES);
@@ -322,7 +322,7 @@ fn download_events_follow_the_real_transfer() {
         gate: None,
         entered: None,
     });
-    let (dm, rx) = manager(source, dir.path(), &[e.clone()]);
+    let (dm, rx) = manager(source, dir.path(), std::slice::from_ref(&e));
     dm.ensure_ready(&e).unwrap();
 
     let events = drain(&rx);

@@ -295,9 +295,7 @@ pub fn server_id_of(base_url: &str) -> String {
         Some(i) => (s[..i].to_ascii_lowercase(), &s[i + 3..]),
         None => ("http".to_string(), s),
     };
-    let authority_end = rest
-        .find(|c| c == '/' || c == '?' || c == '#')
-        .unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     // Strip any userinfo.
     let authority = rest[..authority_end].rsplit('@').next().unwrap_or_default();
 

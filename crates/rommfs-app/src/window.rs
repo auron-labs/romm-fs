@@ -801,9 +801,9 @@ impl RommfsWindow {
             .child(SharedString::from(title.to_uppercase()))
     }
 
-    fn button<'a>(
+    fn button(
         &self,
-        label: &'a str,
+        label: &str,
         enabled: bool,
         on: Option<impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static>,
     ) -> Div {
