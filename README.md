@@ -89,9 +89,12 @@ instant (metadata only); the first launch of a game downloads its file once.
 - Creating brand-new files inside the root cannot be vetoed (ProjFS
   `PRJ_NOTIFY_NEW_FILE_CREATED` is post-only); the tree stays read-only
   for projected entries — deletes/renames/writes on them are rejected.
-- After unmount, hydrated files remain as ordinary on-disk copies until
-  deleted (standard ProjFS behavior; while mounted, eviction removes them
-  correctly via `PrjDeleteFile`).
+- After unmount, ProjFS leaves its virtualization-root reparse tag plus any
+  hydrated files as ordinary on-disk copies. Re-marking that root fails
+  (`ERROR_FILE_SYSTEM_VIRTUALIZATION_BUSY`), so the next mount of an owned
+  root clears the residue and retries while the old namespace tears down;
+  hydrated leftovers are re-projected lazily (the private cache still
+  serves them without re-downloading).
 - Tokens live in memory for the session only; nothing is stored between
   runs except the content cache and the mount-root marker.
 - Windows-only mount backend (`rommfs-fsk` is a `cfg(windows)` target dep);

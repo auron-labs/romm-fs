@@ -154,6 +154,46 @@ impl ProjfsHandle {
     }
 }
 
+/// Delete a mount root we own (marker file present) and recreate it
+/// empty, preserving the marker. Returns false — without touching
+/// anything — when the marker is absent so a foreign directory is never
+/// wiped. Deleting a mid-teardown root also returns transient
+/// virtualization errors, so each phase retries until `deadline`.
+/// Used to recover a stale ProjFS root (see mount_with_handle).
+fn recreate_owned_root(root: &Path, deadline: Instant) -> io::Result<bool> {
+    let marker = root.join(ROOT_MARKER);
+    if !marker.is_file() {
+        return Ok(false);
+    }
+    let owner = std::fs::read(&marker).unwrap_or_default();
+    tracing::info!(root = %root.display(), "clearing stale mount root");
+    loop {
+        let res = (|| -> io::Result<()> {
+            if root.exists() {
+                std::fs::remove_dir_all(root)?;
+            }
+            std::fs::create_dir_all(root)?;
+            std::fs::write(&marker, &owner)?;
+            Ok(())
+        })();
+        match res {
+            Err(e) if is_transient_virtualization_error(&e) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            res => return res.map(|_| true),
+        }
+    }
+}
+
+/// True for mount failures meaning "the previous namespace at this path is
+/// still being torn down": ERROR_FILE_SYSTEM_VIRTUALIZATION_BUSY (0x11b —
+/// fsk wraps the HRESULT in `Error::other`, so match the embedded code)
+/// and ERROR_FILE_SYSTEM_VIRTUALIZATION_UNAVAILABLE (369, which arrives as
+/// a raw OS error).
+fn is_transient_virtualization_error(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(369) | Some(0x11b)) || err.to_string().contains("0x8007112b")
+}
+
 /// Evicts the ProjFS-hydrated copy of a file via `PrjDeleteFile` — the
 /// "provider-aware" removal PRD R4 requires. Ordinary `DeleteFile` is
 /// forbidden here (a tombstone would hide the projected ROM).
@@ -239,13 +279,46 @@ impl WindowsMount {
         handle: Arc<ProjfsHandle>,
     ) -> anyhow::Result<(Self, Arc<ProjfsHandle>)> {
         let root = root.as_ref().to_path_buf();
-        let adapter = RommFsk {
-            core: fs,
+        let make_adapter = || RommFsk {
+            core: Arc::clone(&fs),
             handle: Arc::clone(&handle),
             opens: parking_lot::Mutex::new(HashMap::new()),
         };
-        let session = fsk::MountSession::mount(adapter, &root)
-            .map_err(|e| anyhow::anyhow!("ProjFS mount at {} failed: {e}", root.display()))?;
+        // ProjFS leaves the virtualization-root reparse tag on the
+        // directory after `PrjStopVirtualizing` (by design, so the
+        // hydrated on-disk state could be reused). fsk calls
+        // `PrjMarkDirectoryAsPlaceholder` unconditionally, and marking
+        // such a root fails with ERROR_FILE_SYSTEM_VIRTUALIZATION_BUSY —
+        // permanently wedging the root. Namespace teardown is also
+        // asynchronous, so a fresh root at the same path can return
+        // VIRTUALIZATION_UNAVAILABLE (369) briefly. On a transient
+        // failure, recreate the root once if we own it, then retry until
+        // the deadline. A root we do not own is never touched.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut recreated = false;
+        let session = loop {
+            match fsk::MountSession::mount(make_adapter(), &root) {
+                Ok(session) => break session,
+                Err(err) => {
+                    if !is_transient_virtualization_error(&err) || Instant::now() >= deadline {
+                        return Err(anyhow::anyhow!(
+                            "ProjFS mount at {} failed: {err}",
+                            root.display()
+                        ));
+                    }
+                    if !recreated {
+                        match recreate_owned_root(&root, deadline) {
+                            Ok(true) => recreated = true,
+                            // Foreign root: never wipe — teardown may still
+                            // settle on its own, so keep retrying the mount.
+                            Ok(false) => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        };
 
         // The namespace context only ever travels inside ProjFS callbacks;
         // a directory read on the fresh root forces one so `PrjDeleteFile`
@@ -273,6 +346,9 @@ impl WindowsMount {
     }
 
     /// Stop the provider. Pending work must be released (PRD R3).
+    /// `PrjStopVirtualizing` is a void API — nothing to check; the reparse
+    /// tag it leaves on the root is detected and cleared on the next
+    /// mount by `clear_stale_virtualization_root`.
     pub fn stop(self) {
         self.handle.seal();
         drop(self.session);

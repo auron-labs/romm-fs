@@ -63,27 +63,39 @@ fn live_romm_mounts_lists_and_reads_byte_exact() {
     );
 
     let server_id = server_id_of(&url);
-    let catalogue = build_catalogue(&server_id, &platforms, &roms, |w| eprintln!("catalogue: {w}"))
-        .expect("catalogue builds");
+    let catalogue = build_catalogue(&server_id, &platforms, &roms, |w| {
+        eprintln!("catalogue: {w}")
+    })
+    .expect("catalogue builds");
     eprintln!(
         "catalogue: {} platforms, {} roms, {} skipped",
         catalogue.platforms.len(),
         catalogue.entries.len(),
         catalogue.skipped_unsupported
     );
-    assert!(catalogue.entries.len() >= 3, "expected >=3 single-file roms");
+    assert!(
+        catalogue.entries.len() >= 3,
+        "expected >=3 single-file roms"
+    );
 
     // Verify every projected ROM has a committed source file to compare to.
-    let harness_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testing/romm-harness/library/roms");
+    let harness_root =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testing/romm-harness/library/roms");
     if !harness_root.exists() {
-        panic!("UNAVAILABLE: harness library not found at {}", harness_root.display());
+        panic!(
+            "UNAVAILABLE: harness library not found at {}",
+            harness_root.display()
+        );
     }
 
     let cache = tempfile::tempdir().expect("cache dir");
     let index = CacheIndex::open(cache.path()).expect("index");
     let live = Arc::new(LiveState::default());
-    let expected: HashMap<RomKey, u64> =
-        catalogue.entries.iter().map(|e| (e.key.clone(), e.size)).collect();
+    let expected: HashMap<RomKey, u64> = catalogue
+        .entries
+        .iter()
+        .map(|e| (e.key.clone(), e.size))
+        .collect();
     let versions: HashMap<RomKey, Option<String>> = catalogue
         .entries
         .iter()
@@ -103,7 +115,10 @@ fn live_romm_mounts_lists_and_reads_byte_exact() {
     let evictor = Evictor::new(
         DEFAULT_EVICTION_THRESHOLD_SECS,
         live,
-        Arc::new(ProjfsRemover::new(root.path().to_path_buf(), Arc::clone(&handle))),
+        Arc::new(ProjfsRemover::new(
+            root.path().to_path_buf(),
+            Arc::clone(&handle),
+        )),
     );
     let fs = Arc::new(RommFs::new(
         RommTree::new(catalogue),
@@ -120,7 +135,9 @@ fn live_romm_mounts_lists_and_reads_byte_exact() {
     // Wait for projection, then enumerate + read every ROM through the OS.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let n = std::fs::read_dir(root.path()).map(|it| it.count()).unwrap_or(0);
+        let n = std::fs::read_dir(root.path())
+            .map(|it| it.count())
+            .unwrap_or(0);
         if n >= fs_platform_count(root.path()) && n > 0 {
             break;
         }

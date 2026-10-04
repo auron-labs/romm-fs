@@ -3,9 +3,9 @@
 //! Tests exercise this path — no duplicate state machine in the UI (PRD §6).
 
 use rommfs_core::cache::clock::{Clock, SystemClock, DEFAULT_EVICTION_THRESHOLD_SECS};
-use rommfs_core::cache::{CacheIndex, Evictor, HydratedRemover, LiveState};
 #[cfg(not(windows))]
 use rommfs_core::cache::NoopHydratedRemover;
+use rommfs_core::cache::{CacheIndex, Evictor, HydratedRemover, LiveState};
 use rommfs_core::catalog::{build_catalogue, server_id_of, Catalogue, RomKey};
 use rommfs_core::download::{ContentSource, DownloadManager};
 use rommfs_core::error::{Error, Result};
@@ -751,12 +751,7 @@ impl ActiveMount {
 /// hydrated ProjFS content through `PrjDeleteFile` and the handle arms the
 /// namespace context captured during callbacks.
 #[cfg(windows)]
-fn mount_backend_parts(
-    root: &Path,
-) -> (
-    Arc<dyn HydratedRemover>,
-    Arc<rommfs_fsk::ProjfsHandle>,
-) {
+fn mount_backend_parts(root: &Path) -> (Arc<dyn HydratedRemover>, Arc<rommfs_fsk::ProjfsHandle>) {
     let handle = Arc::new(rommfs_fsk::ProjfsHandle::default());
     (
         Arc::new(rommfs_fsk::ProjfsRemover::new(

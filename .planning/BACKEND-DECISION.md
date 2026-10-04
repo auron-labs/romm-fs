@@ -44,6 +44,15 @@ Evaluated against the PRD §2 checklist by reading the shipped Windows adapter
   just needs to be correct — small OS buffers are handled inside fsk.
 - `PrjMarkDirectoryAsPlaceholder` + `create_dir_all` on the root happens in
   `mount()`. Mounting only into empty/recognized roots is OUR check (PRD R5§5).
+- **Found in E2E testing:** `PrjStopVirtualizing` leaves the root's ProjFS
+  reparse tag + hydrated files behind (by design). fsk re-runs
+  `PrjMarkDirectoryAsPlaceholder` unconditionally, which fails on a tagged
+  root with `ERROR_FILE_SYSTEM_VIRTUALIZATION_BUSY` — wedging remounts.
+  Namespace teardown is also asynchronous, briefly surfacing
+  `ERROR_FILE_SYSTEM_VIRTUALIZATION_UNAVAILABLE` (369) at the same path.
+  `mount_with_handle` recreates an *owned* (marker-bearing) stale root and
+  retries transient failures on a 10s deadline — same-session and
+  cross-run remounts verified by the native test.
 
 **Conclusion:** required behavior achievable without a backend fork → retain
 `fsk = 0.0.9` (pinned via committed `Cargo.lock`). `unifuse` fallback not used.

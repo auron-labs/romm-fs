@@ -335,4 +335,23 @@ fn projfs_mount_lists_reads_once_and_stays_read_only() {
     // --- clean stop ---
     mount.stop();
     assert!(root.path().exists(), "root dir survives a clean stop");
+
+    // --- remount must work: ProjFS leaves its virtualization-root reparse
+    // tag on the directory after stop, and re-marking it fails with
+    // ERROR_FILE_SYSTEM_VIRTUALIZATION_BUSY unless the adapter clears the
+    // stale owned root first (regression: remounting used to wedge).
+    let (mount2, _handle2) = WindowsMount::mount_with_handle(
+        Arc::clone(&fs),
+        root.path(),
+        Arc::new(ProjfsHandle::default()),
+    )
+    .expect("remount on a stopped root must succeed");
+    wait_until(
+        || rom_path.exists(),
+        Duration::from_secs(5),
+        "projected ROM path to reappear after remount",
+    );
+    let got = std::fs::read(&rom_path).expect("read ROM after remount");
+    assert_eq!(got, bytes, "remounted read is byte-exact");
+    mount2.stop();
 }
