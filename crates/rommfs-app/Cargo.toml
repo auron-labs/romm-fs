@@ -10,5 +10,9 @@ gpui.workspace = true
 rommfs-core.workspace = true
 tracing.workspace = true
 
+# Windows-only mount backend (PRD: target-specific isolation)
+[target.'cfg(windows)'.dependencies]
+rommfs-fsk.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

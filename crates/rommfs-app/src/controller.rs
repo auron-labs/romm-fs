@@ -3,7 +3,9 @@
 //! Tests exercise this path — no duplicate state machine in the UI (PRD §6).
 
 use rommfs_core::cache::clock::{Clock, SystemClock, DEFAULT_EVICTION_THRESHOLD_SECS};
-use rommfs_core::cache::{CacheIndex, Evictor, LiveState, NoopHydratedRemover};
+use rommfs_core::cache::{CacheIndex, Evictor, HydratedRemover, LiveState};
+#[cfg(not(windows))]
+use rommfs_core::cache::NoopHydratedRemover;
 use rommfs_core::catalog::{build_catalogue, server_id_of, Catalogue, RomKey};
 use rommfs_core::download::{ContentSource, DownloadManager};
 use rommfs_core::error::{Error, Result};
@@ -480,7 +482,8 @@ impl Worker {
             return;
         }
 
-        let fs = match self.build_fs(&client, &root) {
+        let (remover, mhandle) = mount_backend_parts(&root);
+        let fs = match self.build_fs(&client, &root, remover) {
             Ok(fs) => fs,
             Err(e) => {
                 self.fail_mount(&e);
@@ -488,7 +491,7 @@ impl Worker {
             }
         };
 
-        match start_mount_backend(Arc::clone(&fs), &root) {
+        match start_mount_backend(Arc::clone(&fs), &root, mhandle) {
             Ok(mount) => {
                 let mounted_path = mount.root.display().to_string();
                 self.mount = Some(mount);
@@ -505,7 +508,14 @@ impl Worker {
     }
 
     /// Assemble the portable core objects the platform adapter mounts.
-    fn build_fs(&mut self, client: &Arc<RommClient>, _root: &Path) -> Result<Arc<RommFs>> {
+    /// `remover` is the mount-aware hydrated remover (ProjfsRemover on
+    /// Windows) so eviction also reclaims ProjFS copies.
+    fn build_fs(
+        &mut self,
+        client: &Arc<RommClient>,
+        _root: &Path,
+        remover: Arc<dyn HydratedRemover>,
+    ) -> Result<Arc<RommFs>> {
         let server_id = self.server_id.clone().unwrap_or_default();
         let index = CacheIndex::open(cache_dir_for(&server_id))?;
         let live = Arc::new(LiveState::default());
@@ -536,15 +546,7 @@ impl Worker {
             expected,
             versions,
         ));
-        // NOTE: with the mount backend unlinked (see `start_mount_backend`)
-        // the hydrated remover is the portable no-op; once rommfs-fsk is a
-        // dependency this becomes `ProjfsRemover` built from the mount's
-        // captured `ProjfsHandle` so eviction also removes ProjFS copies.
-        let evictor = Evictor::new(
-            DEFAULT_EVICTION_THRESHOLD_SECS,
-            live,
-            Arc::new(NoopHydratedRemover),
-        );
+        let evictor = Evictor::new(DEFAULT_EVICTION_THRESHOLD_SECS, live, remover);
         let tree = RommTree::new(cat);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         Ok(Arc::new(RommFs::new(tree, downloads, evictor, clock)))
@@ -732,9 +734,11 @@ fn claim_mount_root(root: &Path, server_id: &str) -> Result<()> {
 }
 
 /// A live mount: opaque handle whose `stop` releases the provider.
+/// NOT Send: `fsk::MountSession` carries a raw namespace-context pointer;
+/// the mount is created, held, and stopped entirely on the worker thread.
 struct ActiveMount {
     root: PathBuf,
-    stop_fn: Box<dyn FnOnce() + Send>,
+    stop_fn: Box<dyn FnOnce()>,
 }
 
 impl ActiveMount {
@@ -743,28 +747,51 @@ impl ActiveMount {
     }
 }
 
-/// Start the platform mount over `fs` at `root`.
-///
-/// INTEGRATION SEAM — `rommfs-app` does not declare `rommfs-fsk` in its
-/// Cargo.toml (manifests may not be edited), so the adapter type cannot be
-/// named here and the call currently fails with `Unsupported` — surfaced to
-/// the UI as `MountFailed`. Once `rommfs-fsk = { workspace = true }` is added
-/// to `crates/rommfs-app/Cargo.toml`, this becomes:
-///
-/// ```rust,ignore
-/// let (mount, _handle) = rommfs_fsk::WindowsMount::mount(fs, root)?;
-/// let root = root.to_path_buf();
-/// Ok(ActiveMount { root, stop_fn: Box::new(move || mount.stop()) })
-/// ```
-///
-/// and `build_fs` should then construct the `Evictor` with
-/// `ProjfsRemover::new(root.clone(), handle)` instead of `NoopHydratedRemover`
-/// so eviction also removes the ProjFS-hydrated copies (PRD R4).
-fn start_mount_backend(_fs: Arc<RommFs>, _root: &Path) -> Result<ActiveMount> {
+/// The mount-side remover + handle pair. On Windows the remover evicts
+/// hydrated ProjFS content through `PrjDeleteFile` and the handle arms the
+/// namespace context captured during callbacks.
+#[cfg(windows)]
+fn mount_backend_parts(
+    root: &Path,
+) -> (
+    Arc<dyn HydratedRemover>,
+    Arc<rommfs_fsk::ProjfsHandle>,
+) {
+    let handle = Arc::new(rommfs_fsk::ProjfsHandle::default());
+    (
+        Arc::new(rommfs_fsk::ProjfsRemover::new(
+            root.to_path_buf(),
+            Arc::clone(&handle),
+        )),
+        handle,
+    )
+}
+
+#[cfg(not(windows))]
+fn mount_backend_parts(_root: &Path) -> (Arc<dyn HydratedRemover>, Arc<()>) {
+    (Arc::new(NoopHydratedRemover), Arc::new(()))
+}
+
+/// Start the platform mount over `fs` at `root` (Windows: ProjFS via fsk).
+#[cfg(windows)]
+fn start_mount_backend(
+    fs: Arc<RommFs>,
+    root: &Path,
+    handle: Arc<rommfs_fsk::ProjfsHandle>,
+) -> Result<ActiveMount> {
+    let (mount, _handle) = rommfs_fsk::WindowsMount::mount_with_handle(fs, root, handle)
+        .map_err(|e| Error::Unsupported(e.to_string()))?;
+    let root = root.to_path_buf();
+    Ok(ActiveMount {
+        root,
+        stop_fn: Box::new(move || mount.stop()),
+    })
+}
+
+#[cfg(not(windows))]
+fn start_mount_backend(_fs: Arc<RommFs>, _root: &Path, _handle: Arc<()>) -> Result<ActiveMount> {
     Err(Error::Unsupported(
-        "mount backend not linked: add the rommfs-fsk dependency to rommfs-app \
-         (see start_mount_backend in controller.rs)"
-            .into(),
+        "mounting requires Windows ProjFS; this build is not windows".into(),
     ))
 }
 

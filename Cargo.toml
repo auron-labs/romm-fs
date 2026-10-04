@@ -26,6 +26,7 @@ fsk = "0.0.9"
 gpui = "0.2.2"
 rommfs-core = { path = "crates/rommfs-core" }
 rommfs-fixture = { path = "crates/rommfs-fixture" }
+rommfs-fsk = { path = "crates/rommfs-fsk" }
 windows-sys = { version = "0.61", features = [
     "Win32_Storage_ProjectedFileSystem",
     "Win32_Foundation",
