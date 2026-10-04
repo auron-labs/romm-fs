@@ -1,0 +1,28 @@
+[package]
+name = "rommfs-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["ui"]
+ui = ["dep:gpui"]
+
+[dependencies]
+anyhow.workspace = true
+gpui = { workspace = true, optional = true }
+rommfs-core.workspace = true
+tracing.workspace = true
+
+# Windows-only mount backend (PRD: target-specific isolation)
+[target.'cfg(windows)'.dependencies]
+rommfs-fsk.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "rommfs-app"
+path = "src/main.rs"
+required-features = ["ui"]

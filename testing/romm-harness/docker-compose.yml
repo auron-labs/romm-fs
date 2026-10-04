@@ -1,0 +1,46 @@
+services:
+  romm:
+    image: rommapp/romm:latest
+    container_name: romm
+    restart: unless-stopped
+    environment:
+      - DB_HOST=romm-db
+      - DB_NAME=romm
+      - DB_USER=romm-user
+      - DB_PASSWD=romm-pass-123
+      - ROMM_AUTH_SECRET_KEY=dev-secret-key-for-testing-only
+      - DISABLE_CSRF_PROTECTION=true
+      - DISABLE_DOWNLOAD_ENDPOINT_AUTH=false
+    volumes:
+      - romm_resources:/romm/resources
+      - romm_redis_data:/redis-data
+      - ./library:/romm/library
+      - ./assets:/romm/assets
+      - ./config:/romm/config
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      romm-db:
+        condition: service_healthy
+
+  romm-db:
+    image: mariadb:latest
+    container_name: romm-db
+    restart: unless-stopped
+    environment:
+      - MARIADB_ROOT_PASSWORD=rootpw
+      - MARIADB_DATABASE=romm
+      - MARIADB_USER=romm-user
+      - MARIADB_PASSWORD=romm-pass-123
+    volumes:
+      - romm_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  romm_mysql_data:
+  romm_resources:
+  romm_redis_data:
