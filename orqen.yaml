@@ -1,0 +1,16 @@
+agent:
+    - opencode
+    - codex
+scope: project
+skills:
+    - source: https://github.com/jeffallan/claude-skills
+      skills:
+        - rust-engineer
+        - code-documenter
+        - architecture-designer
+        - code-reviewer
+        - security-reviewer
+        - test-master
+        - the-fool
+    - source: https://github.com/longbridge/gpui-kit
+      skills: '*'
