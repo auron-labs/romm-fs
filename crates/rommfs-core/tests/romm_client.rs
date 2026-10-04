@@ -3,7 +3,7 @@
 //! bearer auth on every call, pagination counts, error mapping, truncation
 //! and stall handling. All assertions are on observable wire facts.
 
-use rommfs_core::romm::{Credentials, DownloadConfig, RommClient};
+use rommfs_core::romm::{Credentials, DownloadConfig, MetadataConfig, RommClient};
 use rommfs_core::Error;
 use rommfs_fixture::{contract, FixtureServer, ResponseSpec};
 use serde_json::Value;
@@ -278,6 +278,41 @@ fn malformed_catalogue_payload_is_an_error_not_empty_library() {
     let client = authed(&fx);
     let err = client.platforms().unwrap_err();
     assert!(matches!(err, Error::InvalidCatalogue(_)), "got {err:?}");
+}
+
+#[test]
+fn stalled_authentication_and_catalogue_responses_are_bounded() {
+    let metadata = MetadataConfig {
+        connect_timeout: Duration::from_secs(1),
+        response_timeout: Duration::from_millis(100),
+    };
+
+    let auth_fx = FixtureServer::start();
+    auth_fx.on("POST", "/api/token", ResponseSpec::Stall);
+    let auth_client = RommClient::new(auth_fx.url())
+        .unwrap()
+        .with_metadata_config(metadata);
+    let auth_error = auth_client
+        .authenticate(Credentials {
+            username: "user",
+            password: "pass",
+        })
+        .unwrap_err();
+    assert!(
+        matches!(auth_error, Error::Transport(_)),
+        "got {auth_error:?}"
+    );
+    assert_eq!(auth_fx.count("POST", "/api/token"), 1);
+
+    let catalogue_fx = contract_server(vec![], 0);
+    let catalogue_client = authed(&catalogue_fx).with_metadata_config(metadata);
+    catalogue_fx.on("GET", "/api/platforms", ResponseSpec::Stall);
+    let catalogue_error = catalogue_client.platforms().unwrap_err();
+    assert!(
+        matches!(catalogue_error, Error::Transport(_)),
+        "got {catalogue_error:?}"
+    );
+    assert_eq!(catalogue_fx.count("GET", "/api/platforms"), 1);
 }
 
 #[test]

@@ -41,6 +41,26 @@ pub struct DownloadConfig {
     pub chunk_bytes: usize,
 }
 
+/// Connection and total response limits for authentication and catalogue calls.
+/// Content downloads use `DownloadConfig` instead so progressing large ROMs are
+/// not subject to a total transfer deadline.
+#[derive(Clone, Copy, Debug)]
+pub struct MetadataConfig {
+    /// Time to establish the connection.
+    pub connect_timeout: Duration,
+    /// Maximum time for the request and complete response body.
+    pub response_timeout: Duration,
+}
+
+impl Default for MetadataConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(15),
+            response_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
 impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
@@ -56,6 +76,7 @@ impl Default for DownloadConfig {
 pub struct RommClient {
     base_url: String,
     download: DownloadConfig,
+    metadata: MetadataConfig,
     token: std::sync::RwLock<Option<String>>,
 }
 
@@ -74,12 +95,18 @@ impl RommClient {
         Ok(Self {
             base_url,
             download: DownloadConfig::default(),
+            metadata: MetadataConfig::default(),
             token: std::sync::RwLock::new(None),
         })
     }
 
     pub fn with_download_config(mut self, cfg: DownloadConfig) -> Self {
         self.download = cfg;
+        self
+    }
+
+    pub fn with_metadata_config(mut self, cfg: MetadataConfig) -> Self {
+        self.metadata = cfg;
         self
     }
 
@@ -93,6 +120,8 @@ impl RommClient {
         );
         let request = isahc::Request::post(format!("{}/api/token", self.base_url))
             .header("Content-Type", "application/x-www-form-urlencoded")
+            .connect_timeout(self.metadata.connect_timeout)
+            .timeout(self.metadata.response_timeout)
             .body(body)
             .map_err(|e| Error::Transport(format!("request build failed: {e}")))?;
         let mut resp = request.send().map_err(transport)?;
@@ -254,6 +283,8 @@ impl RommClient {
             builder = builder.header("Authorization", format!("Bearer {t}"));
         }
         let request = builder
+            .connect_timeout(self.metadata.connect_timeout)
+            .timeout(self.metadata.response_timeout)
             .body(())
             .map_err(|e| Error::Transport(format!("request build failed: {e}")))?;
         let mut resp = request.send().map_err(transport)?;

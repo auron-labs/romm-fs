@@ -3,7 +3,7 @@
 //! In-flight downloads and active-use tracking live in memory.
 
 use crate::catalog::RomKey;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 
 const DB_FILE: &str = "cache-index.db";
@@ -183,6 +183,18 @@ impl CacheIndex {
         let record = self.record_for(key)?;
         match record {
             Some(rec) if rec.state == EntryState::Ready => {
+                match std::fs::metadata(&rec.path) {
+                    Ok(metadata) if metadata.is_file() => {}
+                    Ok(_) => {
+                        self.remove(key)?;
+                        return Ok(None);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        self.remove(key)?;
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(Error::Io(e)),
+                }
                 // No version supplied by the current catalogue cannot
                 // invalidate: the stored bytes are the best we have.
                 match version {
@@ -196,7 +208,7 @@ impl CacheIndex {
     }
 
     /// Remove the durable row (after files were removed).
-    pub fn remove(&mut self, key: &RomKey) -> Result<()> {
+    pub fn remove(&self, key: &RomKey) -> Result<()> {
         self.conn
             .execute(
                 "DELETE FROM cache_entries

@@ -735,9 +735,10 @@ impl RommfsWindow {
         if matches!(self.state.mount, MountState::Mounting | MountState::Mounted) {
             return;
         }
-        self.controller.send(Command::StartMount {
-            path: self.mount_input.read(cx).value().to_string(),
-        });
+        let path = self.mount_input.read(cx).value().to_string();
+        self.state.request_mount(path.clone());
+        cx.notify();
+        self.controller.send(Command::StartMount { path });
     }
 
     fn on_stop_mount(&mut self, _: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {

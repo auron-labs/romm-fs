@@ -25,7 +25,8 @@ window.
   ```powershell
   Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
   ```
-- Rust 1.85+ (built with 1.99)
+- Rust 1.89+ (the locked GPUI dependency graph includes `uuid 1.27`, which
+  requires Rust 1.89)
 - A reachable RomM server. Tested against **RomM 5.3.1** — see
   `.planning/API-CONTRACT.md` for the verified API surface (token grant,
   `/api/platforms`, `/api/roms` pagination, `/api/roms/{id}/content/{name}`).
@@ -48,12 +49,18 @@ and no credentials are ever persisted or logged.
 
 ## Test
 
+Portable core, fixture, and headless app-controller tests run on Linux,
+macOS, and Windows:
+
 ```bash
-cargo test --workspace            # 68 tests: client, catalogue, tree,
-                                  # cache index, download/single-flight,
-                                  # eviction (injected FakeClock), fscore,
-                                  # controller, + native ProjFS mount test
-cargo test -p rommfs-fsk -- --ignored   # + live-RomM E2E (needs the harness)
+cargo test -p rommfs-core -p rommfs-fixture -p rommfs-app --no-default-features
+```
+
+The app and ProjFS adapter require Windows. On Windows, run the workspace
+tests (including the native ProjFS mount test) with:
+
+```powershell
+cargo test --workspace
 ```
 
 The native test (`projfs_native.rs`) mounts a real `RommFs` on a temp root
@@ -89,12 +96,14 @@ instant (metadata only); the first launch of a game downloads its file once.
 - Creating brand-new files inside the root cannot be vetoed (ProjFS
   `PRJ_NOTIFY_NEW_FILE_CREATED` is post-only); the tree stays read-only
   for projected entries — deletes/renames/writes on them are rejected.
-- After unmount, ProjFS leaves its virtualization-root reparse tag plus any
-  hydrated files as ordinary on-disk copies. Re-marking that root fails
-  (`ERROR_FILE_SYSTEM_VIRTUALIZATION_BUSY`), so the next mount of an owned
-  root clears the residue and retries while the old namespace tears down;
-  hydrated leftovers are re-projected lazily (the private cache still
-  serves them without re-downloading).
+- After unmount, ProjFS leaves its virtualization-root reparse tag and
+  hydrated files behind. The next mount clears the owned root's tag and
+  clean ProjFS placeholders, preserving local and modified files. ROMs are
+  re-projected lazily from the private cache without re-downloading.
+- Server identity includes the configured URL's base path. When upgrading
+  a mount configured with a base path, choose a new empty mount folder;
+  older root markers used only the host and cannot safely identify that
+  server. The old folder's files remain available.
 - Tokens live in memory for the session only; nothing is stored between
   runs except the content cache and the mount-root marker.
 - Windows-only mount backend (`rommfs-fsk` is a `cfg(windows)` target dep);
@@ -105,4 +114,7 @@ instant (metadata only); the first launch of a game downloads its file once.
 - `fsk = 0.0.9` pinned via committed `Cargo.lock` — feasibility rationale in
   `.planning/BACKEND-DECISION.md`.
 - `.planning/PRD.md` is the source spec this implements (R1–R5).
-- fmt + clippy are clean: `cargo fmt --all && cargo clippy --workspace --all-targets`.
+- Format all crates with `cargo fmt --all`. On Windows, lint the full workspace
+  with `cargo clippy --workspace --all-targets`; on other platforms, lint the
+  portable crates and headless app with
+  `cargo clippy -p rommfs-core -p rommfs-fixture -p rommfs-app --no-default-features --all-targets`.

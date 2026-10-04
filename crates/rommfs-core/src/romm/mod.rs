@@ -6,5 +6,5 @@
 pub mod client;
 pub mod types;
 
-pub use client::{Credentials, DownloadConfig, RommClient};
+pub use client::{Credentials, DownloadConfig, MetadataConfig, RommClient};
 pub use types::*;

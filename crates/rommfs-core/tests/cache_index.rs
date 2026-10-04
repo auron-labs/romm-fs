@@ -14,12 +14,18 @@ fn key(rom_id: i64, file_id: i64) -> RomKey {
     }
 }
 
+fn mark_ready(index: &mut CacheIndex, key: &RomKey, version: Option<&str>) {
+    std::fs::write(index.bin_path(key), b"cached bytes").unwrap();
+    index.mark_ready(key, 12, version, "nes/Game.nes").unwrap();
+}
+
 #[test]
 fn ready_entry_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let k = key(7, 70);
     {
         let mut index = CacheIndex::open(dir.path()).unwrap();
+        std::fs::write(index.bin_path(&k), b"cached bytes").unwrap();
         index
             .mark_ready(&k, 4096, Some("sha1:abc"), "nes/Game.nes")
             .unwrap();
@@ -41,9 +47,7 @@ fn version_change_makes_entry_not_ready() {
     let dir = tempfile::tempdir().unwrap();
     let mut index = CacheIndex::open(dir.path()).unwrap();
     let k = key(7, 70);
-    index
-        .mark_ready(&k, 10, Some("v1"), "nes/Game.nes")
-        .unwrap();
+    mark_ready(&mut index, &k, Some("v1"));
 
     // Same version: still current.
     assert!(index.ready_if_current(&k, Some("v1")).unwrap().is_some());
@@ -54,7 +58,7 @@ fn version_change_makes_entry_not_ready() {
 
     // An unversioned row is not current for a now-versioned catalogue.
     let k2 = key(8, 80);
-    index.mark_ready(&k2, 10, None, "nes/Other.nes").unwrap();
+    mark_ready(&mut index, &k2, None);
     assert!(index.ready_if_current(&k2, Some("v2")).unwrap().is_none());
     assert!(index.ready_if_current(&k2, None).unwrap().is_some());
 }
@@ -64,9 +68,7 @@ fn failed_state_is_never_served() {
     let dir = tempfile::tempdir().unwrap();
     let mut index = CacheIndex::open(dir.path()).unwrap();
     let k = key(7, 70);
-    index
-        .mark_ready(&k, 10, Some("v1"), "nes/Game.nes")
-        .unwrap();
+    mark_ready(&mut index, &k, Some("v1"));
     index.mark_failed(&k).unwrap();
     assert!(index.ready_if_current(&k, Some("v1")).unwrap().is_none());
     assert!(index.ready_entries().unwrap().is_empty());
@@ -78,11 +80,23 @@ fn failed_state_is_never_served() {
 }
 
 #[test]
+fn missing_ready_file_invalidates_its_durable_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut index = CacheIndex::open(dir.path()).unwrap();
+    let k = key(7, 70);
+    mark_ready(&mut index, &k, Some("v1"));
+    std::fs::remove_file(index.bin_path(&k)).unwrap();
+
+    assert!(index.ready_if_current(&k, Some("v1")).unwrap().is_none());
+    assert!(index.ready_entries().unwrap().is_empty());
+}
+
+#[test]
 fn touch_updates_last_use() {
     let dir = tempfile::tempdir().unwrap();
     let mut index = CacheIndex::open(dir.path()).unwrap();
     let k = key(7, 70);
-    index.mark_ready(&k, 10, None, "nes/Game.nes").unwrap();
+    mark_ready(&mut index, &k, None);
 
     index.touch(&k, 123_456).unwrap();
     let rec = index.ready_if_current(&k, None).unwrap().unwrap();
@@ -113,7 +127,7 @@ fn entries_are_scoped_to_identity() {
     let dir = tempfile::tempdir().unwrap();
     let mut index = CacheIndex::open(dir.path()).unwrap();
     let k = key(7, 70);
-    index.mark_ready(&k, 10, None, "nes/Game.nes").unwrap();
+    mark_ready(&mut index, &k, None);
 
     let other_server = RomKey {
         server_id: "http://other".into(),

@@ -128,6 +128,18 @@ fn mount_start_stop_transitions() {
     assert_eq!(ui.mount, MountState::NotMounted);
 }
 
+/// A start click disables the button immediately, before the worker can send
+/// MountStarting back over the polled event channel.
+#[test]
+fn mount_request_is_pending_immediately() {
+    let mut ui = UiState::new(64);
+    ui.request_mount("C:\\RomM".into());
+
+    assert_eq!(ui.mount, MountState::Mounting);
+    assert_eq!(ui.mount_path.as_deref(), Some("C:\\RomM"));
+    assert!(ui.mount_error.is_none());
+}
+
 /// A mount failure must never display Mounted (PRD §6 UI row) and must
 /// surface the reason as visible text.
 #[test]

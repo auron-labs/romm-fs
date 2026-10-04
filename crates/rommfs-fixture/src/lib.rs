@@ -20,6 +20,9 @@ pub enum ResponseSpec {
         status: u16,
         body: String,
     },
+    /// Accept the request and hold the connection without sending a response.
+    /// The fixture shuts the connection down when dropped.
+    Stall,
     /// Serve `bytes`; may truncate to `truncate_at` or stall after
     /// `stall_after_bytes` without sending more (for stall-timeout tests).
     Bytes {
@@ -30,6 +33,8 @@ pub enum ResponseSpec {
     },
 }
 
+type RecordedAuth = HashMap<(String, String), Vec<Option<String>>>;
+
 /// Per-test scripted server. Drop/join stops it.
 pub struct FixtureServer {
     base_url: String,
@@ -38,7 +43,7 @@ pub struct FixtureServer {
     /// (method, path prefix) -> response spec. First prefix match wins.
     routes: Arc<Mutex<Vec<(String, String, ResponseSpec)>>>,
     /// Authorization header values seen per (method, path prefix), in order.
-    auth_seen: Arc<Mutex<HashMap<(String, String), Vec<Option<String>>>>>,
+    auth_seen: Arc<Mutex<RecordedAuth>>,
     shutdown: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
     conns: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -56,8 +61,7 @@ impl FixtureServer {
             Arc::new(Mutex::new(HashMap::new()));
         let routes: Arc<Mutex<Vec<(String, String, ResponseSpec)>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let auth_seen: Arc<Mutex<HashMap<(String, String), Vec<Option<String>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let auth_seen: Arc<Mutex<RecordedAuth>> = Arc::new(Mutex::new(HashMap::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let conns: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -162,7 +166,7 @@ fn handle_conn(
     mut stream: TcpStream,
     routes: &Mutex<Vec<(String, String, ResponseSpec)>>,
     counts: &Mutex<HashMap<(String, String), AtomicUsize>>,
-    auth_seen: &Mutex<HashMap<(String, String), Vec<Option<String>>>>,
+    auth_seen: &Mutex<RecordedAuth>,
     shutdown: &AtomicBool,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -199,6 +203,11 @@ fn handle_conn(
         .push(auth);
 
     match spec {
+        ResponseSpec::Stall => {
+            while !shutdown.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         ResponseSpec::Json { status, body } => {
             if write_response_head(&mut stream, status, "application/json", body.len()).is_err() {
                 return;

@@ -84,6 +84,18 @@ fn reserved_dos_names_are_adjusted() {
         sanitize_component("LPT9.sfc"),
         Some(ComponentName::Adjusted("LPT9_.sfc".into()))
     );
+    assert_eq!(
+        sanitize_component("COM¹.nes"),
+        Some(ComponentName::Adjusted("COM¹_.nes".into()))
+    );
+    assert_eq!(
+        sanitize_component("lpt².Game Boy.rom"),
+        Some(ComponentName::Adjusted("lpt²_.Game Boy.rom".into()))
+    );
+    assert_eq!(
+        sanitize_component("com³.TXT"),
+        Some(ComponentName::Adjusted("com³_.TXT".into()))
+    );
     // Not actually reserved: stems that merely start with a device name.
     assert_eq!(
         sanitize_component("CONSOLE.nes"),

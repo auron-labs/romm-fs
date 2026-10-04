@@ -27,18 +27,39 @@ use rommfs_core::tree::EntryKind;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
-use windows_sys::Win32::Storage::ProjectedFileSystem::{
-    PrjDeleteFile, PRJ_CALLBACK_DATA, PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED,
-    PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED, PRJ_NOTIFY_FILE_HANDLE_CLOSED_NO_MODIFICATION,
-    PRJ_NOTIFY_FILE_OPENED, PRJ_NOTIFY_FILE_OVERWRITTEN, PRJ_NOTIFY_FILE_PRE_CONVERT_TO_FULL,
-    PRJ_NOTIFY_PRE_DELETE, PRJ_NOTIFY_PRE_RENAME, PRJ_NOTIFY_PRE_SET_HARDLINK,
-    PRJ_UPDATE_FAILURE_CAUSES, PRJ_UPDATE_FAILURE_CAUSE_NONE, PRJ_UPDATE_NONE,
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NOT_A_REPARSE_POINT, ERROR_PATH_NOT_FOUND,
+    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
+};
+use windows_sys::Win32::Storage::ProjectedFileSystem::{
+    PrjDeleteFile, PrjGetOnDiskFileState, PRJ_CALLBACK_DATA, PRJ_FILE_STATE_DIRTY_PLACEHOLDER,
+    PRJ_FILE_STATE_FULL, PRJ_FILE_STATE_HYDRATED_PLACEHOLDER, PRJ_FILE_STATE_PLACEHOLDER,
+    PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED, PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED,
+    PRJ_NOTIFY_FILE_HANDLE_CLOSED_NO_MODIFICATION, PRJ_NOTIFY_FILE_OPENED,
+    PRJ_NOTIFY_FILE_OVERWRITTEN, PRJ_NOTIFY_FILE_PRE_CONVERT_TO_FULL, PRJ_NOTIFY_PRE_DELETE,
+    PRJ_NOTIFY_PRE_RENAME, PRJ_NOTIFY_PRE_SET_HARDLINK, PRJ_UPDATE_FAILURE_CAUSES,
+    PRJ_UPDATE_FAILURE_CAUSE_NONE, PRJ_UPDATE_NONE,
+};
+use windows_sys::Win32::System::Ioctl::FSCTL_DELETE_REPARSE_POINT;
+use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_PROJFS;
+use windows_sys::Win32::System::IO::DeviceIoControl;
+
+#[repr(C)]
+struct ReparseDataBufferHeader {
+    tag: u32,
+    data_length: u16,
+    reserved: u16,
+}
 
 /// Mount-root validation (PRD §5): mount only into an empty directory or a
 /// recognized app-owned root (marker file we wrote). Never over an existing
@@ -154,26 +175,25 @@ impl ProjfsHandle {
     }
 }
 
-/// Delete a mount root we own (marker file present) and recreate it
-/// empty, preserving the marker. Returns false — without touching
-/// anything — when the marker is absent so a foreign directory is never
-/// wiped. Deleting a mid-teardown root also returns transient
-/// virtualization errors, so each phase retries until `deadline`.
-/// Used to recover a stale ProjFS root (see mount_with_handle).
-fn recreate_owned_root(root: &Path, deadline: Instant) -> io::Result<bool> {
+/// Remove only ProjFS-owned clean placeholders and the virtualization-root
+/// reparse tag from a stopped root. User-created/full or dirty files are
+/// preserved. Returns false without touching anything when no app marker is
+/// present, so a foreign directory is never modified.
+fn recover_owned_root(root: &Path, deadline: Instant) -> io::Result<bool> {
     let marker = root.join(ROOT_MARKER);
     if !marker.is_file() {
         return Ok(false);
     }
-    let owner = std::fs::read(&marker).unwrap_or_default();
-    tracing::info!(root = %root.display(), "clearing stale mount root");
+    tracing::info!(root = %root.display(), "recovering stale ProjFS root");
     loop {
         let res = (|| -> io::Result<()> {
-            if root.exists() {
-                std::fs::remove_dir_all(root)?;
-            }
-            std::fs::create_dir_all(root)?;
-            std::fs::write(&marker, &owner)?;
+            // Query and capture states while ProjFS still recognizes the
+            // entries. Detach the root before changing children so physical
+            // removal cannot be interpreted as a virtual namespace delete
+            // and leave ProjFS tombstones behind.
+            let clean_entries = collect_clean_projfs_entries(root)?;
+            clear_projfs_reparse_point(root)?;
+            remove_clean_projfs_entries(clean_entries)?;
             Ok(())
         })();
         match res {
@@ -182,6 +202,194 @@ fn recreate_owned_root(root: &Path, deadline: Instant) -> io::Result<bool> {
             }
             res => return res.map(|_| true),
         }
+    }
+}
+
+/// Snapshot clean placeholder descendants while ProjFS can still identify
+/// them. Don't descend into unmanaged directories: their content belongs to
+/// the user, and the filesystem state is not enough to claim ownership.
+fn collect_clean_projfs_entries(dir: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+    let mut clean_entries = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let state = on_disk_projfs_state(&path);
+        if !is_clean_projfs_placeholder(state) {
+            continue;
+        }
+        if file_type.is_dir() {
+            clean_entries.extend(collect_clean_projfs_entries(&path)?);
+        }
+        // Children precede their parent so projected directories are empty
+        // before removal. A nonempty directory is retained after its ProjFS
+        // tag is detached, preserving any user files it contains.
+        clean_entries.push((path, file_type.is_dir()));
+    }
+    Ok(clean_entries)
+}
+
+/// Once the root is detached, remove the previously identified clean
+/// placeholders without routing ordinary deletion through ProjFS.
+fn remove_clean_projfs_entries(entries: Vec<(PathBuf, bool)>) -> io::Result<()> {
+    for (path, is_dir) in entries {
+        remove_clean_projfs_entry(&path, is_dir)?;
+    }
+    Ok(())
+}
+
+fn on_disk_projfs_state(path: &Path) -> i32 {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut state = 0;
+    // This API only queries the ProjFS state of this exact path. A failed
+    // query returns an unknown state, which is deliberately never deleted.
+    // SAFETY: `wide` is a live, null-terminated UTF-16 path and `state` is a
+    // valid writable output pointer for the duration of the call.
+    let hr = unsafe { PrjGetOnDiskFileState(wide.as_ptr(), &mut state) };
+    if hr < 0 {
+        tracing::debug!(path = %path.display(), hresult = format_args!("0x{:08x}", hr as u32), "could not identify stale ProjFS entry; preserving it");
+        0
+    } else {
+        state
+    }
+}
+
+fn is_clean_projfs_placeholder(state: i32) -> bool {
+    let clean_bits = PRJ_FILE_STATE_PLACEHOLDER | PRJ_FILE_STATE_HYDRATED_PLACEHOLDER;
+    state & clean_bits != 0 && state & (PRJ_FILE_STATE_DIRTY_PLACEHOLDER | PRJ_FILE_STATE_FULL) == 0
+}
+
+/// Clear only an exact ProjFS reparse tag. FSCTL_DELETE_REPARSE_POINT does
+/// not remove the directory or its contents; the explicit tag also makes an
+/// unrelated junction/symlink reparse point fail safely with tag mismatch.
+fn clear_projfs_reparse_point(path: &Path) -> io::Result<()> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: `wide` is a live, null-terminated UTF-16 path; the remaining
+    // arguments are valid for opening an existing directory reparse point.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+
+    let result = clear_projfs_reparse_point_handle(handle).map(|_| ());
+    // SAFETY: `handle` is the valid handle returned by CreateFileW above.
+    unsafe { CloseHandle(handle) };
+    result
+}
+
+/// Atomically validate and remove a clean placeholder. Sharing only for
+/// readers prevents a writer or rename/delete from changing the path between
+/// the final ProjFS state check and deletion. Directories are removed only if
+/// empty; no user descendants are traversed or deleted.
+fn remove_clean_projfs_entry(path: &Path, is_dir: bool) -> io::Result<()> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: `wide` is a live, null-terminated UTF-16 path; this opens the
+    // existing file itself, sharing reads while excluding competing writes
+    // and deletes until its final disposition is set.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE | DELETE,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT
+                | if is_dir {
+                    FILE_FLAG_BACKUP_SEMANTICS
+                } else {
+                    0
+                },
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+
+    let result = (|| {
+        // The root has already been detached. Recheck state under the handle's
+        // share lock so a file converted to full/dirty after the snapshot is
+        // preserved.
+        if !is_clean_projfs_placeholder(on_disk_projfs_state(path)) {
+            return Ok(());
+        }
+        if !clear_projfs_reparse_point_handle(handle)? {
+            return Ok(());
+        }
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: `handle` is open, `disposition` matches FileDispositionInfo,
+        // and its pointer/size remain valid for this synchronous call.
+        if unsafe {
+            SetFileInformationByHandle(
+                handle,
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        } == 0
+        {
+            let err = io::Error::last_os_error();
+            if is_dir
+                && (err.kind() == io::ErrorKind::DirectoryNotEmpty
+                    || err.raw_os_error() == Some(145))
+            {
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Ok(())
+    })();
+    // SAFETY: `handle` is the valid handle returned by CreateFileW above.
+    unsafe { CloseHandle(handle) };
+    result
+}
+
+/// Detach an exact ProjFS tag from an already-open path. Returns false when
+/// the path no longer has any reparse point; callers must preserve it then.
+fn clear_projfs_reparse_point_handle(handle: HANDLE) -> io::Result<bool> {
+    let buffer = ReparseDataBufferHeader {
+        tag: IO_REPARSE_TAG_PROJFS,
+        data_length: 0,
+        reserved: 0,
+    };
+    let mut bytes_returned = 0;
+    // SAFETY: `handle` is open, `buffer` is the required reparse header, and
+    // the output/overlapped pointers are null as required for this sync IOCTL.
+    let success = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_DELETE_REPARSE_POINT,
+            (&buffer as *const ReparseDataBufferHeader).cast(),
+            std::mem::size_of::<ReparseDataBufferHeader>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    let error = if success == 0 {
+        Some(io::Error::last_os_error())
+    } else {
+        None
+    };
+
+    match error {
+        Some(err) if err.raw_os_error() == Some(ERROR_NOT_A_REPARSE_POINT as i32) => Ok(false),
+        Some(err) => Err(err),
+        None => Ok(true),
     }
 }
 
@@ -292,10 +500,11 @@ impl WindowsMount {
         // permanently wedging the root. Namespace teardown is also
         // asynchronous, so a fresh root at the same path can return
         // VIRTUALIZATION_UNAVAILABLE (369) briefly. On a transient
-        // failure, recreate the root once if we own it, then retry until
-        // the deadline. A root we do not own is never touched.
+        // failure, remove clean ProjFS placeholders and clear only the
+        // owned root's ProjFS tag, then retry until the deadline. A root we
+        // do not own is never touched.
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut recreated = false;
+        let mut recovered = false;
         let session = loop {
             match fsk::MountSession::mount(make_adapter(), &root) {
                 Ok(session) => break session,
@@ -306,11 +515,11 @@ impl WindowsMount {
                             root.display()
                         ));
                     }
-                    if !recreated {
-                        match recreate_owned_root(&root, deadline) {
-                            Ok(true) => recreated = true,
-                            // Foreign root: never wipe — teardown may still
-                            // settle on its own, so keep retrying the mount.
+                    if !recovered {
+                        match recover_owned_root(&root, deadline) {
+                            Ok(true) => recovered = true,
+                            // Foreign root: never touch it — teardown may
+                            // still settle on its own, so keep retrying.
                             Ok(false) => {}
                             Err(e) => return Err(e.into()),
                         }
@@ -347,8 +556,8 @@ impl WindowsMount {
 
     /// Stop the provider. Pending work must be released (PRD R3).
     /// `PrjStopVirtualizing` is a void API — nothing to check; the reparse
-    /// tag it leaves on the root is detected and cleared on the next
-    /// mount by `clear_stale_virtualization_root`.
+    /// tag it leaves on the root is cleared on the next mount after clean
+    /// ProjFS placeholders are invalidated.
     pub fn stop(self) {
         self.handle.seal();
         drop(self.session);

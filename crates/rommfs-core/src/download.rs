@@ -245,8 +245,8 @@ impl DownloadManager {
         };
         drop(file);
 
-        if written < expected {
-            return Err(Error::Truncated {
+        if written != expected {
+            return Err(Error::SizeMismatch {
                 expected,
                 received: written,
             });

@@ -24,9 +24,13 @@ use rommfs_fsk::{
 };
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use windows_sys::Win32::Storage::ProjectedFileSystem::{
+    PrjGetOnDiskFileState, PRJ_FILE_STATE_HYDRATED_PLACEHOLDER, PRJ_FILE_STATE_PLACEHOLDER,
+};
 
 /// Deterministic, nontrivial content: 64 KiB of a repeating ramp plus a
 /// recognizable header/footer so offset reads are verifiable.
@@ -318,6 +322,16 @@ fn projfs_mount_lists_reads_once_and_stays_read_only() {
         bytes,
         "projected content must be unchanged after failed mutations"
     );
+
+    // Local content under a managed root belongs to the user. Recovery must
+    // invalidate hydrated ROM placeholders without clearing these files.
+    let root_user_file = root.path().join("local-notes.txt");
+    std::fs::write(&root_user_file, b"keep root-local data").unwrap();
+    let save_dir = nes_dir.join("saves");
+    std::fs::create_dir_all(&save_dir).unwrap();
+    let save_file = save_dir.join("slot1.sav");
+    std::fs::write(&save_file, b"keep nested save data").unwrap();
+
     assert_eq!(server.count("GET", "/api/roms/"), 1);
     assert!(
         rom_path.exists(),
@@ -335,11 +349,11 @@ fn projfs_mount_lists_reads_once_and_stays_read_only() {
     // --- clean stop ---
     mount.stop();
     assert!(root.path().exists(), "root dir survives a clean stop");
+    std::fs::write(&root_user_file, b"updated while stopped").unwrap();
 
     // --- remount must work: ProjFS leaves its virtualization-root reparse
-    // tag on the directory after stop, and re-marking it fails with
-    // ERROR_FILE_SYSTEM_VIRTUALIZATION_BUSY unless the adapter clears the
-    // stale owned root first (regression: remounting used to wedge).
+    // tag after stop. Recovery clears the tag and clean placeholders while
+    // preserving full/local files in the same managed root.
     let (mount2, _handle2) = WindowsMount::mount_with_handle(
         Arc::clone(&fs),
         root.path(),
@@ -351,7 +365,51 @@ fn projfs_mount_lists_reads_once_and_stays_read_only() {
         Duration::from_secs(5),
         "projected ROM path to reappear after remount",
     );
+    assert_eq!(
+        std::fs::metadata(&rom_path).unwrap().len(),
+        bytes.len() as u64,
+        "stat must materialize the virtual entry without hydrating its contents"
+    );
+    let rom_path_wide: Vec<u16> = rom_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut remounted_state = 0;
+    // SAFETY: `rom_path_wide` is a live, null-terminated UTF-16 path and
+    // `remounted_state` is a valid writable output for the duration of call.
+    let state_hr = unsafe { PrjGetOnDiskFileState(rom_path_wide.as_ptr(), &mut remounted_state) };
+    assert!(
+        state_hr >= 0,
+        "query remounted ROM state failed: 0x{:08x}",
+        state_hr as u32
+    );
+    assert_ne!(
+        remounted_state & PRJ_FILE_STATE_PLACEHOLDER,
+        0,
+        "remount must expose a fresh ProjFS placeholder, not a retained full file"
+    );
+    assert_eq!(
+        remounted_state & PRJ_FILE_STATE_HYDRATED_PLACEHOLDER,
+        0,
+        "remount must discard the previous hydrated ProjFS copy before reading"
+    );
     let got = std::fs::read(&rom_path).expect("read ROM after remount");
     assert_eq!(got, bytes, "remounted read is byte-exact");
+    assert_eq!(
+        std::fs::read(&root_user_file).unwrap(),
+        b"updated while stopped",
+        "full local data modified after stop must survive recovery"
+    );
+    assert_eq!(
+        std::fs::read(&save_file).unwrap(),
+        b"keep nested save data",
+        "nested local data must survive recovery"
+    );
+    assert_eq!(
+        server.count("GET", "/api/roms/"),
+        1,
+        "remount must hydrate from the existing private cache without another HTTP transfer"
+    );
     mount2.stop();
 }

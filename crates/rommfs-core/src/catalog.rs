@@ -288,9 +288,11 @@ fn version_key(file: &RomFileDto) -> Option<VersionKey> {
 }
 
 /// Derive the server identity used for cache/root scoping: normalized URL
-/// string (scheme+host+port, no credentials, no trailing slash).
+/// string (scheme+authority+base path, no credentials, no trailing slash).
 pub fn server_id_of(base_url: &str) -> String {
-    let s = base_url.trim();
+    // Match RommClient's treatment of the configured base URL. Preserve a
+    // reverse-proxy path because it can route to a different RomM instance.
+    let s = base_url.trim().trim_end_matches('/');
     let (scheme, rest) = match s.find("://") {
         Some(i) => (s[..i].to_ascii_lowercase(), &s[i + 3..]),
         None => ("http".to_string(), s),
@@ -322,12 +324,18 @@ pub fn server_id_of(base_url: &str) -> String {
     };
 
     let host = host.to_ascii_lowercase();
-    match port {
+    let path_end = rest[authority_end..]
+        .find(['?', '#'])
+        .map(|offset| authority_end + offset)
+        .unwrap_or(rest.len());
+    let path = rest[authority_end..path_end].trim_end_matches('/');
+    let authority = match port {
         Some(p) if !((scheme == "http" && p == 80) || (scheme == "https" && p == 443)) => {
             format!("{scheme}://{host}:{p}")
         }
         _ => format!("{scheme}://{host}"),
-    }
+    };
+    format!("{authority}{path}")
 }
 
 /// A file or directory in the projected tree (inode-model for the adapter).

@@ -88,7 +88,7 @@ impl ContentSource for FlakySource {
 }
 
 /// Writes fewer bytes than the catalogue size and reports success — the
-/// manager must still detect the short write as Truncated.
+/// manager must still detect the size mismatch.
 struct ShortSource {
     bytes: Vec<u8>,
     calls: AtomicUsize,
@@ -254,7 +254,7 @@ fn failed_download_leaves_no_ready_entry_and_retry_succeeds() {
 }
 
 #[test]
-fn short_write_is_reported_as_truncated_not_ready() {
+fn short_write_is_reported_as_a_size_mismatch_not_ready() {
     let dir = tempfile::tempdir().unwrap();
     let k = key(7, 70);
     // Catalogue declares the full size; source only produces half.
@@ -268,15 +268,66 @@ fn short_write_is_reported_as_truncated_not_ready() {
 
     let err = dm.ensure_ready(&e).unwrap_err();
     match err {
-        Error::Truncated { expected, received } => {
+        Error::SizeMismatch { expected, received } => {
             assert_eq!(expected, BYTES.len() as u64);
             assert_eq!(received, short.len() as u64);
         }
-        other => panic!("expected Truncated, got {other:?}"),
+        other => panic!("expected SizeMismatch, got {other:?}"),
     }
     assert!(!dm.is_ready(&k));
     // No partial bytes were published.
     assert!(!dm.index().lock().bin_path(&k).exists());
+}
+
+#[test]
+fn oversized_response_is_rejected_and_never_published() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = key(7, 70);
+    let e = entry(k.clone(), "Game.nes", 3, Some("v1"));
+    let source = Arc::new(BytesSource {
+        bytes: b"too large".to_vec(),
+        calls: AtomicUsize::new(0),
+        gate: None,
+        entered: None,
+    });
+    let (dm, _) = manager(source, dir.path(), std::slice::from_ref(&e));
+
+    let err = dm.ensure_ready(&e).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::SizeMismatch {
+            expected: 3,
+            received: 9
+        }
+    ));
+    assert!(!dm.index().lock().bin_path(&k).exists());
+    assert!(dm
+        .index()
+        .lock()
+        .ready_if_current(&k, Some("v1"))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn missing_ready_file_is_downloaded_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = key(7, 70);
+    let e = entry(k.clone(), "Game.nes", BYTES.len() as u64, Some("v1"));
+    let source = Arc::new(BytesSource {
+        bytes: BYTES.to_vec(),
+        calls: AtomicUsize::new(0),
+        gate: None,
+        entered: None,
+    });
+    let (dm, _) = manager(source.clone(), dir.path(), std::slice::from_ref(&e));
+
+    let path = dm.ensure_ready(&e).unwrap();
+    std::fs::remove_file(path).unwrap();
+    let recovered_path = dm.ensure_ready(&e).unwrap();
+
+    assert_eq!(std::fs::read(recovered_path).unwrap(), BYTES);
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]

@@ -254,21 +254,37 @@ fn inode_plan_is_deterministic_for_an_unchanged_catalogue() {
 }
 
 #[test]
-fn server_id_normalizes_scheme_host_port() {
+fn server_id_normalizes_scheme_host_port_and_preserves_base_path() {
     assert_eq!(server_id_of("http://example.com"), "http://example.com");
     assert_eq!(server_id_of("http://example.com/"), "http://example.com");
     assert_eq!(server_id_of("HTTP://Example.COM:80/"), "http://example.com");
     assert_eq!(
         server_id_of("https://Example.COM:443/x"),
-        "https://example.com"
+        "https://example.com/x"
     );
     assert_eq!(
         server_id_of("http://example.com:8080/api"),
-        "http://example.com:8080"
+        "http://example.com:8080/api"
+    );
+    assert_eq!(
+        server_id_of(" HTTP://Example.COM:80/api/v1/// "),
+        "http://example.com/api/v1"
+    );
+    assert_ne!(
+        server_id_of("https://romm.example/a"),
+        server_id_of("https://romm.example/b")
     );
     assert_eq!(server_id_of("romm.local"), "http://romm.local");
     assert_eq!(
         server_id_of("https://user:secret@example.com:9443/"),
         "https://example.com:9443"
+    );
+    assert_eq!(
+        server_id_of("https://user:secret@example.com:9443/romm/"),
+        "https://example.com:9443/romm"
+    );
+    assert_eq!(
+        server_id_of("https://[2001:DB8::1]:443/romm/"),
+        "https://[2001:db8::1]/romm"
     );
 }

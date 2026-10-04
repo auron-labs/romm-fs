@@ -26,6 +26,10 @@ pub enum Error {
     #[error("truncated body: expected {expected} bytes, got {received}")]
     Truncated { expected: u64, received: u64 },
 
+    /// A completed download did not match the catalogue's declared size.
+    #[error("download size mismatch: expected {expected} bytes, got {received}")]
+    SizeMismatch { expected: u64, received: u64 },
+
     /// Response body could not be parsed as the documented contract.
     #[error("invalid catalogue payload: {0}")]
     InvalidCatalogue(String),

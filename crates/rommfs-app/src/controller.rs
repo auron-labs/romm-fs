@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+const EVICTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnState {
@@ -197,6 +200,14 @@ impl UiState {
         self.prune_downloads();
     }
 
+    /// Mark a mount request pending immediately so a second UI click cannot
+    /// enqueue another start before the worker's MountStarting event arrives.
+    pub fn request_mount(&mut self, path: String) {
+        self.mount = MountState::Mounting;
+        self.mount_path = Some(path);
+        self.mount_error = None;
+    }
+
     fn download_row(&mut self, rom_id: u64, file_name: &str) -> &mut DownloadView {
         if let Some(pos) = self.downloads.iter().position(|d| d.rom_id == rom_id) {
             let row = &mut self.downloads[pos];
@@ -337,6 +348,15 @@ impl Worker {
             return;
         }
 
+        // Starting a new connection replaces the previous session, even when
+        // URL validation or authentication fails. Keep the mounted-session
+        // rejection above intact because that mount still owns its client.
+        self.client = None;
+        self.server_id = None;
+        self.catalogue = None;
+        self.names.clear();
+        self.fs = None;
+
         let client = match RommClient::new(url) {
             Ok(c) => Arc::new(c),
             Err(e) => {
@@ -431,7 +451,8 @@ impl Worker {
     fn start_mount(&mut self, path: &str) {
         let path = path.trim();
         if self.mount.is_some() {
-            self.fail_mount(&Error::Unsupported("already mounted".into()));
+            // Duplicate starts can already be queued when the UI receives
+            // MountStarting. Keep the real mounted state authoritative.
             return;
         }
         let Some(client) = self.client.clone() else {
@@ -607,8 +628,37 @@ impl Worker {
 }
 
 fn worker_loop(rx: mpsc::Receiver<Command>, sink: EventSink) {
-    let mut worker = Worker::new(sink);
-    while let Ok(cmd) = rx.recv() {
+    worker_loop_with_interval_from(rx, Worker::new(sink), EVICTION_INTERVAL);
+}
+
+fn worker_loop_with_interval_from(
+    rx: mpsc::Receiver<Command>,
+    mut worker: Worker,
+    eviction_interval: Duration,
+) {
+    let mut next_eviction = None;
+    loop {
+        let received = if worker.mount.is_some() {
+            let deadline = *next_eviction.get_or_insert_with(|| Instant::now() + eviction_interval);
+            if Instant::now() >= deadline {
+                worker.evict_once();
+                next_eviction = Some(Instant::now() + eviction_interval);
+                continue;
+            }
+            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        } else {
+            next_eviction = None;
+            rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        };
+        let cmd = match received {
+            Ok(cmd) => cmd,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                worker.evict_once();
+                next_eviction = Some(Instant::now() + eviction_interval);
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let shutdown = matches!(cmd, Command::Shutdown);
         // Commands run one at a time on the worker thread; UI stays
         // responsive while network/filesystem work blocks here.
@@ -819,5 +869,168 @@ fn log_line(level: Level, op: &'static str, message: String) -> rommfs_core::eve
         level,
         op,
         message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rommfs_core::cache::{CacheIndex, FakeClock, LiveState, NoopHydratedRemover};
+    use rommfs_core::download::ContentSource;
+    use rommfs_core::romm::PlatformDto;
+    use std::io::Write;
+    use std::time::Duration;
+
+    struct UnusedSource;
+
+    impl ContentSource for UnusedSource {
+        fn fetch(
+            &self,
+            _key: &RomKey,
+            _writer: &mut dyn Write,
+            _progress: &mut dyn FnMut(u64, Option<u64>),
+        ) -> Result<u64> {
+            unreachable!("the eviction test never reads ROM content")
+        }
+    }
+
+    #[test]
+    fn failed_reconnect_discards_previous_worker_session() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 2048];
+            let _ = std::io::Read::read(&mut stream, &mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.client = Some(Arc::new(
+            RommClient::new("http://previous.invalid").unwrap(),
+        ));
+        worker.server_id = Some("http://previous.invalid".into());
+        worker.names.insert(
+            RomKey {
+                server_id: "http://previous.invalid".into(),
+                rom_id: 1,
+                file_id: 2,
+            },
+            "old.nes".into(),
+        );
+
+        worker.connect(&format!("http://{address}"), "user", "password");
+        server.join().unwrap();
+
+        assert!(worker.client.is_none());
+        assert!(worker.server_id.is_none());
+        assert!(worker.catalogue.is_none());
+        assert!(worker.names.is_empty());
+        assert!(matches!(events.try_recv(), Ok(AppEvent::Connecting)));
+        assert!(matches!(events.try_recv(), Ok(AppEvent::SignInRequired)));
+    }
+
+    #[test]
+    fn duplicate_mount_start_preserves_the_active_mount() {
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.mount = Some(ActiveMount {
+            root: PathBuf::from("active-root"),
+            stop_fn: Box::new(|| {}),
+        });
+
+        worker.start_mount("another-root");
+
+        assert_eq!(
+            worker.mount.as_ref().unwrap().root,
+            PathBuf::from("active-root")
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "duplicate start must not emit failure"
+        );
+    }
+
+    #[test]
+    fn worker_loop_sweeps_again_after_the_mount_start_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = RomKey {
+            server_id: "fixture".into(),
+            rom_id: 12,
+            file_id: 34,
+        };
+        let cache_dir = dir.path().to_path_buf();
+        let bin = cache_dir.join(format!("{}.bin", key.cache_stem()));
+        let worker_bin = bin.clone();
+        let (sink, events) = rommfs_core::events::channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let worker_thread = std::thread::spawn(move || {
+            // Construct Worker inside its owning thread: ActiveMount may
+            // contain a platform mount handle that is intentionally !Send.
+            let mut index = CacheIndex::open(&cache_dir).unwrap();
+            std::fs::write(&worker_bin, b"cached bytes").unwrap();
+            index.mark_ready(&key, 12, None, "nes/game.nes").unwrap();
+            index.touch(&key, 0).unwrap();
+
+            let live = Arc::new(LiveState::default());
+            let downloads = Arc::new(DownloadManager::new(
+                index,
+                Arc::clone(&live),
+                Arc::new(UnusedSource),
+                rommfs_core::events::channel().0,
+                HashMap::new(),
+                HashMap::new(),
+            ));
+            let catalogue = build_catalogue(
+                "fixture",
+                &[PlatformDto {
+                    id: 1,
+                    slug: "nes".into(),
+                    fs_slug: "nes".into(),
+                    name: "Nintendo".into(),
+                    custom_name: None,
+                    rom_count: 0,
+                }],
+                &[],
+                |_| {},
+            )
+            .unwrap();
+            let fs = Arc::new(RommFs::new(
+                RommTree::new(catalogue),
+                downloads,
+                Evictor::new(1, live, Arc::new(NoopHydratedRemover)),
+                Arc::new(FakeClock::new(100)),
+            ));
+            let worker = Worker {
+                sink,
+                client: None,
+                server_id: None,
+                catalogue: None,
+                names: HashMap::from([(key, "game.nes".into())]),
+                fs: Some(fs),
+                mount: Some(ActiveMount {
+                    root: cache_dir,
+                    stop_fn: Box::new(|| {}),
+                }),
+            };
+            worker_loop_with_interval_from(cmd_rx, worker, Duration::from_millis(10));
+        });
+
+        let event = events.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(event, AppEvent::Evicted { rom_id: 12, .. }));
+        assert!(
+            !bin.exists(),
+            "the periodic sweep removes stale cache bytes"
+        );
+
+        cmd_tx.send(Command::Shutdown).unwrap();
+        worker_thread.join().unwrap();
     }
 }
