@@ -19,9 +19,14 @@ pub struct RomKey {
 
 impl RomKey {
     /// Filesystem-safe cache file stem derived from the identity (never from
-    /// untrusted filenames).
+    /// untrusted filenames). Stable across runs: FNV-1a of the server id.
     pub fn cache_stem(&self) -> String {
-        todo!("sanitized server-hash / rom_id / file_id stem")
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in self.server_id.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        format!("{h:016x}-{}-{}", self.rom_id, self.file_id)
     }
 }
 
