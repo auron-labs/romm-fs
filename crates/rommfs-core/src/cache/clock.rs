@@ -31,7 +31,9 @@ pub struct FakeClock {
 }
 impl FakeClock {
     pub fn new(start: u64) -> Self {
-        Self { secs: AtomicU64::new(start) }
+        Self {
+            secs: AtomicU64::new(start),
+        }
     }
     pub fn advance(&self, secs: u64) {
         self.secs.fetch_add(secs, Ordering::SeqCst);
