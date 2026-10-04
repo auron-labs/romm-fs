@@ -15,8 +15,12 @@
 
 use crate::error::{Error, Result};
 use crate::romm::types::*;
-use std::io::Write;
+use isahc::prelude::*;
+use std::io::{Read, Write};
 use std::time::Duration;
+
+/// Page size used by `all_roms`.
+const ROMS_PAGE_LIMIT: u64 = 200;
 
 /// Username/password pair; kept in memory only, never logged or persisted.
 pub struct Credentials<'a> {
@@ -61,7 +65,17 @@ impl RommClient {
         if base_url.trim().is_empty() {
             return Err(Error::InvalidCatalogue("empty server URL".into()));
         }
-        todo!("normalize base url (strip trailing /), build isahc client")
+        let base_url = base_url.trim().trim_end_matches('/').to_string();
+        // Validate the URL shape early so catalogue calls never build a bad
+        // request mid-mount.
+        isahc::Request::get(&base_url)
+            .body(())
+            .map_err(|_| Error::InvalidCatalogue("invalid server URL".into()))?;
+        Ok(Self {
+            base_url,
+            download: DownloadConfig::default(),
+            token: std::sync::RwLock::new(None),
+        })
     }
 
     pub fn with_download_config(mut self, cfg: DownloadConfig) -> Self {
@@ -72,8 +86,29 @@ impl RommClient {
     /// OAuth2 password grant. On success the token is held in memory and sent
     /// as `Authorization: Bearer` on every subsequent call.
     pub fn authenticate(&self, creds: Credentials<'_>) -> Result<()> {
-        let _ = creds;
-        todo!("POST base/api/token form; map 401->Auth, 403->Forbidden; store access_token")
+        let body = format!(
+            "grant_type=password&username={}&password={}&scope=platforms.read+roms.read",
+            form_encode(creds.username),
+            form_encode(creds.password)
+        );
+        let request = isahc::Request::post(format!("{}/api/token", self.base_url))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
+            .map_err(|e| Error::Transport(format!("request build failed: {e}")))?;
+        let mut resp = request.send().map_err(transport)?;
+        match resp.status().as_u16() {
+            s if (200..300).contains(&s) => {
+                let token: TokenResponse = resp.json().map_err(invalid_payload)?;
+                *self.token.write().unwrap() = Some(token.access_token);
+                Ok(())
+            }
+            401 => Err(Error::Auth("credentials rejected by server".into())),
+            403 => Err(Error::Forbidden(detail_of(&mut resp))),
+            s => Err(Error::Http {
+                status: s,
+                message: detail_of(&mut resp),
+            }),
+        }
     }
 
     /// Clear the held token (sign-out / after an Auth failure surfaces).
@@ -88,18 +123,33 @@ impl RommClient {
 
     /// `GET /api/platforms` — all accessible platforms.
     pub fn platforms(&self) -> Result<Vec<PlatformDto>> {
-        todo!()
+        self.get_json("/api/platforms")
     }
 
     /// One page of `GET /api/roms?with_files=true&limit=&offset=`.
     pub fn roms_page(&self, limit: u64, offset: u64) -> Result<RomsPage> {
-        let _ = (limit, offset);
-        todo!()
+        self.get_json(&format!(
+            "/api/roms?limit={limit}&offset={offset}&with_files=true"
+        ))
     }
 
     /// The complete ROM list across every page needed.
     pub fn all_roms(&self) -> Result<Vec<RomDto>> {
-        todo!("loop roms_page with page size 200 until total reached or short/empty page")
+        let mut out = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let page = self.roms_page(ROMS_PAGE_LIMIT, offset)?;
+            let got = page.items.len() as u64;
+            out.extend(page.items);
+            offset += got;
+            // Stop when the declared total is covered or the page came back
+            // short/empty (per the verified contract).
+            let done = page.total.is_some_and(|t| offset >= t) || got < ROMS_PAGE_LIMIT;
+            if done || got == 0 {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Stream `GET /api/roms/{rom_id}/content/{file_name}` into `writer`.
@@ -115,7 +165,156 @@ impl RommClient {
         writer: &mut dyn Write,
         progress: &mut dyn FnMut(u64, Option<u64>),
     ) -> Result<u64> {
-        let _ = (rom_id, file_name, writer, progress);
-        todo!("percent-encode file_name; stream chunks via isahc with low_speed_timeout")
+        let url = format!(
+            "{}/api/roms/{}/content/{}",
+            self.base_url,
+            rom_id,
+            path_encode(file_name)
+        );
+        let mut builder = isahc::Request::get(url)
+            .connect_timeout(self.download.connect_timeout)
+            .low_speed_timeout(
+                self.download.low_speed_bytes_per_sec.min(u32::MAX as u64) as u32,
+                self.download.low_speed_window,
+            );
+        if let Some(t) = self.token.read().unwrap().clone() {
+            builder = builder.header("Authorization", format!("Bearer {t}"));
+        }
+        let request = builder
+            .body(())
+            .map_err(|e| Error::Transport(format!("request build failed: {e}")))?;
+        let mut resp = request.send().map_err(transport)?;
+        match resp.status().as_u16() {
+            s if (200..300).contains(&s) => {}
+            401 => {
+                self.clear_token();
+                return Err(Error::Auth("session expired or token rejected".into()));
+            }
+            403 => return Err(Error::Forbidden(detail_of(&mut resp))),
+            s => {
+                return Err(Error::Http {
+                    status: s,
+                    message: detail_of(&mut resp),
+                });
+            }
+        }
+
+        let total = resp
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        let mut received = 0u64;
+        let mut buf = vec![0u8; self.download.chunk_bytes.max(1)];
+        let body = resp.body_mut();
+        loop {
+            match body.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    writer.write_all(&buf[..n]).map_err(Error::Io)?;
+                    received += n as u64;
+                    progress(received, total);
+                }
+                Err(e) => {
+                    // Body-read failures are wrapped isahc errors: a clean
+                    // early close lands as partial-file (io), a stall lands
+                    // as the no-progress timeout.
+                    let e = isahc::Error::from(e);
+                    if e.is_timeout() {
+                        return Err(Error::Transport(format!("transfer stalled: {e}")));
+                    }
+                    if let Some(t) = total {
+                        if received < t {
+                            return Err(Error::Truncated {
+                                expected: t,
+                                received,
+                            });
+                        }
+                    }
+                    return Err(transport(e));
+                }
+            }
+        }
+        if let Some(t) = total {
+            if received < t {
+                return Err(Error::Truncated {
+                    expected: t,
+                    received,
+                });
+            }
+        }
+        Ok(received)
     }
+
+    /// Authenticated `GET` whose body is parsed as the documented JSON shape.
+    /// A mid-session 401 clears the token (sign-in is required again).
+    fn get_json<T: serde::de::DeserializeOwned>(&self, path_and_query: &str) -> Result<T> {
+        let mut builder = isahc::Request::get(format!("{}{path_and_query}", self.base_url));
+        if let Some(t) = self.token.read().unwrap().clone() {
+            builder = builder.header("Authorization", format!("Bearer {t}"));
+        }
+        let request = builder
+            .body(())
+            .map_err(|e| Error::Transport(format!("request build failed: {e}")))?;
+        let mut resp = request.send().map_err(transport)?;
+        match resp.status().as_u16() {
+            s if (200..300).contains(&s) => resp.json().map_err(invalid_payload),
+            401 => {
+                self.clear_token();
+                Err(Error::Auth("session expired or token rejected".into()))
+            }
+            403 => Err(Error::Forbidden(detail_of(&mut resp))),
+            s => Err(Error::Http {
+                status: s,
+                message: detail_of(&mut resp),
+            }),
+        }
+    }
+}
+
+/// Network/connect/stream failures all surface as Transport; messages carry
+/// no credentials (the token only ever travels in the Authorization header).
+fn transport(e: isahc::Error) -> Error {
+    Error::Transport(e.to_string())
+}
+
+fn invalid_payload(e: serde_json::Error) -> Error {
+    Error::InvalidCatalogue(e.to_string())
+}
+
+/// Short response-body detail for error reporting, credentials excluded.
+fn detail_of(resp: &mut isahc::Response<isahc::Body>) -> String {
+    match resp.text() {
+        Ok(t) => t.chars().take(200).collect(),
+        Err(_) => "no response body".to_string(),
+    }
+}
+
+/// `application/x-www-form-urlencoded` value encoding: unreserved characters
+/// are kept, everything else is percent-encoded at the UTF-8 byte level.
+fn form_encode(s: &str) -> String {
+    pct_encode(s)
+}
+
+/// Percent-encode one URL path segment (the `file_name` of a content URL).
+fn path_encode(s: &str) -> String {
+    pct_encode(s)
+}
+
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
+            }
+        }
+    }
+    out
 }

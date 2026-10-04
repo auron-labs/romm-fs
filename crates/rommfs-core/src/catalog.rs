@@ -3,7 +3,9 @@
 //! (PRD R1: no polling/live sync — stop/start reloads).
 
 use crate::error::Result;
-use crate::romm::{PlatformDto, RomDto};
+use crate::romm::{PlatformDto, RomDto, RomFileDto};
+use crate::sanitize::{disambiguate, sanitize_component};
+use std::collections::{HashMap, HashSet};
 
 /// Stable per-ROM content identity scoped to the server + ROM + file.
 /// Version metadata (sha1/md5/crc/last_modified/size) distinguishes known
@@ -64,6 +66,40 @@ pub struct Catalogue {
     inodes: Vec<(u64, u64, u64)>, // (inode, parent_inode, rom_index)
 }
 
+impl Catalogue {
+    /// Inode of the platform dir at `index` in `platforms`.
+    pub fn platform_inode(&self, index: usize) -> Option<u64> {
+        (index < self.platforms.len()).then(|| 2 + index as u64)
+    }
+
+    /// Inode of the ROM file at `rom_index` in `entries`.
+    pub fn rom_inode(&self, rom_index: usize) -> Option<u64> {
+        (rom_index < self.entries.len()).then(|| 2 + self.platforms.len() as u64 + rom_index as u64)
+    }
+
+    /// Classify an inode as root / platform dir / ROM file.
+    pub fn inode_kind(&self, inode: u64) -> Option<NodeKind> {
+        match inode {
+            1 => Some(NodeKind::Root),
+            i if i >= 2 && i < 2 + self.platforms.len() as u64 => Some(NodeKind::PlatformDir {
+                index: (i - 2) as usize,
+            }),
+            i => {
+                let idx = i
+                    .checked_sub(2 + self.platforms.len() as u64)
+                    .map(|v| v as usize);
+                idx.filter(|&r| r < self.entries.len())
+                    .map(|index| NodeKind::Rom { index })
+            }
+        }
+    }
+
+    /// The inode plan: (inode, parent inode, rom index) for every file node.
+    pub fn inode_plan(&self) -> &[(u64, u64, u64)] {
+        &self.inodes
+    }
+}
+
 /// Build the catalogue from verified-contract DTOs. Pure; no IO.
 ///
 /// Rules: one `files` entry per ROM (else skip+count); platform dir =
@@ -76,15 +112,224 @@ pub fn build_catalogue(
     roms: &[RomDto],
     mut warn: impl FnMut(String),
 ) -> Result<Catalogue> {
-    let _ = (server_id, platforms, roms, &mut warn);
-    todo!()
+    // fs_slug -> visible dir name; `None` = rejected component, ROMs on it
+    // are unplaceable and skip with the same accounting.
+    let mut dir_of_slug: HashMap<String, Option<String>> = HashMap::new();
+    let mut taken_dirs: HashSet<String> = HashSet::new();
+
+    for p in platforms {
+        dir_of_slug.insert(
+            p.fs_slug.clone(),
+            platform_dir(&p.fs_slug, &mut taken_dirs, &mut warn),
+        );
+    }
+
+    let mut skipped_unsupported = 0usize;
+    let mut entries: Vec<RomEntry> = Vec::new();
+    // dir -> lowercase visible names already taken in that dir.
+    let mut taken_names: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for rom in roms {
+        if rom.files.len() != 1 {
+            skipped_unsupported += 1;
+            warn(format!(
+                "rom {} ({:?}): {} file entries — multi-file/folder games are unsupported, skipped",
+                rom.id,
+                rom.fs_name,
+                rom.files.len()
+            ));
+            continue;
+        }
+        let file = &rom.files[0];
+
+        let platform_dir = match dir_of_slug.get(&rom.platform_fs_slug) {
+            Some(Some(dir)) => dir.clone(),
+            Some(None) => {
+                skipped_unsupported += 1;
+                warn(format!(
+                    "rom {} ({:?}): platform fs_slug {:?} rejected, skipped",
+                    rom.id, rom.fs_name, rom.platform_fs_slug
+                ));
+                continue;
+            }
+            None => {
+                // ROM references a platform absent from the platform list —
+                // still derive its dir from the ROM's own fs_slug so the
+                // library stays complete.
+                let dir = platform_dir(&rom.platform_fs_slug, &mut taken_dirs, &mut warn);
+                dir_of_slug.insert(rom.platform_fs_slug.clone(), dir.clone());
+                match dir {
+                    Some(dir) => dir,
+                    None => {
+                        skipped_unsupported += 1;
+                        warn(format!(
+                            "rom {} ({:?}): platform fs_slug {:?} rejected, skipped",
+                            rom.id, rom.fs_name, rom.platform_fs_slug
+                        ));
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let file_name = match sanitize_component(&file.file_name) {
+            Some(c) => c.name().to_string(),
+            None => {
+                skipped_unsupported += 1;
+                warn(format!(
+                    "rom {} ({:?}): file name {:?} rejected, skipped",
+                    rom.id, rom.fs_name, file.file_name
+                ));
+                continue;
+            }
+        };
+
+        let taken = taken_names.entry(platform_dir.clone()).or_default();
+        let file_name = disambiguate(&file_name, &|n: &str| taken.contains(n));
+        if file_name != file.file_name {
+            warn(format!(
+                "rom {} ({:?}): visible name adjusted to {:?}",
+                rom.id, rom.fs_name, file_name
+            ));
+        }
+        taken.insert(file_name.to_lowercase());
+
+        entries.push(RomEntry {
+            key: RomKey {
+                server_id: server_id.to_string(),
+                rom_id: rom.id,
+                file_id: file.id,
+            },
+            platform_dir,
+            file_name,
+            size: file.file_size_bytes,
+            content_name: file.file_name.clone(),
+            version: version_key(file),
+        });
+    }
+
+    // Deterministic order: platform dirs sorted, entries grouped per dir and
+    // sorted by visible name inside each dir.
+    let mut platform_names: Vec<String> = dir_of_slug
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    platform_names.sort();
+    entries.sort_by(|a, b| {
+        a.platform_dir
+            .cmp(&b.platform_dir)
+            .then_with(|| a.file_name.cmp(&b.file_name))
+    });
+
+    let base = 2 + platform_names.len() as u64;
+    let inodes: Vec<(u64, u64, u64)> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let parent = platform_names
+                .iter()
+                .position(|p| p == &e.platform_dir)
+                .map(|p| 2 + p as u64)
+                .unwrap_or(1);
+            (base + i as u64, parent, i as u64)
+        })
+        .collect();
+
+    Ok(Catalogue {
+        platforms: platform_names,
+        entries,
+        skipped_unsupported,
+        inodes,
+    })
+}
+
+/// Sanitize one `fs_slug` into a platform dir name, deduplicated
+/// case-insensitively against `taken_dirs` (which is updated on success).
+fn platform_dir(
+    fs_slug: &str,
+    taken_dirs: &mut HashSet<String>,
+    warn: &mut impl FnMut(String),
+) -> Option<String> {
+    let name = match sanitize_component(fs_slug) {
+        Some(c) => c.name().to_string(),
+        None => {
+            warn(format!("platform fs_slug {fs_slug:?} rejected"));
+            return None;
+        }
+    };
+    let dir = disambiguate(&name, &|n: &str| taken_dirs.contains(n));
+    if dir != name {
+        warn(format!(
+            "platform dir {name:?} collides, adjusted to {dir:?}"
+        ));
+    }
+    taken_dirs.insert(dir.to_lowercase());
+    Some(dir)
+}
+
+/// Best available content-version fingerprint for one file:
+/// sha1, else md5, else crc, else a last-modified+size composite.
+fn version_key(file: &RomFileDto) -> Option<VersionKey> {
+    if let Some(h) = &file.sha1_hash {
+        return Some(VersionKey(format!("sha1:{h}")));
+    }
+    if let Some(h) = &file.md5_hash {
+        return Some(VersionKey(format!("md5:{h}")));
+    }
+    if let Some(h) = &file.crc_hash {
+        return Some(VersionKey(format!("crc:{h}")));
+    }
+    file.last_modified
+        .as_ref()
+        .map(|lm| VersionKey(format!("lastmod:{lm}+size:{}", file.file_size_bytes)))
 }
 
 /// Derive the server identity used for cache/root scoping: normalized URL
 /// string (scheme+host+port, no credentials, no trailing slash).
 pub fn server_id_of(base_url: &str) -> String {
-    let _ = base_url;
-    todo!()
+    let s = base_url.trim();
+    let (scheme, rest) = match s.find("://") {
+        Some(i) => (s[..i].to_ascii_lowercase(), &s[i + 3..]),
+        None => ("http".to_string(), s),
+    };
+    let authority_end = rest
+        .find(|c| c == '/' || c == '?' || c == '#')
+        .unwrap_or(rest.len());
+    // Strip any userinfo.
+    let authority = rest[..authority_end].rsplit('@').next().unwrap_or_default();
+
+    let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
+        // Bracketed literal (IPv6): host keeps its brackets.
+        match stripped.find(']') {
+            Some(e) => {
+                let host = &authority[..=e + 1];
+                let port = authority[e + 2..]
+                    .strip_prefix(':')
+                    .and_then(|p| p.parse::<u16>().ok());
+                (host, port)
+            }
+            None => (authority, None),
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => match p.parse::<u16>() {
+                Ok(p) => (h, Some(p)),
+                Err(_) => (authority, None),
+            },
+            None => (authority, None),
+        }
+    };
+
+    let host = host.to_ascii_lowercase();
+    match port {
+        Some(p) if !((scheme == "http" && p == 80) || (scheme == "https" && p == 443)) => {
+            format!("{scheme}://{host}:{p}")
+        }
+        _ => format!("{scheme}://{host}"),
+    }
 }
 
 /// A file or directory in the projected tree (inode-model for the adapter).
