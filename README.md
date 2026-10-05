@@ -5,8 +5,8 @@ library as ordinary filesystem paths (e.g. `C:\RomM\nes\Example Game.nes`)
 so frontends like ES-DE discover ROMs like a normal ROM folder — while ROM
 bytes only download the first time something actually reads them.
 
-Built as a Rust workspace; mounts through Windows **ProjFS** via the
-[`fsk`](https://crates.io/crates/fsk) crate and shows one small **GPUI**
+Built as a Rust workspace; mounts through Windows **WinFsp** via the
+[`winfsp`](https://crates.io/crates/winfsp) crate and shows one small **GPUI**
 window.
 
 ## Workspace
@@ -15,16 +15,16 @@ window.
 |---|---|
 | `rommfs-core` | RomM HTTP client, catalogue→inode tree, sanitization, SQLite cache index, atomic download manager, eviction policy, `RommFs` facade. No Windows APIs — all unit tests run headless. |
 | `rommfs-fixture` | In-process HTTP fixture server implementing the verified RomM 5.3.1 contract for tests (route hit counters prove no-download-on-listing, single-flight downloads). |
-| `rommfs-fsk` | Windows-only ProjFS adapter (`#[cfg(windows)]`): read-only veto of mutation notifications, `PrjDeleteFile`-backed hydrated eviction, mount-root safety. |
+| `rommfs-winfsp` | WinFsp adapter: read-only volume, per-open cache guards, lazy reads, and portable mount-root validation. |
 | `rommfs-app` | The GPUI window + headless controller (connect → catalogue → mount, live download progress, bounded log). |
 
 ## Requirements
 
-- Windows 10 20H1+ (tested on Windows Server 2022) with the **Client-ProjFS**
-  optional feature enabled:
-  ```powershell
-  Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
-  ```
+- Windows with [WinFsp 2.1 or later](https://winfsp.dev/rel/) installed.
+  Install the runtime and Developer components when building from source.
+  RomMFS reports a missing runtime when mounting; it does not install drivers.
+- An MSVC Rust toolchain and Visual Studio C++ build tools, including the
+  Windows SDK and Clang (the WinFsp bindings use bindgen).
 - Rust 1.89+ (the locked GPUI dependency graph includes `uuid 1.27`, which
   requires Rust 1.89)
 - A reachable RomM server. Tested against **RomM 5.3.1** — see
@@ -39,10 +39,12 @@ cargo run -p rommfs-app
 
 Enter the server URL + credentials, press **Connect**, choose a mount root
 (an empty directory, or one RomMFS previously claimed), press **Start**.
+The ownership marker is stored beside the mount directory as
+`<folder>.rommfs-root`; keep it for subsequent mounts.
 Read-only ROM files appear per platform; reading a file downloads it once
 into a private cache (`%LOCALAPPDATA%\rommfs\cache\<server>`); later reads
-are local. Entries unused for 14 days are evicted (bin + ProjFS-hydrated
-copy); a ROM with an open handle is never evicted.
+are local. Entries unused for 14 days are evicted from the private cache;
+a ROM with an open handle is never evicted.
 
 Closing the window stops the mount — there is no tray/background process,
 and no credentials are ever persisted or logged.
@@ -56,16 +58,21 @@ macOS, and Windows:
 cargo test -p rommfs-core -p rommfs-fixture -p rommfs-app --no-default-features
 ```
 
-The app and ProjFS adapter require Windows. On Windows, run the workspace
-tests (including the native ProjFS mount test) with:
+The desktop app and native WinFsp mount require Windows. On Windows, run the workspace
+tests (including the native WinFsp mount test) with:
 
 ```powershell
 cargo test --workspace
+# Run only the native mount test:
+cargo test -p rommfs-winfsp --test winfsp_native
 ```
 
-The native test (`projfs_native.rs`) mounts a real `RommFs` on a temp root
-and proves enumeration never downloads, first read downloads once
-byte-exact, warm reads are cached, and del/ren/write attempts are vetoed.
+The native test (`winfsp_native.rs`) mounts a real `RommFs` on a temp root
+and checks that enumeration never downloads, first read downloads once
+byte-exact, warm reads are cached, mutations and new file creation fail,
+open handles prevent eviction, eviction triggers a fresh download, and remount
+reuses the private cache. Native Windows build and runtime tests are deferred
+to a later Windows session; they have not run on this Linux development host.
 
 ### Live-RomM harness
 
@@ -74,10 +81,10 @@ placeholder ROMs (`nes`, `snes`, `gb` — committed, sha256-verifiable):
 
 ```bash
 cd testing/romm-harness && docker compose up -d   # see its README
-cargo test -p rommfs-fsk --test live_romm -- --ignored
+cargo test -p rommfs-winfsp --test live_romm -- --ignored
 ```
 
-The E2E mounts the live server through real ProjFS and byte-compares every
+The E2E mounts the live server through real WinFsp and byte-compares every
 projected ROM against the committed sources.
 
 ## Frontend setup (example: ES-DE)
@@ -181,13 +188,13 @@ live RomM server.
 - Single-file ROMs only: multi-file games are skipped and counted in the
   log/status line.
 - Catalogue is a mount-time snapshot — no live sync; Stop+Start reloads.
-- Creating brand-new files inside the root cannot be vetoed (ProjFS
-  `PRJ_NOTIFY_NEW_FILE_CREATED` is post-only); the tree stays read-only
-  for projected entries — deletes/renames/writes on them are rejected.
-- After unmount, ProjFS leaves its virtualization-root reparse tag and
-  hydrated files behind. The next mount clears the owned root's tag and
-  clean ProjFS placeholders, preserving local and modified files. ROMs are
-  re-projected lazily from the private cache without re-downloading.
+- The mounted volume is read-only, including new files and directories.
+  Store saves outside the ROM mount.
+- WinFsp uses a directory junction and removes it on unmount. RomMFS restores
+  the empty folder; ROM bytes remain only in the private cache.
+- Migration from the old backend requires a fresh empty mount folder. Old
+  roots may contain hydrated ROMs, modified files, or local saves; RomMFS
+  refuses to mount over them and never clears them automatically.
 - Server identity includes the configured URL's base path. When upgrading
   a mount configured with a base path, choose a new empty mount folder;
   older root markers used only the host and cannot safely identify that
@@ -195,13 +202,15 @@ live RomM server.
 - Auth tokens live in memory only. Save-sync consent, selection, journal, and
   staged snapshots persist separately under the user's private settings path;
   ROM bytes remain in the separate content cache.
-- Windows-only mount backend (`rommfs-fsk` is a `cfg(windows)` target dep);
-  core/fixture crates stay portable for tests.
+- Windows-only mount APIs and dependencies; root validation, core, fixture,
+  and headless app tests remain portable.
 
 ## Development notes
 
-- `fsk = 0.0.9` pinned via committed `Cargo.lock` — feasibility rationale in
+- `winfsp = 0.13.1` pinned via committed `Cargo.lock` — feasibility rationale in
   `.planning/BACKEND-DECISION.md`.
+- The WinFsp Rust bindings are GPL-3.0; review their license when distributing
+  binaries. The workspace package metadata still describes its own code as MIT.
 - `.planning/PRD.md` is the source spec this implements (R1–R5).
 - Format all crates with `cargo fmt --all`. On Windows, lint the full workspace
   with `cargo clippy --workspace --all-targets`; on other platforms, lint the

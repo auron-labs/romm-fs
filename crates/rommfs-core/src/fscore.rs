@@ -110,7 +110,7 @@ impl RommFs {
         Ok(n)
     }
 
-    /// Record an open for access tracking (Windows notification path calls
+    /// Record an open for access tracking (WinFsp open callback calls
     /// this — warm reads may bypass `read_at` but opens still count).
     /// Returns the active-use guard; caller drops it at close.
     pub fn note_open(&self, inode: u64) -> Option<ActiveGuard> {
@@ -126,7 +126,7 @@ impl RommFs {
     }
 
     /// Run one eviction sweep. The hydrated remover handles the
-    /// platform-managed copy (PrjDeleteFile on Windows).
+    /// platform-managed copy, if any. WinFsp has no persistent hydrated copy.
     pub fn evict_stale(&self) -> Result<EvictionOutcome> {
         let key_paths = &self.key_paths;
         self.evictor.sweep(

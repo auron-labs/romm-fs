@@ -11,7 +11,7 @@ This document defines the complete PoC scope. Reference projects are API documen
 ### MVP decisions
 
 - **Ship Windows first**, using a folder such as `C:\RomM`, not a new drive-letter implementation.
-- **Try `fsk` first**, subject to the concrete feasibility check below. Use **GPUI** for the small desktop window.
+- **Use WinFsp**, as requested on 2026-10-05. Use **GPUI** for the small desktop window.
 - Keep the filesystem/client/cache logic independent of the UI and Windows-only code. Linux is the next target, particularly SteamOS and Batocera, but their deployment and UI integration are **not deliverables for this PoC**. macOS is also deferred.
 - One running application, one configured RomM server, one mount. No separate daemon or service.
 - Prove the workflow with **single-file ROMs**, downloaded unchanged and in full. Folder-based/multi-file games are outside this PoC; report them as unsupported rather than pretending a generated ZIP is the original game file.
@@ -19,24 +19,22 @@ This document defines the complete PoC scope. Reference projects are API documen
 
 ## 2. Backend decision: a small experiment, not a research project
 
-The documentation reviewed on 4 October 2026 lists `fsk` 0.0.9. It has a small synchronous `Filesystem` interface, with optional network lifecycle hooks. Windows uses ProjFS; Linux uses FUSE. `unifuse` instead exposes an async interface and uses WinFSP on Windows. These are different Windows semantics—not interchangeable mounting implementations. [S1–S3]
+Use the `winfsp` Rust bindings and a read-only Windows volume. This supersedes
+all earlier backend selection and optional-feature requirements. Keep the
+existing portable `RommFs` facade and GPUI window.
 
-**Better developer experience means less application-specific glue while meeting this PoC’s behavior. It is not established merely because the public trait is small.**
+Verify Windows behavior through ordinary OS operations:
 
-Start with a disposable-file backend using `fsk`. On Windows, establish that it can:
+1. List/stat directories and files without content downloads; read correct bytes on demand.
+2. Reopen cached ROMs and track each open handle to prevent active eviction.
+3. Evict private cached bytes while keeping catalogue entries discoverable; re-download on the next read.
+4. Reject writes, creation, rename and deletion throughout the volume; stop and remount cleanly.
 
-1. Project a directory and file, list/stat them without reading their contents, and supply correct bytes on demand.
-2. Support cached reopening and observe enough access/lifetime information to avoid evicting an actively used file.
-3. Remove hydrated data while leaving the virtual entry discoverable and downloadable again.
-4. Prevent modification, renaming, and deletion of projected ROM entries, and stop/restart the provider against its managed root.
-
-Inspect the actual Windows implementation, not only Linux-generated rustdoc. Small, isolated Windows API glue is allowed. Do not assume default mutation errors or network open/close hooks enforce identical behavior on every backend.
-
-**Selection rule:** retain `fsk` when this is achievable without maintaining a substantial backend fork. If a reproduced limitation prevents the required behavior or demands such a fork, record the exact limitation and use `unifuse` as the single fallback. Do not maintain both implementations, build a backend selector, or undertake a general filesystem-library comparison. Do not switch merely because the dependency is young.
-
-Pin the selected dependency version or commit and commit the lockfile. GPUI’s documented Windows and Linux backends make it a reasonable UI choice, but compile a minimal Windows window before building the full screen. Do not implement two UI frameworks. [S4]
-
-**Missing Windows access is not a failed feasibility experiment.** In that environment, keep `fsk` provisional, implement the portable behavior and native test harness, and report native validation as not run. Continue independent work; do not wait for human sign-off between phases or claim that mocks proved mounting works.
+WinFsp has no persistent hydrated copy in the mount directory. Its runtime is
+installed separately; report missing prerequisites without elevation. Pin the
+bindings in the lockfile. At the user's request, native Windows build and
+runtime validation are deferred and do not gate completion of this migration.
+Portable tests and cross-compilation do not prove that mounting works.
 
 ## 3. Required user workflow
 
@@ -80,7 +78,7 @@ Listing, lookup, and stat must not download ROM contents. Implement directory co
 
 Validate remote path components before using them locally. Reject traversal/absolute paths. Handle Windows-invalid names, reserved names, and case-insensitive collisions deterministically while preserving the file extension; log any necessary visible-name adjustment. Do not silently overwrite or merge different ROMs. Derive private cache paths from stable identities, not untrusted response filenames.
 
-Projected ROM entries are read-only. No writes, renames, deletions, or uploads are supported. Verify this through ordinary Windows filesystem operations; returning an error from the Rust trait alone is not proof. Local files that appear in a ProjFS root are never permission to upload or purge user data. Only app-owned, identified cached ROM data is eligible for cleanup.
+Projected ROM entries are read-only. No writes, renames, deletions, or uploads are supported. Verify this through ordinary Windows filesystem operations; returning an error from the Rust trait alone is not proof. Existing files in a chosen mount folder are never permission to upload or purge user data; refuse nonempty roots. Only app-owned, identified cached ROM data is eligible for cleanup.
 
 ### R3 — Download on first content read
 
@@ -100,17 +98,17 @@ On a failed/truncated download, disk-write failure, or connection/stall timeout:
 
 Use a small SQLite index for cache identity, completion state, and last use; keep transient downloads and active-use tracking in memory. Completed downloads and last-use records survive app restarts. Ignore/remove incomplete app-owned downloads on restart rather than treating them as complete.
 
-Scope cache identities to the server and ROM/file identity. Use available version/hash metadata to invalidate known changed content when reloading the catalogue, including any corresponding Windows-hydrated copy. Do not build change detection beyond the supplied metadata or claim detection of remote edits that leave it unchanged.
+Scope cache identities to the server and ROM/file identity. Use available version/hash metadata to invalidate known changed content when reloading the catalogue. Do not build change detection beyond the supplied metadata or claim detection of remote edits that leave it unchanged.
 
 Record file access/open activity, including warm Windows accesses that may bypass the provider’s `read` method. Do not use last-download time as last-use time. Keep access tracking conservative where the backend cannot distinguish metadata opens; listing/stat still must not initiate content downloads.
 
 Periodically evict entries older than the threshold, but never active downloads or files still in use. Coordinate eviction with new access so a check-then-delete race cannot remove a newly acquired cache entry. When access/lock state is uncertain, defer eviction. A busy file or failed cleanup is logged and retried on a later sweep, not force-deleted.
 
-**Windows-specific requirement:** ProjFS stores hydrated content in its virtualization root. Deleting only the private download file does not reclaim that copy. Eviction must remove both relevant app-managed copies safely, while the catalogue continues projecting the same path. [S9]
+**Windows-specific requirement:** WinFsp reads directly from the private cache. Eviction must reclaim that cached file safely while the catalogue continues exposing the same path.
 
-Use provider-aware cache removal, such as the verified `PrjDeleteFile` integration, rather than ordinary file deletion that can leave a tombstone hiding the projected ROM. Do not force removal of dirty/full/unmanaged files. Keep native context ownership valid across cleanup and shutdown; never retain borrowed callback pointers for later use. [S9–S10]
+Remove only identified private cache files while holding the existing eviction guard. WinFsp owns no hydrated disk copy and requires no provider deletion API. Per-open guards protect active ROMs; the host owns file contexts and dispatcher lifetime through shutdown. Never retain borrowed callback buffers or pointers for later use. [S9–S10]
 
-Temporary duplicate storage between the download cache and ProjFS is acceptable for this PoC; document it rather than adding a deduplication subsystem. Successful eviction must reclaim the corresponding data from both places. The subsequent read must re-download correct bytes.
+The private cache is the only persistent ROM storage. Successful eviction must reclaim it; the subsequent read must re-download correct bytes.
 
 ### R5 — One small GPUI window
 
@@ -133,11 +131,11 @@ Closing the app stops its workers and mount. No tray process, background service
 
 Use reusable Rust library modules for the RomM client, catalogue/tree, download/cache behavior, and filesystem adapter. GPUI calls that library and consumes a simple event channel; it must not contain its own download or eviction rules.
 
-Core tests must run without a GPU, GPUI window, native mount, real RomM server, or user credentials. Isolate Windows-specific code and dependencies behind target-specific boundaries so the core remains usable on Linux. Do not introduce a second generic filesystem abstraction over `fsk`, a plugin architecture, dependency-injection framework, network control API, or multiple application services.
+Core tests must run without a GPU, GPUI window, native mount, real RomM server, or user credentials. Isolate Windows-specific code and dependencies behind target-specific boundaries so the core remains usable on Linux. Do not introduce a second generic filesystem abstraction over `winfsp`, a plugin architecture, dependency-injection framework, network control API, or multiple application services.
 
-Keep the mount root and private cache separate. Mount only into an empty directory or a recognized app-owned root, never over an existing ROM library. Do not recursively clear an arbitrary folder to make mounting succeed. Reusing managed roots must not mix content from different servers.
+Keep the mount root and private cache separate. Mount only into an empty ordinary directory, either unclaimed or owned by this server, never over an existing ROM library. Store ownership beside the mount path; old nonempty managed roots are refused. Do not recursively clear an arbitrary folder to make mounting succeed. Reusing managed roots must not mix content from different servers.
 
-ProjFS is a Windows optional component; check/report its availability and document the manual enablement step. Do not silently elevate or alter Windows features. ProjFS supplies no native download-progress UX; the GPUI window is the progress display. [S1, S11]
+WinFsp requires its installed Windows runtime; check/report availability and document installation. Do not silently elevate or install drivers. The GPUI window displays download progress.
 
 ## 6. Tests: required behavior, not a coverage target
 
@@ -158,11 +156,11 @@ The following are **behavioral cases**, not a required number of test functions.
 
 ### Native Windows integration test — mocks are not a substitute
 
-Provide an explicitly runnable test using a temporary ProjFS root and the local fixture server. Exercise **ordinary OS file operations**, not direct trait calls, to verify:
+Provide an explicitly runnable test using a temporary WinFsp mount and the local fixture server. Exercise **ordinary OS file operations**, not direct trait calls, to verify:
 
 - Enumeration/stat do not request content; cold, warm, seeked, and memory-mapped reads return correct bytes.
 - A warm reopen updates access tracking even when Windows supplies cached bytes. An open file survives an eviction attempt.
-- Expired cached data is actually reclaimed from the private cache and the hydrated root, the path remains enumerable, and reading it causes a new successful transfer. Check physical allocation/cache state, not just the displayed logical file size.
+- Expired cached data is actually reclaimed from the private cache, the path remains enumerable, and reading it causes a new successful transfer. Check physical allocation/cache state, not just the displayed logical file size.
 - Projected ROM modification/rename/delete are rejected, and stopping/restarting the provider does not make managed cached data incorrect or the root unusable.
 
 Test slow-but-progressing reads as well as immediate fixture responses: success with an in-memory backend alone does not establish the download use case.
@@ -179,7 +177,7 @@ Do not add cosmetic UI snapshots, arbitrary coverage thresholds, minimum test co
 
 Implement in four small slices:
 
-1. `fsk` Windows projection/cache-lifecycle experiment; minimal GPUI compile; record the backend decision or outstanding native verification.
+1. `winfsp` Windows mount/cache-lifecycle experiment; minimal GPUI compile; record the backend decision or outstanding native verification.
 2. Real RomM authentication/catalogue and portable tree/download behavior, with the relevant executable tests.
 3. Persistent cache, access tracking, Windows-aware eviction, and native integration harness.
 4. Wire the small GPUI window to real operations; run the available integration checks and the frontend smoke test.
@@ -190,7 +188,7 @@ The frontend smoke test uses a user-provided or freely distributable single-file
 
 Deliver the source, lockfile, focused tests, and one short README containing build/run/test commands, Windows prerequisites, the tested RomM contract/version, the frontend setup example, and observed limitations. Run formatting, applicable Clippy checks, and tests supported by the available host. Do not create a release pipeline or cross-platform packaging project.
 
-Final handoff must distinguish **implemented**, **passed**, **failed**, and **not run (reason)**. The PoC is validated only after actual Windows mounting and the frontend workflow succeed. Missing hardware or credentials may leave those checks outstanding; they must not stop independent implementation or be misrepresented as success.
+Final handoff must distinguish **implemented**, **passed**, **failed**, and **not run (reason)**. Actual Windows mounting and the frontend workflow remain runtime validation tasks, deferred by the user for this migration. Missing hardware or credentials may leave those checks outstanding; they must not stop independent implementation or be misrepresented as success.
 
 ## 8. Explicit exclusions
 
@@ -200,14 +198,13 @@ Do not implement excluded work “to prepare for later.”
 
 ## References — technical evidence, not additional scope
 
-- [S1] [fsk crate/platform model](https://docs.rs/crate/fsk/latest) — ProjFS versus FUSE behavior and Windows prerequisites.
-- [S2] [fsk Filesystem interface](https://docs.rs/fsk/latest/fsk/trait.Filesystem.html) and [network lifecycle interface](https://docs.rs/fsk/latest/fsk/trait.NetworkFilesystem.html).
-- [S3] [unifuse interface/backends](https://docs.rs/unifuse/latest/unifuse/).
+- [S1] [WinFsp Rust bindings](https://docs.rs/winfsp/0.13.1+winfsp-2.1/winfsp/) — API and prerequisites.
+- [S2] [WinFsp FileSystemContext](https://docs.rs/winfsp/latest/winfsp/filesystem/trait.FileSystemContext.html).
 - [S4] [Official GPUI README](https://github.com/zed-industries/zed/blob/main/crates/gpui/README.md).
 - [S5] [ES-DE user guide](https://gitlab.com/es-de/emulationstation-de/-/blob/master/USERGUIDE.md), particularly ROM directory structure and non-standard directories.
 - [S6] [RomM API authentication](https://docs.romm.app/latest/developers/api-authentication/).
 - [S7] [RomM OpenAPI/versioning](https://docs.romm.app/latest/developers/openapi/).
 - [S8] [RomM downloads](https://docs.romm.app/latest/using/downloads/) and [RomM source](https://github.com/rommapp/romm).
-- [S9] [Microsoft: cache state in the virtualization root](https://learn.microsoft.com/en-us/windows/win32/projfs/cache-state).
-- [S10] [Microsoft: PrjDeleteFile](https://learn.microsoft.com/en-us/windows/win32/api/projectedfslib/nf-projectedfslib-prjdeletefile).
-- [S11] [Microsoft: ProjFS overview and limitations](https://learn.microsoft.com/en-us/windows/win32/projfs/projected-file-system).
+- [S9] [WinFsp volume parameters](https://docs.rs/winfsp/latest/winfsp/host/struct.VolumeParams.html).
+- [S10] [WinFsp host lifecycle](https://docs.rs/winfsp/latest/winfsp/host/struct.FileSystemHost.html).
+- [S11] [WinFsp installation](https://winfsp.dev/rel/).

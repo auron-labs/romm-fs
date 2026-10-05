@@ -4,7 +4,6 @@
 
 use crate::save_sync_agent::{SaveSyncAgent, SaveSyncCommandGate};
 use rommfs_core::cache::clock::{Clock, SystemClock, DEFAULT_EVICTION_THRESHOLD_SECS};
-#[cfg(not(windows))]
 use rommfs_core::cache::NoopHydratedRemover;
 use rommfs_core::cache::{CacheIndex, Evictor, HydratedRemover, LiveState};
 use rommfs_core::catalog::{build_catalogue, server_id_of, Catalogue, RomKey};
@@ -1370,7 +1369,7 @@ impl Worker {
             return;
         }
 
-        let (remover, mhandle) = mount_backend_parts(&root);
+        let remover = Arc::new(NoopHydratedRemover);
         let fs = match self.build_fs(&client, &root, remover) {
             Ok(fs) => fs,
             Err(e) => {
@@ -1379,7 +1378,7 @@ impl Worker {
             }
         };
 
-        match start_mount_backend(Arc::clone(&fs), &root, mhandle) {
+        match start_mount_backend(Arc::clone(&fs), &root) {
             Ok(mount) => {
                 let mounted_path = mount.root.display().to_string();
                 self.mount = Some(mount);
@@ -1396,8 +1395,7 @@ impl Worker {
     }
 
     /// Assemble the portable core objects the platform adapter mounts.
-    /// `remover` is the mount-aware hydrated remover (ProjfsRemover on
-    /// Windows) so eviction also reclaims ProjFS copies.
+    /// WinFsp reads the private cache directly; there is no hydrated disk copy.
     fn build_fs(
         &mut self,
         client: &Arc<RommClient>,
@@ -1634,57 +1632,17 @@ impl ContentSource for ClientSource {
 // Mount root + backend seam.
 // ---------------------------------------------------------------------------
 
-/// Marker file written into managed roots so re-mounts are recognized as
-/// app-owned (mirrors the adapter contract in `crates/rommfs-fsk`; keep the
-/// names identical so switching to `rommfs_fsk::{check_mount_root,
-/// claim_mount_root}` is a drop-in change).
-const ROOT_MARKER: &str = ".rommfs-root";
-
-/// `root` may be mounted when it is an empty directory or a directory we
-/// previously claimed for this exact `server_id`.
 fn check_mount_root(root: &Path, server_id: &str) -> Result<()> {
-    if !root.exists() {
-        return Err(Error::Unsupported(format!(
-            "mount root {} does not exist",
-            root.display()
-        )));
-    }
-    if !root.is_dir() {
-        return Err(Error::Unsupported(format!(
-            "mount root {} is not a directory",
-            root.display()
-        )));
-    }
-    let marker = root.join(ROOT_MARKER);
-    if marker.is_file() {
-        let owner = std::fs::read_to_string(&marker).unwrap_or_default();
-        if owner.trim() == server_id {
-            return Ok(());
-        }
-        return Err(Error::Unsupported(format!(
-            "{} is a managed root for a different server",
-            root.display()
-        )));
-    }
-    let mut entries = std::fs::read_dir(root)?;
-    if entries.next().is_none() {
-        return Ok(());
-    }
-    Err(Error::Unsupported(format!(
-        "{} is not empty and is not a RomMFS-managed root",
-        root.display()
-    )))
+    rommfs_winfsp::check_mount_root(root, server_id)
+        .map(|_| ())
+        .map_err(|e| Error::Unsupported(e.to_string()))
 }
 
-/// Claim `root` for this server by writing the marker file (idempotent).
 fn claim_mount_root(root: &Path, server_id: &str) -> Result<()> {
-    std::fs::write(root.join(ROOT_MARKER), server_id)?;
-    Ok(())
+    rommfs_winfsp::claim_mount_root(root, server_id).map_err(|e| Error::Unsupported(e.to_string()))
 }
 
-/// A live mount: opaque handle whose `stop` releases the provider.
-/// NOT Send: `fsk::MountSession` carries a raw namespace-context pointer;
-/// the mount is created, held, and stopped entirely on the worker thread.
+/// A live mount owned and stopped on the worker thread.
 struct ActiveMount {
     root: PathBuf,
     stop_fn: Box<dyn FnOnce()>,
@@ -1696,46 +1654,21 @@ impl ActiveMount {
     }
 }
 
-/// The mount-side remover + handle pair. On Windows the remover evicts
-/// hydrated ProjFS content through `PrjDeleteFile` and the handle arms the
-/// namespace context captured during callbacks.
+/// Start the read-only WinFsp volume over the portable core.
 #[cfg(windows)]
-fn mount_backend_parts(root: &Path) -> (Arc<dyn HydratedRemover>, Arc<rommfs_fsk::ProjfsHandle>) {
-    let handle = Arc::new(rommfs_fsk::ProjfsHandle::default());
-    (
-        Arc::new(rommfs_fsk::ProjfsRemover::new(
-            root.to_path_buf(),
-            Arc::clone(&handle),
-        )),
-        handle,
-    )
-}
-
-#[cfg(not(windows))]
-fn mount_backend_parts(_root: &Path) -> (Arc<dyn HydratedRemover>, Arc<()>) {
-    (Arc::new(NoopHydratedRemover), Arc::new(()))
-}
-
-/// Start the platform mount over `fs` at `root` (Windows: ProjFS via fsk).
-#[cfg(windows)]
-fn start_mount_backend(
-    fs: Arc<RommFs>,
-    root: &Path,
-    handle: Arc<rommfs_fsk::ProjfsHandle>,
-) -> Result<ActiveMount> {
-    let (mount, _handle) = rommfs_fsk::WindowsMount::mount_with_handle(fs, root, handle)
-        .map_err(|e| Error::Unsupported(e.to_string()))?;
-    let root = root.to_path_buf();
+fn start_mount_backend(fs: Arc<RommFs>, root: &Path) -> Result<ActiveMount> {
+    let mount = rommfs_winfsp::WindowsMount::mount(fs, root)
+        .map_err(|e| Error::Unsupported(format!("{e:#}")))?;
     Ok(ActiveMount {
-        root,
+        root: root.to_path_buf(),
         stop_fn: Box::new(move || mount.stop()),
     })
 }
 
 #[cfg(not(windows))]
-fn start_mount_backend(_fs: Arc<RommFs>, _root: &Path, _handle: Arc<()>) -> Result<ActiveMount> {
+fn start_mount_backend(_fs: Arc<RommFs>, _root: &Path) -> Result<ActiveMount> {
     Err(Error::Unsupported(
-        "mounting requires Windows ProjFS; this build is not windows".into(),
+        "mounting requires Windows with WinFsp installed".into(),
     ))
 }
 

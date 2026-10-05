@@ -15,13 +15,13 @@ chrono.workspace = true
 gpui = { workspace = true, optional = true }
 httpdate.workspace = true
 rommfs-core.workspace = true
+rommfs-winfsp.workspace = true
 notify.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
-# Windows-only mount backend (PRD: target-specific isolation)
+# Windows-only platform APIs
 [target.'cfg(windows)'.dependencies]
-rommfs-fsk.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]

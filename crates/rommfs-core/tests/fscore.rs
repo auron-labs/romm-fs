@@ -233,6 +233,12 @@ fn listing_lookup_and_stat_perform_zero_fetches() {
     let meta2 = rig.fs.metadata(rig.inode).unwrap();
     assert_eq!(meta2.size, BYTES.len() as u64);
     assert_eq!(rig.fs.path_of(rig.inode).as_deref(), Some("nes/Game.nes"));
+    let root = rommfs_core::tree::ROOT_INODE;
+    let platform = rig.fs.lookup(root, "NES").unwrap();
+    assert_eq!(rig.fs.path_of(root).as_deref(), Some(""));
+    assert_eq!(rig.fs.path_of(platform.inode).as_deref(), Some("nes"));
+    let alias = rig.fs.lookup(platform.inode, "GAME.NES").unwrap();
+    assert_eq!(rig.fs.path_of(alias.inode).as_deref(), Some("nes/Game.nes"));
 
     assert_eq!(source.count(), 0, "metadata must never request ROM content");
 }

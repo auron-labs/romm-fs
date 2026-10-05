@@ -212,14 +212,15 @@ impl RommTree {
         }
     }
 
-    /// The relative path `platform_dir/file_name` for a file inode.
+    /// Canonical relative path of an inode; the root has an empty path.
     pub fn path_of(&self, inode: u64) -> Option<String> {
         match self.catalogue.inode_kind(inode)? {
+            NodeKind::Root => Some(String::new()),
+            NodeKind::PlatformDir { index } => Some(self.catalogue.platforms[index].clone()),
             NodeKind::Rom { index } => {
                 let e = &self.catalogue.entries[index];
                 Some(format!("{}/{}", e.platform_dir, e.file_name))
             }
-            _ => None,
         }
     }
 }
