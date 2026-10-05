@@ -51,6 +51,11 @@ and no credentials are ever persisted or logged.
 
 ## Test
 
+For an LLM testing on a Windows host, follow the
+[Windows WinFsp and RetroBat testing guide](testing/WINDOWS-TESTING.md).
+It covers automated tests, desktop mounts, live RomM reads, RetroBat save sync,
+cleanup, and evidence reporting.
+
 Portable core, fixture, and headless app-controller tests run on Linux,
 macOS, and Windows:
 
