@@ -12,6 +12,7 @@ pub mod events;
 pub mod fscore;
 pub mod romm;
 pub mod sanitize;
+pub mod save_sync;
 pub mod tree;
 
 pub use error::{Error, Result};

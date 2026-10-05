@@ -371,3 +371,136 @@ fn stalled_transfer_errors_out_via_low_speed_window() {
         .unwrap_err();
     assert!(matches!(err, Error::Transport(_)), "got {err:?}");
 }
+
+#[test]
+fn save_sync_uses_me_saves_multipart_and_content_readback_contracts() {
+    let fx = contract_server(vec![], 0);
+    fx.on(
+        "GET",
+        "/api/users/me",
+        ResponseSpec::Json {
+            status: 200,
+            body: r#"{"id":42,"oauth_scopes":["me.read","assets.read","assets.write"]}"#.into(),
+        },
+    );
+    fx.use_romm_save_store(42, 201);
+    let client = RommClient::new(fx.url()).unwrap();
+    let identity = client
+        .authenticate_for_save_sync(Credentials {
+            username: "user",
+            password: "pass",
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(identity.account_id, 42);
+    assert!(identity.can_read_saves() && identity.can_write_saves());
+    assert!(client
+        .save_inventory(7, "rommfs-retrobat-gb-srm-v1")
+        .unwrap()
+        .is_empty());
+
+    let file_bytes = b"prefix\r\n--rommfs-save-sync-v1-boundary\r\nmiddle\r\n--rommfs-save-sync-v1-boundary--\r\nsuffix\x00\xff";
+    let uploaded = client
+        .upload_save(
+            7,
+            "rommfs-retrobat-gb-srm-v1",
+            "retroarch-gambatte",
+            "rommfs-abc.srm",
+            file_bytes,
+        )
+        .unwrap();
+    assert_eq!(uploaded.id, 31);
+    assert_eq!(uploaded.user_id, 42);
+    assert_eq!(uploaded.file_name, "rommfs-abc [2026-10-05_12-34-56].srm");
+    assert!(!uploaded.missing_from_fs);
+    assert_eq!(uploaded.created_at, "2026-10-05T12:34:56Z");
+    assert_eq!(uploaded.updated_at, uploaded.created_at);
+    assert_eq!(uploaded.emulator.as_deref(), Some("retroarch-gambatte"));
+    assert_eq!(
+        client.download_save_content(uploaded.id).unwrap(),
+        file_bytes
+    );
+    let stored = fx.saved_saves();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].file_name, uploaded.file_name);
+    assert_eq!(stored[0].bytes, file_bytes);
+
+    let requests = fx.requests();
+    let upload = requests
+        .iter()
+        .find(|request| request.method == "POST" && request.target.starts_with("/api/saves?"))
+        .unwrap();
+    assert!(upload.target.contains("rom_id=7"));
+    assert!(upload.target.contains("slot=rommfs-retrobat-gb-srm-v1"));
+    assert!(upload.target.contains("emulator=retroarch-gambatte"));
+    assert!(upload.target.contains("overwrite=false"));
+    assert!(upload.target.contains("autocleanup=false"));
+    let content_type = upload.headers.get("content-type").unwrap();
+    assert!(content_type.starts_with("multipart/form-data; boundary="));
+    assert!(upload
+        .body
+        .windows(b"name=\"saveFile\"; filename=\"rommfs-abc.srm\"".len())
+        .any(|part| part == b"name=\"saveFile\"; filename=\"rommfs-abc.srm\""));
+    assert!(upload
+        .body
+        .windows(file_bytes.len())
+        .any(|part| part == file_bytes));
+    assert_eq!(
+        fx.auth_headers("GET", "/api/users/me"),
+        vec![Some("Bearer fixture-access-token".into())]
+    );
+    assert!(requests
+        .iter()
+        .filter(|request| request.target != "/api/token")
+        .all(|request| request
+            .headers
+            .get("authorization")
+            .is_some_and(|value| value == "Bearer fixture-access-token")));
+    assert!(requests
+        .iter()
+        .all(|request| request.method != "PUT" && request.method != "DELETE"));
+}
+
+#[test]
+fn expired_save_api_token_is_cleared_like_other_authenticated_routes() {
+    let fx = FixtureServer::start();
+    fx.on(
+        "POST",
+        "/api/token",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::token_ok(),
+        },
+    );
+    fx.on(
+        "GET",
+        "/api/users/me",
+        ResponseSpec::Json {
+            status: 200,
+            body: r#"{"id":42,"oauth_scopes":["me.read","assets.read","assets.write"]}"#.into(),
+        },
+    );
+    fx.on(
+        "GET",
+        "/api/saves?rom_id=7",
+        ResponseSpec::Json {
+            status: 401,
+            body: r#"{"detail":"expired"}"#.into(),
+        },
+    );
+    let client = RommClient::new(fx.url()).unwrap();
+    client
+        .authenticate_for_save_sync(Credentials {
+            username: "user",
+            password: "pass",
+        })
+        .unwrap()
+        .unwrap();
+    assert!(client.has_token());
+
+    let failure = client
+        .save_inventory(7, "rommfs-retrobat-gb-srm-v1")
+        .unwrap_err();
+    assert!(matches!(failure.error, Error::Auth(_)));
+    assert!(!client.has_token());
+}

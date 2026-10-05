@@ -2,6 +2,7 @@
 //! Drives workers via commands, consumes `AppEvent`s into `UiState`.
 //! Tests exercise this path — no duplicate state machine in the UI (PRD §6).
 
+use crate::save_sync_agent::{SaveSyncAgent, SaveSyncCommandGate};
 use rommfs_core::cache::clock::{Clock, SystemClock, DEFAULT_EVICTION_THRESHOLD_SECS};
 #[cfg(not(windows))]
 use rommfs_core::cache::NoopHydratedRemover;
@@ -9,9 +10,16 @@ use rommfs_core::cache::{CacheIndex, Evictor, HydratedRemover, LiveState};
 use rommfs_core::catalog::{build_catalogue, server_id_of, Catalogue, RomKey};
 use rommfs_core::download::{ContentSource, DownloadManager};
 use rommfs_core::error::{Error, Result};
-use rommfs_core::events::{AppEvent, EventSink, Level, LogBuffer};
+use rommfs_core::events::{
+    AppEvent, EventSink, Level, LogBuffer, SaveSyncGameStatus, SaveSyncQueueStatus,
+};
 use rommfs_core::fscore::RommFs;
 use rommfs_core::romm::{Credentials, RommClient};
+use rommfs_core::save_sync::{
+    discover_installations, map_catalogue, resolve_retrobat_gb_profile, validate_installation,
+    ConsentSettings, DiscoveryInput, InstallationCandidate, InstallationProblem, MappingReport,
+    RetroBatGbProfile, SaveSyncJournal, SaveSyncScope, SaveSyncSettingsStore, SnapshotState,
+};
 use rommfs_core::tree::RommTree;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -49,6 +57,14 @@ pub struct DownloadView {
     pub finished: Option<std::result::Result<(), String>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SaveSyncTransferView {
+    pub rom_id: i64,
+    pub revision: String,
+    pub phase: String,
+    pub detail: Option<String>,
+}
+
 /// How many download rows are kept on screen; oldest finished rows are
 /// dropped first (the log carries the durable record anyway).
 const MAX_DOWNLOAD_ROWS: usize = 128;
@@ -62,6 +78,33 @@ pub struct UiState {
     pub mount_error: Option<String>,
     pub downloads: Vec<DownloadView>,
     pub catalogue: Option<(usize, usize, usize)>, // platforms, roms, skipped
+    pub save_sync_candidates: Vec<InstallationCandidate>,
+    pub save_sync_skipped: usize,
+    pub save_sync_selected_root: Option<String>,
+    pub save_sync_documented_saves_root: Option<String>,
+    pub save_sync_effective_saves_root: Option<String>,
+    pub save_sync_profile_version: Option<String>,
+    pub save_sync_account_id: Option<i64>,
+    pub save_sync_mapped_targets: usize,
+    pub save_sync_catalogue_unmapped: usize,
+    pub save_sync_existing_saves: Option<rommfs_core::save_sync::ExistingSavePreview>,
+    pub save_sync_preview: Vec<String>,
+    pub save_sync_available: bool,
+    pub save_sync_problem: Option<String>,
+    pub save_sync_enabled: bool,
+    pub save_sync_debounce_secs: u32,
+    pub save_sync_games: Vec<SaveSyncGameStatus>,
+    pub save_sync_reconciled_games: usize,
+    pub save_sync_pending_incoming: usize,
+    pub save_sync_attention_games: usize,
+    pub save_sync_failure: Option<String>,
+    pub save_sync_transfers: Vec<SaveSyncTransferView>,
+    pub save_sync_session_id: u64,
+    pub save_sync_server_id: Option<String>,
+    pub save_sync_queue: Option<SaveSyncQueueStatus>,
+    pub save_sync_authentication_required: bool,
+    pub save_sync_export_errors: HashMap<String, String>,
+    pub save_sync_export_feedback: HashMap<String, String>,
     pub log: LogBuffer,
 }
 
@@ -75,6 +118,33 @@ impl UiState {
             mount_error: None,
             downloads: Vec::new(),
             catalogue: None,
+            save_sync_candidates: Vec::new(),
+            save_sync_skipped: 0,
+            save_sync_selected_root: None,
+            save_sync_documented_saves_root: None,
+            save_sync_effective_saves_root: None,
+            save_sync_profile_version: None,
+            save_sync_account_id: None,
+            save_sync_mapped_targets: 0,
+            save_sync_catalogue_unmapped: 0,
+            save_sync_existing_saves: None,
+            save_sync_preview: Vec::new(),
+            save_sync_available: false,
+            save_sync_problem: None,
+            save_sync_enabled: false,
+            save_sync_debounce_secs: rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS,
+            save_sync_games: Vec::new(),
+            save_sync_reconciled_games: 0,
+            save_sync_pending_incoming: 0,
+            save_sync_attention_games: 0,
+            save_sync_failure: None,
+            save_sync_transfers: Vec::new(),
+            save_sync_session_id: 0,
+            save_sync_server_id: None,
+            save_sync_queue: None,
+            save_sync_authentication_required: false,
+            save_sync_export_errors: HashMap::new(),
+            save_sync_export_feedback: HashMap::new(),
             log: LogBuffer::new(log_cap),
         }
     }
@@ -90,6 +160,24 @@ impl UiState {
                 // we may no longer be talking to.
                 self.catalogue = None;
                 self.downloads.clear();
+                self.save_sync_games.clear();
+                self.save_sync_reconciled_games = 0;
+                self.save_sync_pending_incoming = 0;
+                self.save_sync_attention_games = 0;
+                self.save_sync_failure = None;
+                self.save_sync_transfers.clear();
+                self.save_sync_queue = None;
+                self.save_sync_authentication_required = false;
+                self.save_sync_export_errors.clear();
+                self.save_sync_export_feedback.clear();
+                self.save_sync_enabled = false;
+                self.save_sync_available = false;
+                self.save_sync_account_id = None;
+                self.save_sync_server_id = None;
+                self.save_sync_effective_saves_root = None;
+                self.save_sync_mapped_targets = 0;
+                self.save_sync_catalogue_unmapped = 0;
+                self.save_sync_existing_saves = None;
             }
             AppEvent::Connected => {
                 self.conn = ConnState::Connected;
@@ -141,6 +229,150 @@ impl UiState {
                 for d in &mut self.downloads {
                     if d.finished.is_none() {
                         d.finished = Some(Err("mount stopped".to_string()));
+                    }
+                }
+            }
+
+            AppEvent::SaveSyncUpdated {
+                session_id,
+                server_id,
+                candidates,
+                skipped,
+                selected_root,
+                documented_saves_root,
+                effective_saves_root,
+                profile_version,
+                account_id,
+                mapped_targets,
+                catalogue_unmapped,
+                existing_saves,
+                preview_saves,
+                available,
+                selected_problem,
+                enabled,
+                debounce_secs,
+            } => {
+                if *session_id != self.save_sync_session_id {
+                    return;
+                }
+                self.save_sync_candidates = candidates.clone();
+                self.save_sync_server_id = server_id.clone();
+                self.save_sync_skipped = *skipped;
+                self.save_sync_selected_root = selected_root.clone();
+                self.save_sync_documented_saves_root = documented_saves_root.clone();
+                self.save_sync_effective_saves_root = effective_saves_root.clone();
+                self.save_sync_profile_version = profile_version.clone();
+                self.save_sync_account_id = *account_id;
+                self.save_sync_mapped_targets = *mapped_targets;
+                self.save_sync_catalogue_unmapped = *catalogue_unmapped;
+                self.save_sync_existing_saves = existing_saves.clone();
+                self.save_sync_preview = preview_saves.clone();
+                self.save_sync_available = *available;
+                self.save_sync_problem = selected_problem.clone();
+                self.save_sync_enabled = *enabled;
+                self.save_sync_debounce_secs = *debounce_secs;
+            }
+            AppEvent::SaveSyncReconciliation {
+                session_id,
+                game,
+                reconciled_games,
+                pending_incoming,
+                attention_games,
+                failure,
+                ..
+            } => {
+                if *session_id != self.save_sync_session_id {
+                    return;
+                }
+                if let Some(existing) = self
+                    .save_sync_games
+                    .iter_mut()
+                    .find(|existing| existing.rom_id == game.rom_id)
+                {
+                    *existing = game.clone();
+                } else {
+                    self.save_sync_games.push(game.clone());
+                }
+                self.save_sync_reconciled_games = *reconciled_games;
+                self.save_sync_pending_incoming = *pending_incoming;
+                self.save_sync_attention_games = *attention_games;
+                self.save_sync_failure = failure.clone();
+            }
+            AppEvent::SaveSyncTransferProgress {
+                session_id,
+                rom_id,
+                revision,
+                phase,
+                detail,
+            } => {
+                if *session_id != self.save_sync_session_id {
+                    return;
+                }
+                self.save_sync_transfers.push(SaveSyncTransferView {
+                    rom_id: *rom_id,
+                    revision: revision.clone(),
+                    phase: phase.clone(),
+                    detail: detail.clone(),
+                });
+                if self.save_sync_transfers.len() > 64 {
+                    self.save_sync_transfers.remove(0);
+                }
+            }
+            AppEvent::SaveSyncSessionChanged { session_id } => {
+                if *session_id >= self.save_sync_session_id {
+                    self.save_sync_session_id = *session_id;
+                    self.save_sync_enabled = false;
+                    self.save_sync_available = false;
+                    self.save_sync_account_id = None;
+                    self.save_sync_server_id = None;
+                    self.save_sync_effective_saves_root = None;
+                    self.save_sync_mapped_targets = 0;
+                    self.save_sync_catalogue_unmapped = 0;
+                    self.save_sync_existing_saves = None;
+                    self.save_sync_games.clear();
+                    self.save_sync_reconciled_games = 0;
+                    self.save_sync_pending_incoming = 0;
+                    self.save_sync_attention_games = 0;
+                    self.save_sync_failure = None;
+                    self.save_sync_transfers.clear();
+                    self.save_sync_queue = None;
+                    self.save_sync_authentication_required = false;
+                    self.save_sync_export_errors.clear();
+                    self.save_sync_export_feedback.clear();
+                }
+            }
+            AppEvent::SaveSyncAuthenticationRequired { session_id } => {
+                if *session_id == self.save_sync_session_id {
+                    self.save_sync_authentication_required = true;
+                    self.conn = ConnState::SignInRequired;
+                }
+            }
+            AppEvent::SaveSyncQueueUpdated(status) => {
+                if status.session_id == self.save_sync_session_id {
+                    self.save_sync_reconciled_games = status.reconciled_games;
+                    self.save_sync_pending_incoming = status.pending_incoming;
+                    self.save_sync_attention_games = status.attention_games;
+                    self.save_sync_failure = status.failure.clone();
+                    self.save_sync_authentication_required = status.authentication_required;
+                    self.save_sync_games = status.games.clone();
+                    self.save_sync_queue = Some(status.clone());
+                }
+            }
+            AppEvent::SaveSyncExportFinished {
+                session_id,
+                incoming_id,
+                destination,
+                error,
+            } => {
+                if *session_id == self.save_sync_session_id {
+                    if let Some(error) = error {
+                        self.save_sync_export_feedback.remove(incoming_id);
+                        self.save_sync_export_errors
+                            .insert(incoming_id.clone(), error.clone());
+                    } else if let Some(destination) = destination {
+                        self.save_sync_export_errors.remove(incoming_id);
+                        self.save_sync_export_feedback
+                            .insert(incoming_id.clone(), destination.clone());
                     }
                 }
             }
@@ -250,40 +482,89 @@ pub enum Command {
         path: String,
     },
     StopMount,
+    RefreshSaveSync,
+    SelectSaveSyncInstallation {
+        path: PathBuf,
+    },
+    SetSaveSyncEnabled {
+        enabled: bool,
+    },
+    SetSaveSyncDebounce {
+        seconds: u32,
+    },
+    ExportSaveSyncIncoming {
+        session_id: u64,
+        incoming_id: String,
+        destination: PathBuf,
+    },
     Shutdown,
+}
+
+struct CommandEnvelope {
+    command: Command,
+    save_sync_epoch: u64,
+}
+
+fn invalidates_save_sync_scope(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Connect { .. }
+            | Command::StartMount { .. }
+            | Command::RefreshSaveSync
+            | Command::SelectSaveSyncInstallation { .. }
+            | Command::SetSaveSyncEnabled { enabled: false }
+            | Command::Shutdown
+    )
 }
 
 /// Owns the worker session (client + catalogue + mount + evict timer).
 /// Created on Connect; events flow back over the `EventSink` channel.
 pub struct Controller {
     sink: EventSink,
-    cmd_tx: mpsc::Sender<Command>,
+    cmd_tx: mpsc::Sender<CommandEnvelope>,
     // worker thread handle held for shutdown joining
     worker: Option<JoinHandle<()>>,
+    save_sync_gate: SaveSyncCommandGate,
 }
 
 impl Controller {
     /// Spawn the controller + worker loop. Returns (controller, event rx).
     pub fn spawn() -> (Self, mpsc::Receiver<AppEvent>) {
         let (sink, event_rx) = rommfs_core::events::channel();
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<CommandEnvelope>();
         let worker_sink = sink.clone();
+        let save_sync_gate = SaveSyncCommandGate::new();
+        let worker_gate = save_sync_gate.clone();
         let worker = std::thread::Builder::new()
             .name("rommfs-worker".to_string())
-            .spawn(move || worker_loop(cmd_rx, worker_sink))
+            .spawn(move || worker_loop(cmd_rx, worker_sink, worker_gate))
             .expect("spawn worker thread");
+        let initial_epoch = save_sync_gate.invalidate();
+        let _ = cmd_tx.send(CommandEnvelope {
+            command: Command::RefreshSaveSync,
+            save_sync_epoch: initial_epoch,
+        });
         (
             Self {
                 sink,
                 cmd_tx,
                 worker: Some(worker),
+                save_sync_gate,
             },
             event_rx,
         )
     }
 
     pub fn send(&self, cmd: Command) {
-        let _ = self.cmd_tx.send(cmd);
+        let save_sync_epoch = if invalidates_save_sync_scope(&cmd) {
+            self.save_sync_gate.invalidate()
+        } else {
+            self.save_sync_gate.current_epoch()
+        };
+        let _ = self.cmd_tx.send(CommandEnvelope {
+            command: cmd,
+            save_sync_epoch,
+        });
     }
 
     pub fn sink(&self) -> EventSink {
@@ -295,7 +576,7 @@ impl Drop for Controller {
     /// Closing the app stops the worker and mount (PRD: no background
     /// process survives the window).
     fn drop(&mut self) {
-        let _ = self.cmd_tx.send(Command::Shutdown);
+        self.send(Command::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -318,10 +599,32 @@ struct Worker {
     names: HashMap<RomKey, String>,
     fs: Option<Arc<RommFs>>,
     mount: Option<ActiveMount>,
+    save_sync_settings: Option<SaveSyncSettingsStore>,
+    save_sync_storage_dir: Option<PathBuf>,
+    save_sync_selected_root: Option<PathBuf>,
+    save_sync_settings_problem: Option<String>,
+    save_sync_enabled: bool,
+    save_sync_debounce_secs: u32,
+    save_sync_identity: Option<rommfs_core::romm::SaveSyncIdentity>,
+    save_sync_scope: Option<SaveSyncScope>,
+    save_sync_profile: Option<RetroBatGbProfile>,
+    save_sync_mapping_report: Option<MappingReport>,
+    save_sync_catalogue: Option<Catalogue>,
+    save_sync_agent: Option<SaveSyncAgent>,
+    save_sync_gate: SaveSyncCommandGate,
+    current_save_sync_epoch: u64,
+    save_sync_runtime_problem: Option<String>,
+    save_sync_session_id: u64,
 }
 
 impl Worker {
+    #[cfg(test)]
     fn new(sink: EventSink) -> Self {
+        Self::new_with_gate(sink, SaveSyncCommandGate::new())
+    }
+
+    fn new_with_gate(sink: EventSink, save_sync_gate: SaveSyncCommandGate) -> Self {
+        let current_save_sync_epoch = save_sync_gate.current_epoch();
         Self {
             sink,
             client: None,
@@ -330,6 +633,534 @@ impl Worker {
             names: HashMap::new(),
             fs: None,
             mount: None,
+            save_sync_settings: None,
+            save_sync_storage_dir: None,
+            save_sync_selected_root: None,
+            save_sync_settings_problem: None,
+            save_sync_enabled: false,
+            save_sync_debounce_secs: rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS,
+            save_sync_identity: None,
+            save_sync_scope: None,
+            save_sync_profile: None,
+            save_sync_mapping_report: None,
+            save_sync_catalogue: None,
+            save_sync_agent: None,
+            save_sync_gate,
+            current_save_sync_epoch,
+            save_sync_runtime_problem: None,
+            save_sync_session_id: 0,
+        }
+    }
+
+    fn with_persistent_save_sync_settings(
+        sink: EventSink,
+        save_sync_gate: SaveSyncCommandGate,
+    ) -> Self {
+        let settings_path = save_sync_settings_path();
+        let (save_sync_settings, save_sync_settings_problem) = match settings_path.as_ref() {
+            Some(path) => match SaveSyncSettingsStore::open(path) {
+                Ok(settings) => (Some(settings), None),
+                Err(error) => (None, Some(format!("Settings could not be opened: {error}"))),
+            },
+            None => (
+                None,
+                Some("No application settings directory is available.".into()),
+            ),
+        };
+        let save_sync_selected_root = save_sync_settings
+            .as_ref()
+            .and_then(|settings| settings.selected_installation().ok().flatten());
+        let mut worker = Self::new_with_gate(sink, save_sync_gate);
+        worker.save_sync_settings = save_sync_settings;
+        worker.save_sync_storage_dir =
+            settings_path.and_then(|path| path.parent().map(Path::to_path_buf));
+        worker.save_sync_selected_root = save_sync_selected_root;
+        worker.save_sync_settings_problem = save_sync_settings_problem;
+        worker
+    }
+
+    fn refresh_save_sync(&mut self) {
+        self.refresh_save_sync_from(save_sync_discovery_input());
+    }
+
+    fn refresh_save_sync_from(&mut self, input: DiscoveryInput) {
+        self.advance_save_sync_session();
+        self.stop_save_sync_agent();
+        let discovery = discover_installations(input);
+        let mut selected_problem = self.save_sync_settings_problem.clone();
+        let mut selected_root = None;
+        let mut documented_saves_root = None;
+        let mut effective_saves_root = None;
+        let mut profile_version = None;
+        let mut account_id = None;
+        let mut mapped_targets = 0;
+        let mut catalogue_unmapped = 0;
+        let mut existing_saves = None;
+        let mut preview_saves = Vec::new();
+        let mut profile = None;
+        let mut mapping_report = None;
+
+        if let Some(root) = self.save_sync_selected_root.as_deref() {
+            selected_root = Some(root.display().to_string());
+            match validate_installation(root) {
+                Err(problem) => selected_problem = Some(selected_installation_problem(problem)),
+                Ok(info) => {
+                    selected_root = Some(info.install_root.display().to_string());
+                    documented_saves_root = Some(info.documented_saves_root.display().to_string());
+                    let visible_gb_names = self
+                        .save_sync_catalogue
+                        .as_ref()
+                        .map(|catalogue| {
+                            catalogue
+                                .entries
+                                .iter()
+                                .filter(|entry| entry.platform_dir.eq_ignore_ascii_case("gb"))
+                                .map(|entry| entry.file_name.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    match resolve_retrobat_gb_profile(root, &visible_gb_names) {
+                        Err(error) => selected_problem = Some(error.to_string()),
+                        Ok(resolved) => {
+                            effective_saves_root =
+                                Some(resolved.effective_saves_root.display().to_string());
+                            profile_version = Some(resolved.version.clone());
+                            if let Some(catalogue) = self.save_sync_catalogue.as_ref() {
+                                match map_catalogue(catalogue, &resolved.effective_saves_root) {
+                                    Ok(report) => {
+                                        mapped_targets = report.supported_count();
+                                        catalogue_unmapped = report.unmapped_count();
+                                        existing_saves =
+                                            Some(rommfs_core::save_sync::preview_existing_saves(
+                                                &resolved.effective_saves_root,
+                                                &report,
+                                            ));
+                                        preview_saves = report
+                                            .mappings
+                                            .iter()
+                                            .take(5)
+                                            .map(|mapping| {
+                                                mapping.target_path.display().to_string()
+                                            })
+                                            .collect();
+                                        mapping_report = Some(report);
+                                    }
+                                    Err(error) => selected_problem = Some(error.to_string()),
+                                }
+                            }
+                            profile = Some(resolved);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(identity) = &self.save_sync_identity {
+            account_id = Some(identity.account_id);
+        } else if self.client.is_some() {
+            selected_problem.get_or_insert_with(|| {
+                "Save sync needs a verified authenticated account with me.read, assets.read, and assets.write.".into()
+            });
+        }
+
+        let scope = match (
+            self.server_id.as_ref(),
+            self.save_sync_identity.as_ref(),
+            self.save_sync_selected_root.as_ref(),
+            profile.as_ref(),
+        ) {
+            (Some(server_id), Some(identity), Some(installation_root), Some(profile)) => {
+                Some(SaveSyncScope {
+                    server_id: server_id.clone(),
+                    account_id: identity.account_id.to_string(),
+                    installation_root: installation_root.clone(),
+                    effective_saves_root: profile.effective_saves_root.clone(),
+                })
+            }
+            _ => None,
+        };
+        let consent = match (self.save_sync_settings.as_ref(), scope.as_ref()) {
+            (Some(settings), Some(scope)) => match settings.load(scope) {
+                Ok(consent) => Some(consent),
+                Err(error) => {
+                    selected_problem = Some(format!("Consent settings could not be read: {error}"));
+                    None
+                }
+            },
+            _ => None,
+        };
+        self.save_sync_scope = scope.clone();
+        self.save_sync_profile = profile;
+        self.save_sync_mapping_report = mapping_report;
+        if let Some(consent) = consent {
+            self.save_sync_enabled = consent.enabled;
+            self.save_sync_debounce_secs = consent.debounce_secs;
+        } else {
+            self.save_sync_enabled = false;
+        }
+
+        let save_permissions = self
+            .save_sync_identity
+            .as_ref()
+            .is_some_and(|identity| identity.can_read_saves() && identity.can_write_saves());
+        if self.save_sync_identity.is_some() && !save_permissions {
+            selected_problem = Some(
+                "The authenticated account lacks assets.read or assets.write; ROM access is unchanged.".into(),
+            );
+        }
+        let available = scope.is_some()
+            && save_permissions
+            && self.save_sync_settings.is_some()
+            && self
+                .save_sync_mapping_report
+                .as_ref()
+                .is_some_and(|report| report.supported_count() > 0);
+
+        if self.save_sync_enabled && available {
+            if let (Some(scope), Some(report), Some(client), Some(identity)) = (
+                scope.as_ref(),
+                self.save_sync_mapping_report.as_ref(),
+                self.client.as_ref(),
+                self.save_sync_identity.as_ref(),
+            ) {
+                if !report.mappings.is_empty() {
+                    if let Some(settings_dir) = &self.save_sync_storage_dir {
+                        let journal_path = settings_dir.join("save-sync-journal.db");
+                        let spool_path = settings_dir.join("save-sync-snapshots");
+                        let epoch = self.current_save_sync_epoch;
+                        if self.save_sync_gate.open(epoch) && self.save_sync_gate.enabled_for(epoch)
+                        {
+                            match SaveSyncAgent::start(
+                                scope.clone(),
+                                report.mappings.clone(),
+                                identity.clone(),
+                                Arc::clone(client),
+                                journal_path,
+                                spool_path,
+                                self.save_sync_debounce_secs,
+                                self.save_sync_session_id,
+                                self.save_sync_gate.enablement(epoch),
+                                self.sink.clone(),
+                            ) {
+                                Ok(agent) => self.save_sync_agent = Some(agent),
+                                Err(error) => {
+                                    self.save_sync_gate.close();
+                                    selected_problem =
+                                        Some(format!("Save watcher could not start: {error}"));
+                                }
+                            }
+                        }
+                    } else {
+                        self.save_sync_gate.close();
+                        selected_problem =
+                            Some("No persistent save-sync directory is available.".into());
+                    }
+                }
+            }
+        } else {
+            self.save_sync_gate.close();
+        }
+
+        if self.save_sync_agent.is_none() {
+            if let (Some(scope), Some(report), Some(identity)) = (
+                self.save_sync_scope.as_ref(),
+                self.save_sync_mapping_report.as_ref(),
+                self.save_sync_identity.as_ref(),
+            ) {
+                if let Err(error) =
+                    self.emit_persisted_save_sync_review(scope, &report.mappings, identity)
+                {
+                    selected_problem =
+                        Some(format!("Saved review state could not be read: {error}"));
+                }
+            }
+        }
+
+        if let Some(problem) = self.save_sync_runtime_problem.take() {
+            selected_problem = Some(problem);
+        }
+        if let Some(settings_problem) = &self.save_sync_settings_problem {
+            selected_problem = Some(match selected_problem {
+                Some(problem) => format!("{problem} {settings_problem}"),
+                None => settings_problem.clone(),
+            });
+        }
+        self.sink.emit(AppEvent::SaveSyncUpdated {
+            session_id: self.save_sync_session_id,
+            server_id: self.server_id.clone(),
+            candidates: discovery.candidates,
+            skipped: discovery.skipped,
+            selected_root,
+            documented_saves_root,
+            effective_saves_root,
+            profile_version,
+            account_id,
+            mapped_targets,
+            catalogue_unmapped,
+            existing_saves,
+            preview_saves,
+            available,
+            selected_problem,
+            enabled: self.save_sync_enabled
+                && self
+                    .save_sync_gate
+                    .enabled_for(self.current_save_sync_epoch),
+            debounce_secs: self.save_sync_debounce_secs,
+        });
+    }
+
+    fn select_save_sync_installation(&mut self, path: &Path) {
+        self.stop_save_sync_agent();
+        self.save_sync_enabled = false;
+        self.save_sync_scope = None;
+        // Explicit selection is remembered even while missing/invalid, so
+        // refresh never changes to a different install on the user's behalf.
+        if let Some(settings) = &self.save_sync_settings {
+            if let Err(error) = settings.save_selected_installation(path) {
+                self.save_sync_settings_problem = Some(format!("Selection was not saved: {error}"));
+                self.log(Level::Error, "save-sync", error.to_string());
+                self.refresh_save_sync();
+                return;
+            }
+        } else {
+            self.save_sync_settings_problem = Some(
+                "Selection cannot be persisted without the application settings database.".into(),
+            );
+        }
+        self.save_sync_selected_root = Some(path.to_path_buf());
+        self.refresh_save_sync();
+    }
+
+    fn set_save_sync_enabled(&mut self, enabled: bool) {
+        if enabled {
+            let ready = self.save_sync_scope.is_some()
+                && self.save_sync_profile.is_some()
+                && self.save_sync_identity.as_ref().is_some_and(|identity| {
+                    identity.can_read_saves() && identity.can_write_saves()
+                })
+                && self
+                    .save_sync_mapping_report
+                    .as_ref()
+                    .is_some_and(|report| report.supported_count() > 0);
+            if !ready {
+                self.save_sync_runtime_problem = Some(
+                    "Enable refused: account, RetroBat 8.2.1 profile, and visible save mapping are not verified.".into(),
+                );
+                self.refresh_save_sync();
+                return;
+            }
+        }
+        if let (Some(settings), Some(scope)) = (
+            self.save_sync_settings.as_ref(),
+            self.save_sync_scope.as_ref(),
+        ) {
+            let settings_value = ConsentSettings {
+                enabled,
+                debounce_secs: self.save_sync_debounce_secs,
+            };
+            if let Err(error) = settings.save(scope, settings_value) {
+                self.save_sync_runtime_problem =
+                    Some(format!("Consent could not be saved: {error}"));
+                self.refresh_save_sync();
+                return;
+            }
+        } else if enabled {
+            self.save_sync_runtime_problem = Some("Consent scope is unavailable.".into());
+            self.refresh_save_sync();
+            return;
+        }
+        self.save_sync_enabled = enabled;
+        self.refresh_save_sync();
+    }
+
+    fn set_save_sync_debounce(&mut self, seconds: u32) {
+        if !(1..=3600).contains(&seconds) {
+            self.save_sync_runtime_problem =
+                Some("Debounce must be a whole number from 1 to 3600 seconds.".into());
+            self.refresh_save_sync();
+            return;
+        }
+        self.save_sync_debounce_secs = seconds;
+        if let (Some(settings), Some(scope)) = (
+            self.save_sync_settings.as_ref(),
+            self.save_sync_scope.as_ref(),
+        ) {
+            if let Err(error) = settings.save(
+                scope,
+                ConsentSettings {
+                    enabled: self.save_sync_enabled,
+                    debounce_secs: seconds,
+                },
+            ) {
+                self.save_sync_runtime_problem =
+                    Some(format!("Debounce could not be saved: {error}"));
+            }
+        }
+        self.refresh_save_sync();
+    }
+
+    fn export_save_sync_incoming(
+        &mut self,
+        session_id: u64,
+        incoming_id: &str,
+        destination: &Path,
+    ) {
+        if session_id != self.save_sync_session_id {
+            return;
+        }
+        let result = (|| {
+            if let Some(agent) = self.save_sync_agent.as_ref() {
+                return agent.export_incoming(incoming_id, destination.to_path_buf());
+            }
+            let scope = self.save_sync_scope.as_ref().ok_or_else(|| {
+                Error::Unsupported("save-sync scope is unavailable for export".into())
+            })?;
+            let mappings = &self
+                .save_sync_mapping_report
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::Unsupported("save mappings are unavailable for export".into())
+                })?
+                .mappings;
+            let identity = self.save_sync_identity.as_ref().ok_or_else(|| {
+                Error::Unsupported("verified account identity is unavailable for export".into())
+            })?;
+            let settings_dir = self.save_sync_storage_dir.clone().ok_or_else(|| {
+                Error::Unsupported("persistent save-sync directory is unavailable".into())
+            })?;
+            crate::save_sync_agent::export_pending_incoming(
+                scope,
+                mappings,
+                identity,
+                &settings_dir.join("save-sync-journal.db"),
+                &settings_dir.join("save-sync-snapshots"),
+                incoming_id,
+                destination,
+            )
+        })();
+        let (destination, error) = match result {
+            Ok(()) => (Some(destination.display().to_string()), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        if let Some(error) = error.as_ref() {
+            self.log(
+                Level::Error,
+                "save-sync",
+                format!("incoming save export failed: {error}"),
+            );
+        }
+        self.sink.emit(AppEvent::SaveSyncExportFinished {
+            session_id,
+            incoming_id: incoming_id.to_owned(),
+            destination,
+            error,
+        });
+    }
+
+    fn advance_save_sync_session(&mut self) {
+        self.save_sync_session_id = self.save_sync_session_id.saturating_add(1);
+        self.sink.emit(AppEvent::SaveSyncSessionChanged {
+            session_id: self.save_sync_session_id,
+        });
+    }
+
+    fn emit_persisted_save_sync_review(
+        &self,
+        scope: &SaveSyncScope,
+        mappings: &[rommfs_core::save_sync::SaveMapping],
+        _identity: &rommfs_core::romm::SaveSyncIdentity,
+    ) -> Result<()> {
+        let Some(settings_dir) = &self.save_sync_storage_dir else {
+            return Ok(());
+        };
+        let journal_path = settings_dir.join("save-sync-journal.db");
+        if !journal_path.is_file() {
+            return Ok(());
+        }
+        let journal = SaveSyncJournal::open(
+            &journal_path,
+            settings_dir.join("save-sync-snapshots"),
+            scope.clone(),
+        )?;
+        let incoming_records = journal.incoming_saves()?;
+        let incoming = incoming_records
+            .iter()
+            .map(|record| rommfs_core::events::SaveSyncIncomingStatus {
+                incoming_id: record.id.clone(),
+                rom_id: record.rom_key.rom_id,
+                rom_name: mappings
+                    .iter()
+                    .find(|mapping| mapping.rom_key == record.rom_key)
+                    .map(|mapping| mapping.visible_rom_name.clone())
+                    .unwrap_or_else(|| format!("ROM {}", record.rom_key.rom_id)),
+                remote_id: record.remote_id.clone(),
+                content_hash: record.content_hash.clone(),
+                reason: record.reason.clone(),
+                state: record.state.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut games = Vec::new();
+        let mut attention_games = 0;
+        let mut failure = None;
+        for mapping in mappings {
+            let Some(slot) = journal.slot(&mapping.rom_key)? else {
+                continue;
+            };
+            if slot.needs_attention {
+                attention_games += 1;
+            }
+            if failure.is_none() {
+                failure = slot.last_failure.clone();
+            }
+            games.push(SaveSyncGameStatus {
+                rom_id: mapping.rom_key.rom_id,
+                rom_name: mapping.visible_rom_name.clone(),
+                local_hash: slot.current_local_hash,
+                remote_id: slot.remote_slot_id,
+                remote_hash: slot.remote_baseline_hash,
+                incoming_ids: incoming_records
+                    .iter()
+                    .filter(|record| record.rom_key == mapping.rom_key)
+                    .map(|record| record.id.clone())
+                    .collect(),
+                issue: slot.last_failure.or_else(|| {
+                    slot.local_removed.then(|| {
+                        "the tracked local save was removed; the remote copy was preserved".into()
+                    })
+                }),
+                installed_incoming: false,
+            });
+        }
+        let pending_outbound = journal
+            .snapshots()?
+            .iter()
+            .filter(|snapshot| snapshot.state != SnapshotState::RemoteComplete)
+            .count()
+            + journal.dirty_mappings()?.len();
+        self.sink
+            .emit(AppEvent::SaveSyncQueueUpdated(SaveSyncQueueStatus {
+                session_id: self.save_sync_session_id,
+                mapped_games: mappings.len(),
+                // Persisted baselines are useful review context, but they are
+                // not a fresh inventory verification for this session.
+                reconciled_games: 0,
+                pending_outbound,
+                pending_incoming: incoming.len(),
+                attention_games,
+                network_paused: false,
+                authentication_required: false,
+                actor_failed: false,
+                failure,
+                games,
+                incoming,
+            }));
+        Ok(())
+    }
+
+    fn stop_save_sync_agent(&mut self) {
+        self.save_sync_gate.close();
+        if let Some(mut agent) = self.save_sync_agent.take() {
+            agent.stop();
         }
     }
 
@@ -340,11 +1171,14 @@ impl Worker {
     fn connect(&mut self, url: &str, username: &str, password: &str) {
         // Credentials are used to authenticate and then dropped from this
         // stack frame; they are never stored in logs/events (R1).
+        self.advance_save_sync_session();
         self.sink.emit(AppEvent::Connecting);
+        self.stop_save_sync_agent();
         if self.mount.is_some() {
             self.fail_connect(&Error::Unsupported(
                 "stop the mount before connecting elsewhere".into(),
             ));
+            self.refresh_save_sync();
             return;
         }
 
@@ -354,6 +1188,12 @@ impl Worker {
         self.client = None;
         self.server_id = None;
         self.catalogue = None;
+        self.save_sync_catalogue = None;
+        self.save_sync_identity = None;
+        self.save_sync_scope = None;
+        self.save_sync_profile = None;
+        self.save_sync_mapping_report = None;
+        self.save_sync_enabled = false;
         self.names.clear();
         self.fs = None;
 
@@ -361,23 +1201,33 @@ impl Worker {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 self.fail_connect(&e);
+                self.refresh_save_sync();
                 return;
             }
         };
-        if let Err(e) = client.authenticate(Credentials { username, password }) {
-            self.fail_connect(&e);
-            return;
-        }
+        let save_sync_identity =
+            match client.authenticate_for_save_sync(Credentials { username, password }) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    self.fail_connect(&error);
+                    self.refresh_save_sync();
+                    return;
+                }
+            };
 
         self.client = Some(Arc::clone(&client));
         self.server_id = Some(server_id_of(url));
+        self.save_sync_identity = save_sync_identity;
         self.sink.emit(AppEvent::Connected);
         self.log(Level::Info, "connect", format!("connected as {username}"));
 
         // The catalogue primes the UI (counts) but a failure here must not
         // fake an empty library — it surfaces as CatalogueFailed (R1).
         match self.load_catalogue(&client) {
-            Ok(cat) => self.store_catalogue(cat),
+            Ok(cat) => {
+                self.store_catalogue(cat);
+                self.refresh_save_sync();
+            }
             Err(e) => {
                 if e.needs_sign_in() {
                     self.sink.emit(AppEvent::SignInRequired);
@@ -387,6 +1237,7 @@ impl Worker {
                     });
                 }
                 self.log(Level::Error, "catalogue", e.to_string());
+                self.refresh_save_sync();
             }
         }
     }
@@ -422,6 +1273,7 @@ impl Worker {
     }
 
     fn store_catalogue(&mut self, cat: Catalogue) {
+        self.save_sync_catalogue = Some(cat.clone());
         self.names = cat
             .entries
             .iter()
@@ -453,18 +1305,27 @@ impl Worker {
         if self.mount.is_some() {
             // Duplicate starts can already be queued when the UI receives
             // MountStarting. Keep the real mounted state authoritative.
+            if self.save_sync_enabled
+                && !self
+                    .save_sync_gate
+                    .enabled_for(self.current_save_sync_epoch)
+            {
+                self.refresh_save_sync();
+            }
             return;
         }
         let Some(client) = self.client.clone() else {
             self.fail_mount(&Error::Auth(
                 "connect to a RomM server before mounting".into(),
             ));
+            self.refresh_save_sync();
             return;
         };
         let Some(server_id) = self.server_id.clone() else {
             self.fail_mount(&Error::Auth(
                 "connect to a RomM server before mounting".into(),
             ));
+            self.refresh_save_sync();
             return;
         };
 
@@ -478,15 +1339,20 @@ impl Worker {
         // ROM library, never recursively cleared).
         if let Err(e) = check_mount_root(&root, &server_id) {
             self.fail_mount(&e);
+            self.refresh_save_sync();
             return;
         }
 
         // Mounts re-read the catalogue so stop/start never serves stale data.
         match self.load_catalogue(&client) {
-            Ok(cat) => self.store_catalogue(cat),
+            Ok(cat) => {
+                self.store_catalogue(cat);
+                self.refresh_save_sync();
+            }
             Err(e) if e.needs_sign_in() => {
                 self.sink.emit(AppEvent::SignInRequired);
                 self.fail_mount(&e);
+                self.refresh_save_sync();
                 return;
             }
             Err(e) => {
@@ -494,6 +1360,7 @@ impl Worker {
                     reason: e.to_string(),
                 });
                 self.fail_mount(&e);
+                self.refresh_save_sync();
                 return;
             }
         }
@@ -627,12 +1494,20 @@ impl Worker {
     }
 }
 
-fn worker_loop(rx: mpsc::Receiver<Command>, sink: EventSink) {
-    worker_loop_with_interval_from(rx, Worker::new(sink), EVICTION_INTERVAL);
+fn worker_loop(
+    rx: mpsc::Receiver<CommandEnvelope>,
+    sink: EventSink,
+    save_sync_gate: SaveSyncCommandGate,
+) {
+    worker_loop_with_interval_from(
+        rx,
+        Worker::with_persistent_save_sync_settings(sink, save_sync_gate),
+        EVICTION_INTERVAL,
+    );
 }
 
 fn worker_loop_with_interval_from(
-    rx: mpsc::Receiver<Command>,
+    rx: mpsc::Receiver<CommandEnvelope>,
     mut worker: Worker,
     eviction_interval: Duration,
 ) {
@@ -650,8 +1525,8 @@ fn worker_loop_with_interval_from(
             next_eviction = None;
             rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
         };
-        let cmd = match received {
-            Ok(cmd) => cmd,
+        let envelope = match received {
+            Ok(envelope) => envelope,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 worker.evict_once();
                 next_eviction = Some(Instant::now() + eviction_interval);
@@ -659,6 +1534,11 @@ fn worker_loop_with_interval_from(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        let CommandEnvelope {
+            command: cmd,
+            save_sync_epoch,
+        } = envelope;
+        worker.current_save_sync_epoch = save_sync_epoch;
         let shutdown = matches!(cmd, Command::Shutdown);
         // Commands run one at a time on the worker thread; UI stays
         // responsive while network/filesystem work blocks here.
@@ -670,7 +1550,21 @@ fn worker_loop_with_interval_from(
             } => worker.connect(url, username, password),
             Command::StartMount { path } => worker.start_mount(path),
             Command::StopMount => worker.stop_mount(),
-            Command::Shutdown => worker.stop_mount(),
+            Command::RefreshSaveSync => worker.refresh_save_sync(),
+            Command::SelectSaveSyncInstallation { path } => {
+                worker.select_save_sync_installation(path)
+            }
+            Command::SetSaveSyncEnabled { enabled } => worker.set_save_sync_enabled(*enabled),
+            Command::SetSaveSyncDebounce { seconds } => worker.set_save_sync_debounce(*seconds),
+            Command::ExportSaveSyncIncoming {
+                session_id,
+                incoming_id,
+                destination,
+            } => worker.export_save_sync_incoming(*session_id, incoming_id, destination),
+            Command::Shutdown => {
+                worker.stop_save_sync_agent();
+                worker.stop_mount();
+            }
         }));
         if let Err(payload) = result {
             // Mid-flight a sibling crate's todo!() (or any panic) must
@@ -687,6 +1581,11 @@ fn worker_loop_with_interval_from(
                     reason: format!("internal error: {msg}"),
                 }),
                 Command::StopMount => {}
+                Command::RefreshSaveSync
+                | Command::SelectSaveSyncInstallation { .. }
+                | Command::SetSaveSyncEnabled { .. }
+                | Command::SetSaveSyncDebounce { .. }
+                | Command::ExportSaveSyncIncoming { .. } => {}
                 Command::Shutdown => {}
             }
         }
@@ -863,6 +1762,47 @@ fn cache_dir_for(server_id: &str) -> PathBuf {
     })
 }
 
+fn save_sync_settings_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(|profile| PathBuf::from(profile).join("AppData").join("Local"))
+        });
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    base.map(|path| path.join("rommfs").join("settings").join("save-sync.db"))
+}
+
+fn save_sync_discovery_input() -> DiscoveryInput {
+    #[cfg(windows)]
+    {
+        crate::save_sync_native::discovery_input()
+    }
+    #[cfg(not(windows))]
+    {
+        DiscoveryInput::default()
+    }
+}
+
+fn selected_installation_problem(problem: InstallationProblem) -> String {
+    match problem {
+        InstallationProblem::Missing => {
+            "The previously selected RetroBat installation is missing; choose another explicitly."
+                .into()
+        }
+        InstallationProblem::Inaccessible => {
+            "The previously selected RetroBat installation is inaccessible; sync is paused.".into()
+        }
+        InstallationProblem::Invalid(reason) => {
+            format!("The selected path is not a supported RetroBat installation: {reason}.")
+        }
+    }
+}
+
 fn log_line(level: Level, op: &'static str, message: String) -> rommfs_core::events::LogLine {
     rommfs_core::events::LogLine {
         unix_secs: rommfs_core::cache::now_unix_secs(),
@@ -877,7 +1817,9 @@ mod tests {
     use super::*;
     use rommfs_core::cache::{CacheIndex, FakeClock, LiveState, NoopHydratedRemover};
     use rommfs_core::download::ContentSource;
-    use rommfs_core::romm::PlatformDto;
+    use rommfs_core::romm::{PlatformDto, RomDto, RomFileDto, SaveSyncIdentity};
+    use rommfs_core::save_sync::RETROBAT_GB_SRM_PROFILE;
+    use rommfs_fixture::{FixtureBodyBarrier, FixtureSaveRecord, FixtureServer, ResponseSpec};
     use std::io::Write;
     use std::time::Duration;
 
@@ -892,6 +1834,34 @@ mod tests {
         ) -> Result<u64> {
             unreachable!("the eviction test never reads ROM content")
         }
+    }
+
+    fn create_test_retrobat_install(root: &Path, create_saves: bool) {
+        let launcher_home = root.join("emulationstation/.emulationstation");
+        std::fs::create_dir_all(root.join("system")).unwrap();
+        std::fs::create_dir_all(root.join("emulators/retroarch")).unwrap();
+        std::fs::create_dir_all(&launcher_home).unwrap();
+        if create_saves {
+            std::fs::create_dir_all(root.join("saves")).unwrap();
+        }
+        std::fs::write(root.join("RetroBat.exe"), b"exe").unwrap();
+        std::fs::write(root.join("system/version.info"), "8.2.1\n").unwrap();
+        std::fs::write(
+            root.join("emulators/retroarch/retroarch.cfg"),
+            "savefile_directory = \":\\saves\"\nsavefiles_in_content_dir = \"false\"\nsort_savefiles_enable = \"false\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("emulationstation/emulatorLauncher.cfg"),
+            "home=.\\.emulationstation\nsaves=.\\..\\saves\n",
+        )
+        .unwrap();
+        std::fs::write(launcher_home.join("es_settings.cfg"), "<config/>\n").unwrap();
+        std::fs::write(
+            launcher_home.join("es_systems.cfg"),
+            r#"<systemList><system><name>gb</name><command>"%HOME%\emulatorLauncher.exe" -gameinfo %GAMEINFOXML% %CONTROLLERSCONFIG% -system %SYSTEM% -emulator %EMULATOR% -core %CORE% -rom %ROM%</command><emulators><emulator name="libretro"><cores><core>gambatte</core></cores></emulator></emulators></system></systemList>"#,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -933,6 +1903,10 @@ mod tests {
         assert!(worker.server_id.is_none());
         assert!(worker.catalogue.is_none());
         assert!(worker.names.is_empty());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AppEvent::SaveSyncSessionChanged { session_id: 1 })
+        ));
         assert!(matches!(events.try_recv(), Ok(AppEvent::Connecting)));
         assert!(matches!(events.try_recv(), Ok(AppEvent::SignInRequired)));
     }
@@ -959,6 +1933,522 @@ mod tests {
     }
 
     #[test]
+    fn missing_previous_save_sync_selection_stays_selected_and_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("previous-retrobat");
+        let newly_found = dir.path().join("new-install");
+        std::fs::create_dir_all(newly_found.join("emulationstation/config")).unwrap();
+        std::fs::create_dir_all(newly_found.join("emulators/retroarch")).unwrap();
+        std::fs::create_dir(newly_found.join("saves")).unwrap();
+        std::fs::write(newly_found.join("RetroBat.exe"), b"exe").unwrap();
+        std::fs::write(
+            newly_found.join("emulationstation/config/es_systems.cfg"),
+            "<systemList/>",
+        )
+        .unwrap();
+        std::fs::write(
+            newly_found.join("emulators/retroarch/retroarch.cfg"),
+            "# config",
+        )
+        .unwrap();
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.save_sync_selected_root = Some(missing.clone());
+
+        worker.refresh_save_sync_from(DiscoveryInput {
+            drive_roots: vec![(
+                newly_found.clone(),
+                rommfs_core::save_sync::InstallationSource::FixedDrive,
+            )],
+            process_images: Vec::new(),
+        });
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AppEvent::SaveSyncSessionChanged { session_id: 1 })
+        ));
+        let event = events.try_recv().unwrap();
+        match event {
+            AppEvent::SaveSyncUpdated {
+                candidates,
+                selected_root,
+                selected_problem,
+                ..
+            } => {
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].info.install_root, newly_found);
+                assert_eq!(selected_root, Some(missing.display().to_string()));
+                assert!(selected_problem
+                    .unwrap()
+                    .contains("previously selected RetroBat installation is missing"));
+            }
+            other => panic!("expected save-sync state event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manual_save_sync_selection_is_validated_and_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("chosen-retrobat");
+        std::fs::create_dir_all(root.join("emulationstation/config")).unwrap();
+        std::fs::create_dir_all(root.join("emulators/retroarch")).unwrap();
+        std::fs::create_dir(root.join("saves")).unwrap();
+        std::fs::write(root.join("RetroBat.exe"), b"exe").unwrap();
+        std::fs::write(
+            root.join("emulationstation/config/es_systems.cfg"),
+            "<systemList/>",
+        )
+        .unwrap();
+        std::fs::write(root.join("emulators/retroarch/retroarch.cfg"), "# config").unwrap();
+
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.save_sync_settings =
+            Some(SaveSyncSettingsStore::open(dir.path().join("settings/save-sync.db")).unwrap());
+        worker.select_save_sync_installation(&root);
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AppEvent::SaveSyncSessionChanged { session_id: 1 })
+        ));
+        let event = events.try_recv().unwrap();
+        match event {
+            AppEvent::SaveSyncUpdated {
+                selected_root,
+                documented_saves_root,
+                effective_saves_root,
+                enabled,
+                debounce_secs,
+                selected_problem,
+                ..
+            } => {
+                assert_eq!(selected_root, Some(root.display().to_string()));
+                assert_eq!(
+                    documented_saves_root,
+                    Some(root.join("saves").display().to_string())
+                );
+                assert!(!enabled);
+                assert_eq!(debounce_secs, rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS);
+                assert!(selected_problem.is_some());
+                assert!(effective_saves_root.is_none());
+            }
+            other => panic!("expected save-sync state event, got {other:?}"),
+        }
+        assert_eq!(
+            worker
+                .save_sync_settings
+                .as_ref()
+                .unwrap()
+                .selected_installation()
+                .unwrap(),
+            Some(root)
+        );
+    }
+
+    #[test]
+    fn save_sync_enable_request_is_refused_without_verified_account_and_save_root() {
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+
+        worker.set_save_sync_enabled(true);
+
+        let mut enabled = true;
+        let mut debounce_secs = 0;
+        let mut problem = None;
+        for event in events.try_iter() {
+            if let AppEvent::SaveSyncUpdated {
+                enabled: event_enabled,
+                debounce_secs: event_debounce,
+                selected_problem,
+                ..
+            } = event
+            {
+                enabled = event_enabled;
+                debounce_secs = event_debounce;
+                problem = selected_problem;
+            }
+        }
+        assert!(!enabled);
+        assert_eq!(debounce_secs, rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS);
+        assert!(problem.unwrap().contains(
+            "account, RetroBat 8.2.1 profile, and visible save mapping are not verified"
+        ));
+    }
+
+    #[test]
+    fn stale_save_sync_status_and_transfer_events_are_rejected_after_scope_change() {
+        let mut state = UiState::new(32);
+        state.apply(&AppEvent::SaveSyncSessionChanged { session_id: 8 });
+        state.apply(&AppEvent::SaveSyncAuthenticationRequired { session_id: 7 });
+        assert_ne!(state.conn, ConnState::SignInRequired);
+        state.apply(&AppEvent::SaveSyncQueueUpdated(SaveSyncQueueStatus {
+            session_id: 7,
+            mapped_games: 1,
+            reconciled_games: 1,
+            pending_outbound: 0,
+            pending_incoming: 0,
+            attention_games: 0,
+            network_paused: false,
+            authentication_required: false,
+            actor_failed: false,
+            failure: None,
+            games: Vec::new(),
+            incoming: Vec::new(),
+        }));
+        state.apply(&AppEvent::SaveSyncTransferProgress {
+            session_id: 7,
+            rom_id: 3,
+            revision: "stale-revision".into(),
+            phase: "verified".into(),
+            detail: None,
+        });
+        assert!(state.save_sync_queue.is_none());
+        assert!(state.save_sync_transfers.is_empty());
+
+        state.apply(&AppEvent::SaveSyncAuthenticationRequired { session_id: 8 });
+        assert!(state.save_sync_authentication_required);
+        assert_eq!(state.conn, ConnState::SignInRequired);
+
+        state.apply(&AppEvent::SaveSyncQueueUpdated(SaveSyncQueueStatus {
+            session_id: 8,
+            mapped_games: 1,
+            reconciled_games: 0,
+            pending_outbound: 2,
+            pending_incoming: 1,
+            attention_games: 1,
+            network_paused: false,
+            authentication_required: false,
+            actor_failed: false,
+            failure: Some("network retry".into()),
+            games: Vec::new(),
+            incoming: Vec::new(),
+        }));
+        let queue = state.save_sync_queue.as_ref().unwrap();
+        assert_eq!(queue.pending_outbound, 2);
+        assert_eq!(queue.reconciled_games, 0);
+        assert_eq!(state.save_sync_pending_incoming, 1);
+        assert_eq!(state.save_sync_attention_games, 1);
+    }
+
+    #[test]
+    fn invalid_debounce_values_do_not_change_persisted_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("save-sync.db");
+        let scope = SaveSyncScope {
+            server_id: "fixture-server".into(),
+            account_id: "42".into(),
+            installation_root: dir.path().join("RetroBat"),
+            effective_saves_root: dir.path().join("RetroBat/saves"),
+        };
+        let settings = SaveSyncSettingsStore::open(&database).unwrap();
+        settings
+            .save(
+                &scope,
+                ConsentSettings {
+                    enabled: false,
+                    debounce_secs: 17,
+                },
+            )
+            .unwrap();
+        drop(settings);
+
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.save_sync_settings = Some(SaveSyncSettingsStore::open(&database).unwrap());
+        worker.save_sync_scope = Some(scope.clone());
+        worker.save_sync_debounce_secs = 17;
+        worker.set_save_sync_debounce(0);
+        worker.set_save_sync_debounce(3601);
+
+        assert_eq!(
+            worker
+                .save_sync_settings
+                .as_ref()
+                .unwrap()
+                .load(&scope)
+                .unwrap()
+                .debounce_secs,
+            17
+        );
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            AppEvent::SaveSyncUpdated {
+                selected_problem: Some(problem),
+                ..
+            } if problem.contains("1 to 3600 seconds")
+        )));
+    }
+
+    #[test]
+    fn preview_reports_mapped_targets_separately_from_empty_existing_saves_before_consent() {
+        let directory = tempfile::tempdir().unwrap();
+        let install_root = directory.path().join("RetroBat");
+        create_test_retrobat_install(&install_root, false);
+        let settings_dir = directory.path().join("settings");
+        let settings = SaveSyncSettingsStore::open(settings_dir.join("save-sync.db")).unwrap();
+        let fixture = FixtureServer::start();
+        let server_id = server_id_of(fixture.url());
+        let client = Arc::new(RommClient::new(fixture.url()).unwrap());
+        let rom = RomDto {
+            id: 7,
+            platform_fs_slug: "gb".into(),
+            platform_slug: "gb".into(),
+            fs_name: "Game.gb".into(),
+            fs_size_bytes: 1,
+            has_simple_single_file: true,
+            has_nested_single_file: false,
+            has_multiple_files: false,
+            missing_from_fs: false,
+            is_physical: false,
+            updated_at: String::new(),
+            files: vec![RomFileDto {
+                id: 70,
+                file_name: "Game.gb".into(),
+                file_size_bytes: 1,
+                last_modified: None,
+                crc_hash: None,
+                md5_hash: None,
+                sha1_hash: None,
+                is_top_level: true,
+            }],
+        };
+        let catalogue = build_catalogue(
+            &server_id,
+            &[PlatformDto {
+                id: 1,
+                slug: "gb".into(),
+                fs_slug: "gb".into(),
+                name: "Game Boy".into(),
+                custom_name: None,
+                rom_count: 1,
+            }],
+            &[rom],
+            |_| {},
+        )
+        .unwrap();
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.save_sync_settings = Some(settings);
+        worker.save_sync_storage_dir = Some(settings_dir);
+        worker.save_sync_selected_root = Some(install_root.clone());
+        worker.server_id = Some(server_id);
+        worker.client = Some(client);
+        worker.save_sync_identity = Some(SaveSyncIdentity {
+            account_id: 42,
+            scopes: vec!["assets.read".into(), "assets.write".into()],
+        });
+        worker.save_sync_catalogue = Some(catalogue);
+
+        worker.refresh_save_sync_from(DiscoveryInput::default());
+
+        let update = events
+            .try_iter()
+            .find_map(|event| match event {
+                AppEvent::SaveSyncUpdated {
+                    mapped_targets,
+                    catalogue_unmapped,
+                    existing_saves,
+                    available,
+                    enabled,
+                    ..
+                } => Some((
+                    mapped_targets,
+                    catalogue_unmapped,
+                    existing_saves.unwrap(),
+                    available,
+                    enabled,
+                )),
+                _ => None,
+            })
+            .expect("worker preview update");
+        assert_eq!(update.0, 1);
+        assert_eq!(update.1, 0);
+        assert!(
+            update.3,
+            "an absent local save must not block incoming sync"
+        );
+        assert!(!update.4, "consent remains off by default");
+        assert_eq!(
+            update.2.status,
+            rommfs_core::save_sync::ExistingSaveScanStatus::Complete
+        );
+        assert_eq!(update.2.supported_files, 0);
+        assert_eq!(update.2.skipped_files, 0);
+        assert!(!install_root.join("saves").exists());
+        assert!(
+            fixture.requests().is_empty(),
+            "preview is local-only before consent"
+        );
+    }
+
+    #[test]
+    fn disable_during_connect_prevents_the_older_scope_refresh_from_starting_sync() {
+        let directory = tempfile::tempdir().unwrap();
+        let install_root = directory.path().join("RetroBat");
+        let save_root = install_root.join("saves");
+        create_test_retrobat_install(&install_root, true);
+
+        let fixture = FixtureServer::start();
+        let account_barrier = FixtureBodyBarrier::new();
+        let inventory_barrier = FixtureBodyBarrier::new();
+        fixture.on(
+            "POST",
+            "/api/token",
+            ResponseSpec::Json {
+                status: 200,
+                body: rommfs_fixture::contract::token_ok(),
+            },
+        );
+        fixture.on(
+            "GET",
+            "/api/users/me",
+            ResponseSpec::HeldBytes {
+                status: 200,
+                bytes: br#"{"id":42,"oauth_scopes":["me.read","assets.read","assets.write"]}"#
+                    .to_vec(),
+                barrier: account_barrier.clone(),
+            },
+        );
+        fixture.on(
+            "GET",
+            "/api/platforms",
+            ResponseSpec::Json {
+                status: 200,
+                body: rommfs_fixture::contract::platforms(&[(1, "gb", "gb", "Game Boy")]),
+            },
+        );
+        let rom = rommfs_fixture::contract::rom(7, "gb", "Game.gb", 1, "abc");
+        fixture.on(
+            "GET",
+            "/api/roms?",
+            ResponseSpec::Json {
+                status: 200,
+                body: rommfs_fixture::contract::roms_page(&[rom], 1, 100, 0),
+            },
+        );
+        fixture.use_romm_save_store(42, 201);
+        fixture.seed_save(FixtureSaveRecord {
+            id: 31,
+            rom_id: 7,
+            user_id: 42,
+            file_name: "rommfs-550e8400-e29b-41d4-a716-446655440000 [2026-10-05_12-34-56].srm"
+                .into(),
+            file_size_bytes: 19,
+            slot: RETROBAT_GB_SRM_PROFILE.into(),
+            bytes: b"incoming save bytes".to_vec(),
+            created_at: "2026-10-05T12:34:56Z".into(),
+            updated_at: "2026-10-05T12:34:56Z".into(),
+        });
+        fixture.on(
+            "GET",
+            "/api/saves?",
+            ResponseSpec::HeldBytes {
+                status: 200,
+                bytes: serde_json::json!([{
+                    "id": 31,
+                    "rom_id": 7,
+                    "user_id": 42,
+                    "file_name": "rommfs-550e8400-e29b-41d4-a716-446655440000 [2026-10-05_12-34-56].srm",
+                    "file_size_bytes": 19,
+                    "missing_from_fs": false,
+                    "created_at": "2026-10-05T12:34:56Z",
+                    "updated_at": "2026-10-05T12:34:56Z",
+                    "emulator": "retroarch-gambatte",
+                    "slot": RETROBAT_GB_SRM_PROFILE,
+                }])
+                .to_string()
+                .into_bytes(),
+                barrier: inventory_barrier.clone(),
+            },
+        );
+
+        let settings_dir = directory.path().join("settings");
+        let settings = SaveSyncSettingsStore::open(settings_dir.join("save-sync.db")).unwrap();
+        let scope = SaveSyncScope {
+            server_id: server_id_of(fixture.url()),
+            account_id: "42".into(),
+            installation_root: install_root.clone(),
+            effective_saves_root: save_root,
+        };
+        settings
+            .save(
+                &scope,
+                ConsentSettings {
+                    enabled: true,
+                    debounce_secs: 1,
+                },
+            )
+            .unwrap();
+
+        let (sink, events) = rommfs_core::events::channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let gate = SaveSyncCommandGate::new();
+        let worker_gate = gate.clone();
+        let worker_sink = sink.clone();
+        let worker_settings_dir = settings_dir.clone();
+        let worker_install_root = install_root.clone();
+        let worker = std::thread::spawn(move || {
+            let mut worker = Worker::new_with_gate(worker_sink, worker_gate);
+            worker.save_sync_settings = Some(settings);
+            worker.save_sync_storage_dir = Some(worker_settings_dir);
+            worker.save_sync_selected_root = Some(worker_install_root);
+            worker_loop_with_interval_from(cmd_rx, worker, Duration::from_secs(3600));
+        });
+        let controller = Controller {
+            sink,
+            cmd_tx,
+            worker: Some(worker),
+            save_sync_gate: gate,
+        };
+
+        controller.send(Command::Connect {
+            url: fixture.url().into(),
+            username: "user".into(),
+            password: "password".into(),
+        });
+        assert!(account_barrier.wait_until_blocked(Duration::from_secs(5)));
+        controller.send(Command::SetSaveSyncEnabled { enabled: false });
+        let disabled_epoch = controller.save_sync_gate.current_epoch();
+        account_barrier.release();
+
+        let inventory_started = inventory_barrier.wait_until_blocked(Duration::from_secs(3));
+        if inventory_started {
+            inventory_barrier.release();
+        }
+        let mut saw_disabled_status = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !saw_disabled_status && std::time::Instant::now() < deadline {
+            if let Ok(AppEvent::SaveSyncUpdated {
+                enabled,
+                available,
+                mapped_targets,
+                account_id,
+                ..
+            }) = events.recv_timeout(Duration::from_millis(100))
+            {
+                assert!(!enabled, "an older connection refresh reopened save sync");
+                assert!(available, "test account/profile was not save-sync ready");
+                assert_eq!(mapped_targets, 1);
+                assert_eq!(account_id, Some(42));
+                saw_disabled_status = true;
+            }
+        }
+
+        assert!(
+            saw_disabled_status,
+            "worker did not report the disabled scope"
+        );
+        assert!(
+            !inventory_started,
+            "the stale refresh started an inventory request"
+        );
+        assert!(!controller.save_sync_gate.enabled_for(disabled_epoch));
+        assert_eq!(fixture.count_requests("POST", "/api/saves?"), 0);
+        assert_eq!(fixture.count_requests("GET", "/api/saves/31/content"), 0);
+        assert!(!install_root.join("saves/gb/Game.srm").exists());
+    }
+
+    #[test]
     fn worker_loop_sweeps_again_after_the_mount_start_sweep() {
         let dir = tempfile::tempdir().unwrap();
         let key = RomKey {
@@ -970,7 +2460,7 @@ mod tests {
         let bin = cache_dir.join(format!("{}.bin", key.cache_stem()));
         let worker_bin = bin.clone();
         let (sink, events) = rommfs_core::events::channel();
-        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<CommandEnvelope>();
         let worker_thread = std::thread::spawn(move || {
             // Construct Worker inside its owning thread: ActiveMount may
             // contain a platform mount handle that is intentionally !Send.
@@ -1019,6 +2509,22 @@ mod tests {
                     root: cache_dir,
                     stop_fn: Box::new(|| {}),
                 }),
+                save_sync_settings: None,
+                save_sync_storage_dir: None,
+                save_sync_selected_root: None,
+                save_sync_settings_problem: None,
+                save_sync_enabled: false,
+                save_sync_debounce_secs: rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS,
+                save_sync_identity: None,
+                save_sync_scope: None,
+                save_sync_profile: None,
+                save_sync_mapping_report: None,
+                save_sync_catalogue: None,
+                save_sync_agent: None,
+                save_sync_gate: SaveSyncCommandGate::new(),
+                current_save_sync_epoch: 0,
+                save_sync_runtime_problem: None,
+                save_sync_session_id: 0,
             };
             worker_loop_with_interval_from(cmd_rx, worker, Duration::from_millis(10));
         });
@@ -1030,7 +2536,12 @@ mod tests {
             "the periodic sweep removes stale cache bytes"
         );
 
-        cmd_tx.send(Command::Shutdown).unwrap();
+        cmd_tx
+            .send(CommandEnvelope {
+                command: Command::Shutdown,
+                save_sync_epoch: 0,
+            })
+            .unwrap();
         worker_thread.join().unwrap();
     }
 }

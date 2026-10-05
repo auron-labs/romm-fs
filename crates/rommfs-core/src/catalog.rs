@@ -53,6 +53,7 @@ pub struct RomEntry {
 }
 
 /// The full mounted snapshot.
+#[derive(Clone)]
 pub struct Catalogue {
     /// Sorted platform directory names.
     pub platforms: Vec<String>,
