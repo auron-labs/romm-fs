@@ -9,15 +9,21 @@
 
 use crate::controller::{Command, ConnState, Controller, MountState, UiState};
 use gpui::{
-    actions, div, fill, hsla, point, prelude::*, px, relative, rgb, rgba, size, App, Application,
-    Bounds, ClipboardItem, Context, CursorStyle, Div, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight, GlobalElementId, IntoElement,
-    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, Render, ScrollHandle, ShapedLine, SharedString, Style, TextRun, Timer,
-    UTF16Selection, UnderlineStyle, WeakEntity, Window, WindowBounds, WindowOptions,
+    actions, div, fill, hsla, point, prelude::*, px, relative, rems, rgb, rgba, size, App,
+    Application, Bounds, ClipboardItem, Context, CursorStyle, Div, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
+    GlobalElementId, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, PathPromptOptions, Pixels, Point, Render,
+    ScrollHandle, ShapedLine, SharedString, Style, TextRun, Timer, UTF16Selection, UnderlineStyle,
+    WeakEntity, Window, WindowBounds, WindowOptions,
 };
-use rommfs_core::events::{AppEvent, Level};
+use rommfs_core::events::{AppEvent, Level, SaveSyncIncomingStatus};
+use rommfs_core::save_sync::{
+    ExistingSavePreview, ExistingSaveScanStatus, MAX_EXISTING_SAVE_SCAN_DEPTH,
+    MAX_EXISTING_SAVE_SCAN_ENTRIES,
+};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -36,11 +42,40 @@ actions!(
         Paste,
         Cut,
         Copy,
+        SaveSyncApplyDebounce,
+        ActivateSaveControl,
     ]
 );
 
 const LOG_CAP: usize = 500;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+#[derive(Clone, Copy)]
+enum PaletteRole {
+    Accent,
+    AccentHover,
+    Focus,
+    Border,
+    Disabled,
+    Muted,
+    Danger,
+    Caution,
+    Success,
+}
+
+fn palette_color(role: PaletteRole) -> u32 {
+    match role {
+        PaletteRole::Accent => 0x2f6df6,
+        PaletteRole::AccentHover => 0x3d7bff,
+        PaletteRole::Focus => 0x4c8dff,
+        PaletteRole::Border => 0x3a3f55,
+        PaletteRole::Disabled => 0x3a3f55,
+        PaletteRole::Muted => 0x8a8fa8,
+        PaletteRole::Danger => 0xe06060,
+        PaletteRole::Caution => 0xe0b45c,
+        PaletteRole::Success => 0x4caf7d,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Minimal single-line text input (masked flag for the password field).
@@ -84,6 +119,14 @@ impl TextInput {
 
     fn value(&self) -> &str {
         &self.content
+    }
+
+    fn set_value(&mut self, value: impl Into<SharedString>) {
+        self.content = value.into();
+        let end = self.content.len();
+        self.selected_range = end..end;
+        self.selection_reversed = false;
+        self.marked_range = None;
     }
 
     /// What is drawn — masked fields render one `*` per content byte so all
@@ -663,6 +706,9 @@ struct RommfsWindow {
     user_input: Entity<TextInput>,
     password_input: Entity<TextInput>,
     mount_input: Entity<TextInput>,
+    debounce_input: Entity<TextInput>,
+    debounce_input_applied: String,
+    debounce_error: Option<String>,
     focus_handle: FocusHandle,
     log_scroll: ScrollHandle,
 }
@@ -677,6 +723,14 @@ impl RommfsWindow {
         let password_input =
             cx.new(|cx| TextInput::new(cx, "password", SharedString::default(), true));
         let mount_input = cx.new(|cx| TextInput::new(cx, "mount folder", "C:\\RomM", false));
+        let debounce_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "5",
+                rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string(),
+                false,
+            )
+        });
 
         // Worker events arrive on the channel; poll it on the UI executor —
         // every applied event is a real fact, nothing fabricated (R5).
@@ -696,7 +750,10 @@ impl RommfsWindow {
             user_input,
             password_input,
             mount_input,
-            focus_handle: cx.focus_handle(),
+            debounce_input,
+            debounce_input_applied: rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string(),
+            debounce_error: None,
+            focus_handle: cx.focus_handle().tab_stop(true),
             log_scroll: ScrollHandle::new(),
         }
     }
@@ -708,6 +765,31 @@ impl RommfsWindow {
         while let Ok(event) = self.event_rx.try_recv() {
             if matches!(event, AppEvent::Log(_)) {
                 new_logs = true;
+            }
+            match &event {
+                AppEvent::SaveSyncSessionChanged { .. } => {
+                    if self.debounce_input.read(cx).value() == self.debounce_input_applied {
+                        let default = rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string();
+                        self.debounce_input
+                            .update(cx, |input, _| input.set_value(default.clone()));
+                        self.debounce_input_applied = default;
+                    }
+                    self.debounce_error = None;
+                }
+                AppEvent::SaveSyncUpdated {
+                    session_id,
+                    debounce_secs,
+                    ..
+                } if *session_id == self.state.save_sync_session_id => {
+                    let previous = self.debounce_input_applied.clone();
+                    let next = debounce_secs.to_string();
+                    if self.debounce_input.read(cx).value() == previous {
+                        self.debounce_input
+                            .update(cx, |input, _| input.set_value(next.clone()));
+                    }
+                    self.debounce_input_applied = next;
+                }
+                _ => {}
             }
             self.state.apply(&event);
             changed = true;
@@ -746,6 +828,142 @@ impl RommfsWindow {
             return;
         }
         self.controller.send(Command::StopMount);
+    }
+
+    fn browse_save_sync(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Select a RetroBat installation folder".into()),
+        });
+        cx.spawn(
+            async move |this: WeakEntity<RommfsWindow>, cx| match paths.await {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        let _ = this.update(cx, |view, cx| {
+                            view.controller
+                                .send(Command::SelectSaveSyncInstallation { path });
+                            cx.notify();
+                        });
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    let _ = this.update(cx, |view, _| view.show_picker_error(error.to_string()));
+                }
+                Err(_) => {
+                    let _ = this.update(cx, |view, _| {
+                        view.show_picker_error("folder picker response was interrupted".into())
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn apply_save_sync_debounce(&mut self, cx: &mut Context<Self>) {
+        let value = self.debounce_input.read(cx).value().trim().to_owned();
+        let Ok(seconds) = value.parse::<u32>() else {
+            self.debounce_error = Some("Enter a whole number from 1 to 3600 seconds.".into());
+            cx.notify();
+            return;
+        };
+        if !(1..=3600).contains(&seconds) {
+            self.debounce_error = Some("Enter a whole number from 1 to 3600 seconds.".into());
+            cx.notify();
+            return;
+        }
+        self.debounce_error = None;
+        self.debounce_input_applied = seconds.to_string();
+        self.controller
+            .send(Command::SetSaveSyncDebounce { seconds });
+        cx.notify();
+    }
+
+    fn on_apply_debounce_action(
+        &mut self,
+        _: &SaveSyncApplyDebounce,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_save_sync_debounce(cx);
+    }
+
+    fn prompt_export(&mut self, incoming: SaveSyncIncomingStatus, cx: &mut Context<Self>) {
+        let Some(root) = self.state.save_sync_effective_saves_root.as_deref() else {
+            return;
+        };
+        let session_id = self.state.save_sync_session_id;
+        if !self.pending_incoming_exists(&incoming.incoming_id) {
+            return;
+        }
+        let root = PathBuf::from(root);
+        let directory = root.parent().unwrap_or(&root).to_path_buf();
+        let suggested_name = format!("rommfs-incoming-{}.rommfs-incoming", incoming.incoming_id);
+        let prompt = cx.prompt_for_new_path(&directory, Some(&suggested_name));
+        let incoming_id = incoming.incoming_id;
+        cx.spawn(
+            async move |this: WeakEntity<RommfsWindow>, cx| match prompt.await {
+                Ok(Ok(Some(destination))) => {
+                    let _ = this.update(cx, |view, cx| {
+                        if view.state.save_sync_session_id != session_id
+                            || !view.pending_incoming_exists(&incoming_id)
+                        {
+                            return;
+                        }
+                        view.controller.send(Command::ExportSaveSyncIncoming {
+                            session_id,
+                            incoming_id,
+                            destination,
+                        });
+                        cx.notify();
+                    });
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    let _ = this.update(cx, |view, _| {
+                        view.emit_export_error(session_id, &incoming_id, error.to_string());
+                    });
+                }
+                Err(_) => {
+                    let _ = this.update(cx, |view, _| {
+                        view.emit_export_error(
+                            session_id,
+                            &incoming_id,
+                            "file picker response was interrupted".into(),
+                        );
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn pending_incoming_exists(&self, incoming_id: &str) -> bool {
+        self.state.save_sync_queue.as_ref().is_some_and(|queue| {
+            queue
+                .incoming
+                .iter()
+                .any(|incoming| incoming.incoming_id == incoming_id)
+        })
+    }
+
+    fn show_picker_error(&self, error: String) {
+        self.controller
+            .sink()
+            .emit(AppEvent::log(Level::Error, "save-sync", error));
+    }
+
+    fn emit_export_error(&self, session_id: u64, incoming_id: &str, error: String) {
+        self.controller
+            .sink()
+            .emit(AppEvent::SaveSyncExportFinished {
+                session_id,
+                incoming_id: incoming_id.to_owned(),
+                destination: None,
+                error: Some(error),
+            });
     }
 
     fn on_copy_log(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -798,7 +1016,7 @@ impl RommfsWindow {
         div()
             .text_xs()
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(0x8a8fa8))
+            .text_color(rgb(palette_color(PaletteRole::Muted)))
             .child(SharedString::from(title.to_uppercase()))
     }
 
@@ -810,7 +1028,7 @@ impl RommfsWindow {
     ) -> Div {
         let mut el = div()
             .px_3()
-            .h(px(30.))
+            .h(rems(1.875))
             .flex()
             .items_center()
             .justify_center()
@@ -819,16 +1037,482 @@ impl RommfsWindow {
             .child(SharedString::from(label.to_string()));
         if enabled {
             el = el
-                .bg(rgb(0x2f6df6))
+                .bg(rgb(palette_color(PaletteRole::Accent)))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(0x3d7bff)));
+                .hover(|s| s.bg(rgb(palette_color(PaletteRole::AccentHover))));
             if let Some(on) = on {
                 el = el.on_mouse_up(MouseButton::Left, on);
             }
         } else {
-            el = el.bg(rgb(0x3a3f55)).text_color(rgb(0x8a8fa8));
+            el = el
+                .bg(rgb(palette_color(PaletteRole::Disabled)))
+                .text_color(rgb(palette_color(PaletteRole::Muted)))
+                .cursor_default();
         }
         el
+    }
+
+    fn save_control(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        id: String,
+        label: impl Into<SharedString>,
+        enabled: bool,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + Clone + 'static,
+    ) -> impl IntoElement {
+        let key: SharedString = format!("save-sync-control-{id}").into();
+        let focus =
+            window.use_keyed_state(key.clone(), cx, |_, cx| cx.focus_handle().tab_stop(true));
+        let focus_handle = focus.read(cx).clone();
+        let focused = focus_handle.is_focused(window);
+        let mut control = div()
+            .id(key.clone())
+            .px_3()
+            .h(rems(1.875))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .text_sm()
+            .border_1()
+            .border_color(if focused {
+                rgb(palette_color(PaletteRole::Focus))
+            } else {
+                rgb(palette_color(PaletteRole::Border))
+            })
+            .child(label.into());
+        if enabled {
+            let mouse_action = action.clone();
+            let key_action = action;
+            control = control
+                .track_focus(&focus_handle)
+                .key_context("SaveSyncControl")
+                .bg(rgb(palette_color(PaletteRole::Accent)))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(palette_color(PaletteRole::AccentHover))))
+                .when(focused, |style| style.border_2())
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |view, _, window, cx| {
+                        mouse_action(view, window, cx);
+                    }),
+                )
+                .on_action(
+                    cx.listener(move |view, _: &ActivateSaveControl, window, cx| {
+                        key_action(view, window, cx);
+                    }),
+                );
+        } else {
+            control = control
+                .bg(rgb(palette_color(PaletteRole::Disabled)))
+                .text_color(rgb(palette_color(PaletteRole::Muted)))
+                .cursor_default();
+        }
+        control
+    }
+
+    fn save_sync_status(&self) -> (&'static str, PaletteRole) {
+        if self.state.conn == ConnState::SignInRequired
+            || self.state.save_sync_authentication_required
+        {
+            return ("authentication required", PaletteRole::Danger);
+        }
+        if self.state.conn == ConnState::Failed {
+            return ("offline", PaletteRole::Danger);
+        }
+        if !self.state.save_sync_enabled {
+            return ("disabled", PaletteRole::Muted);
+        }
+        if self
+            .state
+            .save_sync_queue
+            .as_ref()
+            .is_some_and(|queue| queue.network_paused)
+        {
+            return ("paused", PaletteRole::Danger);
+        }
+        if !self.state.save_sync_available {
+            return ("not ready", PaletteRole::Danger);
+        }
+        let Some(queue) = self.state.save_sync_queue.as_ref() else {
+            return ("reconciling", PaletteRole::Caution);
+        };
+        if queue.actor_failed {
+            return ("failed", PaletteRole::Danger);
+        }
+        if queue.failure.is_some() && queue.reconciled_games < queue.mapped_games {
+            return ("retrying", PaletteRole::Caution);
+        }
+        if queue.reconciled_games < queue.mapped_games {
+            return ("reconciling", PaletteRole::Caution);
+        }
+        if queue.attention_games > 0 || queue.pending_incoming > 0 {
+            return ("review needed", PaletteRole::Caution);
+        }
+        if queue.failure.is_some() {
+            return ("retrying", PaletteRole::Caution);
+        }
+        if queue.pending_outbound > 0 {
+            return ("syncing", PaletteRole::Caution);
+        }
+        if queue.mapped_games > 0 && queue.reconciled_games == queue.mapped_games {
+            return ("up to date", PaletteRole::Success);
+        }
+        ("waiting", PaletteRole::Muted)
+    }
+
+    fn render_save_sync(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let candidates = self.state.save_sync_candidates.clone();
+        let preview = self.state.save_sync_preview.clone();
+        let existing_saves = self.state.save_sync_existing_saves.clone();
+        let queue = self.state.save_sync_queue.clone();
+        let (status, status_color) = self.save_sync_status();
+        let candidate_summary = if candidates.is_empty() {
+            "No ready RetroBat installations found".to_string()
+        } else {
+            format!("{} ready installation(s)", candidates.len())
+        };
+        let selected = self
+            .state
+            .save_sync_selected_root
+            .as_deref()
+            .map(|path| format!("Selected installation: {path}"))
+            .unwrap_or_else(|| "Selected installation: none".into());
+        let effective_root = self
+            .state
+            .save_sync_effective_saves_root
+            .as_deref()
+            .map(|path| format!("Verified effective saves folder: {path}"))
+            .unwrap_or_else(|| "Effective saves folder: not verified".into());
+        let profile = self
+            .state
+            .save_sync_profile_version
+            .as_deref()
+            .map(|version| format!("Verified RetroBat profile: {version}, Game Boy/Gambatte"))
+            .unwrap_or_else(|| "Verified RetroBat profile: unavailable".into());
+        let account = self
+            .state
+            .save_sync_account_id
+            .map(|id| format!("Authenticated RomM account ID: {id}"))
+            .unwrap_or_else(|| "Authenticated RomM account ID: unavailable".into());
+        let server = self
+            .state
+            .save_sync_server_id
+            .as_deref()
+            .map(|id| format!("Server scope: {id}"))
+            .unwrap_or_else(|| "Server scope: unavailable".into());
+        let last_action = self.state.save_sync_transfers.last().map(|transfer| {
+            format!(
+                "ROM {} · {} · {}{}",
+                transfer.rom_id,
+                transfer.revision,
+                transfer.phase,
+                transfer
+                    .detail
+                    .as_ref()
+                    .map(|detail| format!(" — {detail}"))
+                    .unwrap_or_default()
+            )
+        });
+        let last_failure = queue
+            .as_ref()
+            .and_then(|queue| queue.failure.as_ref())
+            .or(self.state.save_sync_failure.as_ref())
+            .cloned();
+        let problem = self.state.save_sync_problem.clone();
+        let incoming_rows = queue
+            .as_ref()
+            .map(|queue| queue.incoming.clone())
+            .unwrap_or_default();
+        let games = queue
+            .as_ref()
+            .map(|queue| queue.games.clone())
+            .unwrap_or_else(|| self.state.save_sync_games.clone());
+        let can_export = self.state.save_sync_effective_saves_root.is_some()
+            && self.state.save_sync_account_id.is_some();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .max_h(rems(18.75))
+            .id("save-sync-panel")
+            .overflow_y_scroll()
+            .py_1()
+            .child(self.section("Save sync"))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(self.save_control(
+                        window,
+                        cx,
+                        "browse".into(),
+                        "Browse…",
+                        true,
+                        |view, _window, cx| view.browse_save_sync(cx),
+                    ))
+                    .child(self.save_control(
+                        window,
+                        cx,
+                        "refresh".into(),
+                        "Refresh",
+                        true,
+                        |view, _window, _cx| view.controller.send(Command::RefreshSaveSync),
+                    ))
+                    .child(self.save_control(
+                        window,
+                        cx,
+                        "toggle".into(),
+                        if self.state.save_sync_enabled {
+                            "Save sync: on (disable)"
+                        } else {
+                            "Enable save sync"
+                        },
+                        self.state.save_sync_available || self.state.save_sync_enabled,
+                        |view, _window, cx| {
+                            let enabled = !view.state.save_sync_enabled;
+                            if !enabled {
+                                view.state.save_sync_enabled = false;
+                                cx.notify();
+                            }
+                            view.controller
+                                .send(Command::SetSaveSyncEnabled { enabled });
+                        },
+                    ))
+                    .child(
+                        div()
+                            .text_color(rgb(palette_color(status_color)))
+                            .child(format!("Save sync: {status}")),
+                    ),
+            )
+            .child(div().text_xs().child(server))
+            .child(div().text_xs().child(selected))
+            .child(div().text_xs().child(effective_root))
+            .child(div().text_xs().child(profile))
+            .child(div().text_xs().child(account))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette_color(PaletteRole::Muted)))
+                    .child(format!(
+                        "{candidate_summary}; {} mapped game targets; {} catalogue entries excluded; {} installations skipped",
+                        self.state.save_sync_mapped_targets,
+                        self.state.save_sync_catalogue_unmapped,
+                        self.state.save_sync_skipped,
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette_color(PaletteRole::Muted)))
+                    .child(existing_save_inventory_summary(existing_saves.as_ref())),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette_color(PaletteRole::Muted)))
+                    .child(format!(
+                        "Read-only filename/metadata scan; save contents are not opened. Bounded to {MAX_EXISTING_SAVE_SCAN_ENTRIES} entries and {MAX_EXISTING_SAVE_SCAN_DEPTH} directory levels."
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette_color(PaletteRole::Muted)))
+                    .child("Preview only: gb/*.gb → gb/<visible ROM stem>.srm. RTC companions, .gbc, and other profiles are skipped. Existing remote differences require review."),
+            )
+            .children(preview.into_iter().map(|path| {
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette_color(PaletteRole::Muted)))
+                    .child(format!("Target preview: {path}"))
+            }))
+            .child(
+                div()
+                    .text_xs()
+                    .child("Opt-in uploads local SRAM snapshots. Remote saves are installed automatically only at paths that have never existed; existing saves are never replaced."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_xs().child("Debounce (seconds)"))
+                    .child(
+                        div()
+                            .w(rems(5.25))
+                            .key_context("SaveSyncDebounce")
+                            .on_action(cx.listener(Self::on_apply_debounce_action))
+                            .child(self.debounce_input.clone()),
+                    )
+                    .child(self.save_control(
+                        window,
+                        cx,
+                        "apply-debounce".into(),
+                        "Apply",
+                        self.state.save_sync_available || self.state.save_sync_enabled,
+                        |view, _window, cx| view.apply_save_sync_debounce(cx),
+                    )),
+            )
+            .children(self.debounce_error.clone().map(|error| {
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette_color(PaletteRole::Danger)))
+                    .child(error)
+            }))
+            .children(candidates.into_iter().map(|candidate| {
+                let path = candidate.info.install_root.clone();
+                let selected = self
+                    .state
+                    .save_sync_selected_root
+                    .as_deref()
+                    .is_some_and(|root| root.eq_ignore_ascii_case(&path.to_string_lossy()));
+                let label = format!(
+                    "{}{} — {:?}",
+                    if selected { "Selected: " } else { "Use: " },
+                    path.display(),
+                    candidate.sources
+                );
+                self.save_control(
+                    window,
+                    cx,
+                    format!("candidate-{}", path.display()),
+                    label,
+                    true,
+                    move |view, _window, cx| {
+                        view.controller
+                            .send(Command::SelectSaveSyncInstallation { path: path.clone() });
+                        cx.notify();
+                    },
+                )
+            }))
+            .children(problem.map(|problem| {
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette_color(PaletteRole::Caution)))
+                    .child(format!("Paused: {problem}"))
+            }))
+            .children(last_failure.map(|failure| {
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette_color(PaletteRole::Danger)))
+                    .child(format!("Last failure: {failure}"))
+            }))
+            .child(
+                self.section("Affected games")
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .child(queue.as_ref().map_or_else(
+                        || "No save reconciliation yet".to_string(),
+                        |queue| {
+                            format!(
+                                "{} mapped · {} reconciled · {} pending uploads · {} incoming · {} games need attention",
+                                queue.mapped_games,
+                                queue.reconciled_games,
+                                queue.pending_outbound,
+                                queue.pending_incoming,
+                                queue.attention_games,
+                            )
+                        },
+                    )),
+            )
+            .children(last_action.map(|action| {
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette_color(PaletteRole::Muted)))
+                    .child(format!("Last action: {action}"))
+            }))
+            .child(
+                div()
+                    .id("save-sync-games")
+                    .max_h(rems(4.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(games.into_iter().map(|game| {
+                        let hashes = format!(
+                            "local {} · remote ID {} · remote {}",
+                            game.local_hash.as_deref().unwrap_or("unknown"),
+                            game.remote_id.as_deref().unwrap_or("none"),
+                            game.remote_hash.as_deref().unwrap_or("unknown"),
+                        );
+                        div()
+                            .flex()
+                            .flex_col()
+                            .text_xs()
+                            .child(format!("{} (ROM {}) · {hashes}", game.rom_name, game.rom_id))
+                            .children(game.issue.map(|issue| {
+                                div()
+                                    .text_color(rgb(palette_color(PaletteRole::Caution)))
+                                    .child(format!("Attention: {issue}"))
+                            }))
+                    })),
+            )
+            .child(
+                self.section("Incoming saves · export only")
+            )
+            .child(
+                div()
+                    .id("save-sync-incoming")
+                    .max_h(rems(5.5))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(incoming_rows.iter().cloned().map(|incoming| {
+                        let id = incoming.incoming_id.clone();
+                        let label = format!(
+                            "{} · RomM save {} · pending revision {} · {} · {} · {}",
+                            incoming.rom_name,
+                            incoming.remote_id,
+                            incoming.incoming_id,
+                            incoming.state,
+                            incoming.reason,
+                            incoming.content_hash,
+                        );
+                        let error = self.state.save_sync_export_errors.get(&id).cloned();
+                        let feedback = self.state.save_sync_export_feedback.get(&id).cloned();
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().child(label))
+                            .child(self.save_control(
+                                window,
+                                cx,
+                                format!("export-{id}"),
+                                "Export…",
+                                can_export,
+                                move |view, _window, cx| {
+                                    view.prompt_export(incoming.clone(), cx);
+                                },
+                            ))
+                            .children(error.map(|error| {
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette_color(PaletteRole::Danger)))
+                                    .child(format!("Export failed: {error}"))
+                            }))
+                            .children(feedback.map(|path| {
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette_color(PaletteRole::Success)))
+                                    .child(format!("Exported to {path}; review remains pending."))
+                            }))
+                    })),
+            )
     }
 }
 
@@ -875,14 +1559,51 @@ fn fmt_bytes(n: u64) -> String {
     }
 }
 
+fn existing_save_inventory_summary(preview: Option<&ExistingSavePreview>) -> String {
+    let Some(preview) = preview else {
+        return "Existing-save inventory not available until the path, profile, and catalogue are verified.".into();
+    };
+    let diagnostics = if preview.diagnostics.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", preview.diagnostics.join(" "))
+    };
+    match preview.status {
+        ExistingSaveScanStatus::Unavailable => {
+            format!("Existing-file scan unavailable; counts are not reported.{diagnostics}")
+        }
+        ExistingSaveScanStatus::Complete | ExistingSaveScanStatus::Partial => {
+            let completeness = if preview.status == ExistingSaveScanStatus::Partial {
+                "partial; counts may be incomplete"
+            } else {
+                "complete"
+            };
+            let reasons = preview
+                .skipped_reasons
+                .iter()
+                .map(|count| format!("{} {}", count.files, count.reason.label()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let skipped = if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" ({reasons})")
+            };
+            format!(
+                "Existing files ({completeness}): {} supported mapped SRAM files; {} skipped{skipped}.{diagnostics}",
+                preview.supported_files, preview.skipped_files
+            )
+        }
+    }
+}
+
 impl Render for RommfsWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (conn_text, conn_color) = self.conn_status();
         let (mount_text, mount_color) = self.mount_status();
         let connecting = self.state.conn == ConnState::Connecting;
         let mounted = self.state.mount == MountState::Mounted;
         let mounting = self.state.mount == MountState::Mounting;
-
         div()
             .flex()
             .flex_col()
@@ -962,6 +1683,7 @@ impl Render for RommfsWindow {
                             )),
                     ),
             )
+            .child(self.render_save_sync(window, cx))
             .child(
                 // Downloads: real worker events only (R5).
                 div()
@@ -1124,9 +1846,12 @@ pub fn run() {
             KeyBinding::new("secondary-x", Cut, None),
             KeyBinding::new("home", Home, None),
             KeyBinding::new("end", End, None),
+            KeyBinding::new("enter", SaveSyncApplyDebounce, Some("SaveSyncDebounce")),
+            KeyBinding::new("enter", ActivateSaveControl, Some("SaveSyncControl")),
+            KeyBinding::new("space", ActivateSaveControl, Some("SaveSyncControl")),
         ]);
 
-        let bounds = Bounds::centered(None, size(px(720.0), px(560.0)), cx);
+        let bounds = Bounds::centered(None, size(px(720.0), px(680.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),

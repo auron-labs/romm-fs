@@ -4,7 +4,9 @@
 //! transfers are never killed by a total-time budget (PRD R3).
 
 pub mod client;
+mod saves;
 pub mod types;
 
 pub use client::{Credentials, DownloadConfig, MetadataConfig, RommClient};
+pub use saves::{RemoteSave, SaveApiFailure, SaveSyncIdentity};
 pub use types::*;

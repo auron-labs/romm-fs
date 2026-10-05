@@ -24,6 +24,48 @@ pub struct LogLine {
     pub message: String,
 }
 
+/// A durable per-game reconciliation fact for the opt-in save handoff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaveSyncGameStatus {
+    pub rom_id: i64,
+    pub rom_name: String,
+    pub local_hash: Option<String>,
+    pub remote_id: Option<String>,
+    pub remote_hash: Option<String>,
+    pub incoming_ids: Vec<String>,
+    pub issue: Option<String>,
+    pub installed_incoming: bool,
+}
+
+/// A verified incoming save kept in the scoped journal for explicit review.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaveSyncIncomingStatus {
+    pub incoming_id: String,
+    pub rom_id: i64,
+    pub rom_name: String,
+    pub remote_id: String,
+    pub content_hash: String,
+    pub reason: String,
+    pub state: String,
+}
+
+/// An event-backed snapshot of the current save handoff queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaveSyncQueueStatus {
+    pub session_id: u64,
+    pub mapped_games: usize,
+    pub reconciled_games: usize,
+    pub pending_outbound: usize,
+    pub pending_incoming: usize,
+    pub attention_games: usize,
+    pub network_paused: bool,
+    pub authentication_required: bool,
+    pub actor_failed: bool,
+    pub failure: Option<String>,
+    pub games: Vec<SaveSyncGameStatus>,
+    pub incoming: Vec<SaveSyncIncomingStatus>,
+}
+
 /// Events emitted by workers. UI renders these; tests assert on them.
 #[derive(Clone, Debug)]
 pub enum AppEvent {
@@ -55,6 +97,56 @@ pub enum AppEvent {
     },
     MountStopping,
     MountStopped,
+
+    SaveSyncUpdated {
+        session_id: u64,
+        server_id: Option<String>,
+        candidates: Vec<crate::save_sync::InstallationCandidate>,
+        skipped: usize,
+        selected_root: Option<String>,
+        documented_saves_root: Option<String>,
+        effective_saves_root: Option<String>,
+        profile_version: Option<String>,
+        account_id: Option<i64>,
+        mapped_targets: usize,
+        catalogue_unmapped: usize,
+        existing_saves: Option<crate::save_sync::ExistingSavePreview>,
+        preview_saves: Vec<String>,
+        available: bool,
+        selected_problem: Option<String>,
+        enabled: bool,
+        debounce_secs: u32,
+    },
+    SaveSyncReconciliation {
+        session_id: u64,
+        game: SaveSyncGameStatus,
+        mapped_games: usize,
+        reconciled_games: usize,
+        pending_incoming: usize,
+        attention_games: usize,
+        failure: Option<String>,
+    },
+    SaveSyncTransferProgress {
+        session_id: u64,
+        rom_id: i64,
+        revision: String,
+        phase: String,
+        detail: Option<String>,
+    },
+    /// Invalidates transient facts from an earlier account/root/server scope.
+    SaveSyncSessionChanged {
+        session_id: u64,
+    },
+    SaveSyncAuthenticationRequired {
+        session_id: u64,
+    },
+    SaveSyncQueueUpdated(SaveSyncQueueStatus),
+    SaveSyncExportFinished {
+        session_id: u64,
+        incoming_id: String,
+        destination: Option<String>,
+        error: Option<String>,
+    },
 
     DownloadStarted {
         rom_id: u64,

@@ -74,10 +74,10 @@ impl Default for DownloadConfig {
 
 /// A client bound to one base URL + one in-memory token.
 pub struct RommClient {
-    base_url: String,
+    pub(super) base_url: String,
     download: DownloadConfig,
-    metadata: MetadataConfig,
-    token: std::sync::RwLock<Option<String>>,
+    pub(super) metadata: MetadataConfig,
+    pub(super) token: std::sync::RwLock<Option<String>>,
 }
 
 impl RommClient {
@@ -113,10 +113,48 @@ impl RommClient {
     /// OAuth2 password grant. On success the token is held in memory and sent
     /// as `Authorization: Bearer` on every subsequent call.
     pub fn authenticate(&self, creds: Credentials<'_>) -> Result<()> {
+        self.authenticate_scopes(creds, "platforms.read roms.read")
+    }
+
+    /// Authenticate with the verified save-sync scopes when available. A
+    /// limited user still gets the existing ROM-only session; missing save
+    /// permissions simply leave save sync unavailable.
+    pub fn authenticate_for_save_sync(
+        &self,
+        creds: Credentials<'_>,
+    ) -> Result<Option<super::saves::SaveSyncIdentity>> {
+        let save_scopes = "platforms.read roms.read me.read assets.read assets.write";
+        match self.authenticate_scopes(
+            Credentials {
+                username: creds.username,
+                password: creds.password,
+            },
+            save_scopes,
+        ) {
+            Ok(()) => {
+                return match self.save_sync_identity() {
+                    Ok(identity) => Ok(identity),
+                    Err(Error::Forbidden(_)) => Ok(None),
+                    Err(error) if error.needs_sign_in() => {
+                        self.authenticate_scopes(creds, "platforms.read roms.read")?;
+                        Ok(None)
+                    }
+                    Err(_) => Ok(None),
+                };
+            }
+            Err(error @ Error::Auth(_)) => return Err(error),
+            Err(_) => {}
+        }
+        self.authenticate_scopes(creds, "platforms.read roms.read")?;
+        Ok(None)
+    }
+
+    fn authenticate_scopes(&self, creds: Credentials<'_>, scopes: &str) -> Result<()> {
         let body = format!(
-            "grant_type=password&username={}&password={}&scope=platforms.read+roms.read",
+            "grant_type=password&username={}&password={}&scope={}",
             form_encode(creds.username),
-            form_encode(creds.password)
+            form_encode(creds.password),
+            form_encode(scopes),
         );
         let request = isahc::Request::post(format!("{}/api/token", self.base_url))
             .header("Content-Type", "application/x-www-form-urlencoded")
@@ -277,7 +315,10 @@ impl RommClient {
 
     /// Authenticated `GET` whose body is parsed as the documented JSON shape.
     /// A mid-session 401 clears the token (sign-in is required again).
-    fn get_json<T: serde::de::DeserializeOwned>(&self, path_and_query: &str) -> Result<T> {
+    pub(super) fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path_and_query: &str,
+    ) -> Result<T> {
         let mut builder = isahc::Request::get(format!("{}{path_and_query}", self.base_url));
         if let Some(t) = self.token.read().unwrap().clone() {
             builder = builder.header("Authorization", format!("Bearer {t}"));
@@ -305,7 +346,7 @@ impl RommClient {
 
 /// Network/connect/stream failures all surface as Transport; messages carry
 /// no credentials (the token only ever travels in the Authorization header).
-fn transport(e: isahc::Error) -> Error {
+pub(super) fn transport(e: isahc::Error) -> Error {
     Error::Transport(e.to_string())
 }
 
