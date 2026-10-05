@@ -48,6 +48,10 @@ impl RommFs {
 
     // --- metadata: never downloads ---
 
+    pub fn catalogue(&self) -> &crate::catalog::Catalogue {
+        self.tree.catalogue()
+    }
+
     pub fn lookup(&self, parent: u64, name: &str) -> Option<NodeMeta> {
         self.tree.lookup(parent, name)
     }
@@ -110,8 +114,7 @@ impl RommFs {
         Ok(n)
     }
 
-    /// Record an open for access tracking (WinFsp open callback calls
-    /// this — warm reads may bypass `read_at` but opens still count).
+    /// Record an open for access tracking. Warm OS reads may bypass `read_at`.
     /// Returns the active-use guard; caller drops it at close.
     pub fn note_open(&self, inode: u64) -> Option<ActiveGuard> {
         let entry = self.entry_for(inode).ok()?;
@@ -126,7 +129,7 @@ impl RommFs {
     }
 
     /// Run one eviction sweep. The hydrated remover handles the
-    /// platform-managed copy, if any. WinFsp has no persistent hydrated copy.
+    /// platform-managed copy before removing private cached bytes.
     pub fn evict_stale(&self) -> Result<EvictionOutcome> {
         let key_paths = &self.key_paths;
         self.evictor.sweep(

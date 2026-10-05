@@ -11,7 +11,7 @@ This document defines the complete PoC scope. Reference projects are API documen
 ### MVP decisions
 
 - **Ship Windows first**, using a folder such as `C:\RomM`, not a new drive-letter implementation.
-- **Use WinFsp**, as requested on 2026-10-05. Use **GPUI** for the small desktop window.
+- **Use custom Windows CFAPI integration**, as requested on 2026-10-05. Use **GPUI** for the small desktop window.
 - Keep the filesystem/client/cache logic independent of the UI and Windows-only code. Linux is the next target, particularly SteamOS and Batocera, but their deployment and UI integration are **not deliverables for this PoC**. macOS is also deferred.
 - One running application, one configured RomM server, one mount. No separate daemon or service.
 - Prove the workflow with **single-file ROMs**, downloaded unchanged and in full. Folder-based/multi-file games are outside this PoC; report them as unsupported rather than pretending a generated ZIP is the original game file.
@@ -19,22 +19,17 @@ This document defines the complete PoC scope. Reference projects are API documen
 
 ## 2. Backend decision: a small experiment, not a research project
 
-Use the `winfsp` Rust bindings and a read-only Windows volume. This supersedes
-all earlier backend selection and optional-feature requirements. Keep the
-existing portable `RommFs` facade and GPUI window.
+Use Windows' built-in Cloud Files API through `windows-sys`. This supersedes
+WinFsp and ProjFS. Retain the existing portable `RommFs` and GPUI window.
+Require Windows 10 1709+ and a local NTFS root, without separately installed
+drivers or optional-feature activation. Linux/macOS `fsk` integration is deferred.
 
-Verify Windows behavior through ordinary OS operations:
-
-1. List/stat directories and files without content downloads; read correct bytes on demand.
-2. Reopen cached ROMs and track each open handle to prevent active eviction.
-3. Evict private cached bytes while keeping catalogue entries discoverable; re-download on the next read.
-4. Reject writes, creation, rename and deletion throughout the volume; stop and remount cleanly.
-
-WinFsp has no persistent hydrated copy in the mount directory. Its runtime is
-installed separately; report missing prerequisites without elevation. Pin the
-bindings in the lockfile. At the user's request, native Windows build and
-runtime validation are deferred and do not gate completion of this migration.
-Portable tests and cross-compilation do not prove that mounting works.
+Verify native listing/stat without downloads, complete lazy hydration, warm
+access tracking, active-file retention, dehydration of NTFS data plus private
+cache eviction, read-only behavior, restart and cleanup on clean Windows.
+Portable tests and Windows Rust type-checks are implementation evidence only;
+Windows linking, native filesystem operations and frontend launch remain unverified.
+See `BACKEND-DECISION.md` for storage/cleanup behavior and acceptance gaps.
 
 ## 3. Required user workflow
 
@@ -78,7 +73,7 @@ Listing, lookup, and stat must not download ROM contents. Implement directory co
 
 Validate remote path components before using them locally. Reject traversal/absolute paths. Handle Windows-invalid names, reserved names, and case-insensitive collisions deterministically while preserving the file extension; log any necessary visible-name adjustment. Do not silently overwrite or merge different ROMs. Derive private cache paths from stable identities, not untrusted response filenames.
 
-Projected ROM entries are read-only. No writes, renames, deletions, or uploads are supported. Verify this through ordinary Windows filesystem operations; returning an error from the Rust trait alone is not proof. Existing files in a chosen mount folder are never permission to upload or purge user data; refuse nonempty roots. Only app-owned, identified cached ROM data is eligible for cleanup.
+Projected ROM entries are read-only. No writes, renames, deletions, or uploads are supported. Verify this through ordinary Windows filesystem operations; returning an error from the Rust trait alone is not proof. Existing files in a chosen mount folder are never permission to upload or purge user data; refuse nonempty roots except individually verified app-owned placeholders. Only app-owned, identified cached ROM data is eligible for cleanup.
 
 ### R3 — Download on first content read
 
@@ -104,11 +99,13 @@ Record file access/open activity, including warm Windows accesses that may bypas
 
 Periodically evict entries older than the threshold, but never active downloads or files still in use. Coordinate eviction with new access so a check-then-delete race cannot remove a newly acquired cache entry. When access/lock state is uncertain, defer eviction. A busy file or failed cleanup is logged and retried on a later sweep, not force-deleted.
 
-**Windows-specific requirement:** WinFsp reads directly from the private cache. Eviction must reclaim that cached file safely while the catalogue continues exposing the same path.
-
-Remove only identified private cache files while holding the existing eviction guard. WinFsp owns no hydrated disk copy and requires no provider deletion API. Per-open guards protect active ROMs; the host owns file contexts and dispatcher lifetime through shutdown. Never retain borrowed callback buffers or pointers for later use. [S9–S10]
-
-The private cache is the only persistent ROM storage. Successful eviction must reclaim it; the subsequent read must re-download correct bytes.
+**Windows-specific requirement:** CFAPI holds hydrated bytes in the NTFS
+placeholder as well as the private cache. Dehydrate the identified, unmodified
+placeholder under exclusive native access before removing private bytes. A busy
+file, pinned/modified placeholder or failed native operation defers eviction.
+Keep callback buffers borrowed only during their invocation; disconnect and drain
+callbacks before freeing their context. Successful eviction must reclaim both
+copies, preserve the visible path, and permit correct re-download. [S9–S10]
 
 ### R5 — One small GPUI window
 
@@ -131,11 +128,11 @@ Closing the app stops its workers and mount. No tray process, background service
 
 Use reusable Rust library modules for the RomM client, catalogue/tree, download/cache behavior, and filesystem adapter. GPUI calls that library and consumes a simple event channel; it must not contain its own download or eviction rules.
 
-Core tests must run without a GPU, GPUI window, native mount, real RomM server, or user credentials. Isolate Windows-specific code and dependencies behind target-specific boundaries so the core remains usable on Linux. Do not introduce a second generic filesystem abstraction over `winfsp`, a plugin architecture, dependency-injection framework, network control API, or multiple application services.
+Core tests must run without a GPU, GPUI window, native mount, real RomM server, or user credentials. Isolate Windows-specific code and dependencies behind target-specific boundaries so the core remains usable on Linux. Do not introduce a second generic filesystem abstraction over the Windows API, a plugin architecture, dependency-injection framework, network control API, or multiple application services.
 
-Keep the mount root and private cache separate. Mount only into an empty ordinary directory, either unclaimed or owned by this server, never over an existing ROM library. Store ownership beside the mount path; old nonempty managed roots are refused. Do not recursively clear an arbitrary folder to make mounting succeed. Reusing managed roots must not mix content from different servers.
+Keep the mount root and private cache separate. Mount only into an empty ordinary directory, either unclaimed or owned by this server, never over an existing ROM library. Store ownership beside the mount path; nonempty roots require individually verified, unmodified CFAPI placeholders. Do not recursively clear an arbitrary folder to make mounting succeed. Reusing managed roots must not mix content from different servers.
 
-WinFsp requires its installed Windows runtime; check/report availability and document installation. Do not silently elevate or install drivers. The GPUI window displays download progress.
+CFAPI requires the built-in Windows Cloud Files platform and a local NTFS root; check/report both. Do not silently elevate or install drivers. The GPUI window displays download progress.
 
 ## 6. Tests: required behavior, not a coverage target
 
@@ -156,7 +153,7 @@ The following are **behavioral cases**, not a required number of test functions.
 
 ### Native Windows integration test — mocks are not a substitute
 
-Provide an explicitly runnable test using a temporary WinFsp mount and the local fixture server. Exercise **ordinary OS file operations**, not direct trait calls, to verify:
+Provide an explicitly runnable test using a temporary CFAPI sync root and the local fixture server. Exercise **ordinary OS file operations**, not direct trait calls, to verify:
 
 - Enumeration/stat do not request content; cold, warm, seeked, and memory-mapped reads return correct bytes.
 - A warm reopen updates access tracking even when Windows supplies cached bytes. An open file survives an eviction attempt.
@@ -177,7 +174,7 @@ Do not add cosmetic UI snapshots, arbitrary coverage thresholds, minimum test co
 
 Implement in four small slices:
 
-1. `winfsp` Windows mount/cache-lifecycle experiment; minimal GPUI compile; record the backend decision or outstanding native verification.
+1. CFAPI Windows placeholder/cache-lifecycle experiment; minimal GPUI compile; record the backend decision or outstanding native verification.
 2. Real RomM authentication/catalogue and portable tree/download behavior, with the relevant executable tests.
 3. Persistent cache, access tracking, Windows-aware eviction, and native integration harness.
 4. Wire the small GPUI window to real operations; run the available integration checks and the frontend smoke test.
@@ -188,7 +185,7 @@ The frontend smoke test uses a user-provided or freely distributable single-file
 
 Deliver the source, lockfile, focused tests, and one short README containing build/run/test commands, Windows prerequisites, the tested RomM contract/version, the frontend setup example, and observed limitations. Run formatting, applicable Clippy checks, and tests supported by the available host. Do not create a release pipeline or cross-platform packaging project.
 
-Final handoff must distinguish **implemented**, **passed**, **failed**, and **not run (reason)**. Actual Windows mounting and the frontend workflow remain runtime validation tasks, deferred by the user for this migration. Missing hardware or credentials may leave those checks outstanding; they must not stop independent implementation or be misrepresented as success.
+Final handoff must distinguish **implemented**, **passed**, **failed**, and **not run (reason)**. Actual Windows mounting and the frontend workflow remain required runtime validation tasks, not yet run on this Linux host. Missing hardware or credentials may leave those checks outstanding; they must not stop independent implementation or be misrepresented as success.
 
 ## 8. Explicit exclusions
 
@@ -198,13 +195,13 @@ Do not implement excluded work “to prepare for later.”
 
 ## References — technical evidence, not additional scope
 
-- [S1] [WinFsp Rust bindings](https://docs.rs/winfsp/0.13.1+winfsp-2.1/winfsp/) — API and prerequisites.
-- [S2] [WinFsp FileSystemContext](https://docs.rs/winfsp/latest/winfsp/filesystem/trait.FileSystemContext.html).
+- [S1] [Cloud Files architecture](https://learn.microsoft.com/en-us/windows/win32/cfapi/build-a-cloud-file-sync-engine) — API and prerequisites.
+- [S2] [CFAPI reference](https://learn.microsoft.com/en-us/windows/win32/cfapi/cloud-filter-reference).
 - [S4] [Official GPUI README](https://github.com/zed-industries/zed/blob/main/crates/gpui/README.md).
 - [S5] [ES-DE user guide](https://gitlab.com/es-de/emulationstation-de/-/blob/master/USERGUIDE.md), particularly ROM directory structure and non-standard directories.
 - [S6] [RomM API authentication](https://docs.romm.app/latest/developers/api-authentication/).
 - [S7] [RomM OpenAPI/versioning](https://docs.romm.app/latest/developers/openapi/).
 - [S8] [RomM downloads](https://docs.romm.app/latest/using/downloads/) and [RomM source](https://github.com/rommapp/romm).
-- [S9] [WinFsp volume parameters](https://docs.rs/winfsp/latest/winfsp/host/struct.VolumeParams.html).
-- [S10] [WinFsp host lifecycle](https://docs.rs/winfsp/latest/winfsp/host/struct.FileSystemHost.html).
-- [S11] [WinFsp installation](https://winfsp.dev/rel/).
+- [S9] [CFAPI transfer parameters](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/ns-cfapi-cf_operation_parameters).
+- [S10] [CFAPI disconnect lifetime](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/nf-cfapi-cfdisconnectsyncroot).
+- [S11] [CFAPI unregistration](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/nf-cfapi-cfunregistersyncroot).

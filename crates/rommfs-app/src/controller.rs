@@ -4,6 +4,7 @@
 
 use crate::save_sync_agent::{SaveSyncAgent, SaveSyncCommandGate};
 use rommfs_core::cache::clock::{Clock, SystemClock, DEFAULT_EVICTION_THRESHOLD_SECS};
+#[cfg(not(windows))]
 use rommfs_core::cache::NoopHydratedRemover;
 use rommfs_core::cache::{CacheIndex, Evictor, HydratedRemover, LiveState};
 use rommfs_core::catalog::{build_catalogue, server_id_of, Catalogue, RomKey};
@@ -1369,7 +1370,7 @@ impl Worker {
             return;
         }
 
-        let remover = Arc::new(NoopHydratedRemover);
+        let remover = hydrated_remover(&root);
         let fs = match self.build_fs(&client, &root, remover) {
             Ok(fs) => fs,
             Err(e) => {
@@ -1395,7 +1396,7 @@ impl Worker {
     }
 
     /// Assemble the portable core objects the platform adapter mounts.
-    /// WinFsp reads the private cache directly; there is no hydrated disk copy.
+    /// CFAPI eviction dehydrates the NTFS copy before removing private bytes.
     fn build_fs(
         &mut self,
         client: &Arc<RommClient>,
@@ -1633,13 +1634,25 @@ impl ContentSource for ClientSource {
 // ---------------------------------------------------------------------------
 
 fn check_mount_root(root: &Path, server_id: &str) -> Result<()> {
-    rommfs_winfsp::check_mount_root(root, server_id)
+    #[cfg(windows)]
+    rommfs_cfapi::check_prerequisites(root).map_err(|e| Error::Unsupported(format!("{e:#}")))?;
+    rommfs_cfapi::check_mount_root(root, server_id)
         .map(|_| ())
         .map_err(|e| Error::Unsupported(e.to_string()))
 }
 
 fn claim_mount_root(root: &Path, server_id: &str) -> Result<()> {
-    rommfs_winfsp::claim_mount_root(root, server_id).map_err(|e| Error::Unsupported(e.to_string()))
+    rommfs_cfapi::claim_mount_root(root, server_id).map_err(|e| Error::Unsupported(e.to_string()))
+}
+
+#[cfg(windows)]
+fn hydrated_remover(root: &Path) -> Arc<dyn HydratedRemover> {
+    Arc::new(rommfs_cfapi::WindowsHydratedRemover::new(root))
+}
+
+#[cfg(not(windows))]
+fn hydrated_remover(_root: &Path) -> Arc<dyn HydratedRemover> {
+    Arc::new(NoopHydratedRemover)
 }
 
 /// A live mount owned and stopped on the worker thread.
@@ -1654,10 +1667,10 @@ impl ActiveMount {
     }
 }
 
-/// Start the read-only WinFsp volume over the portable core.
+/// Connect the Windows Cloud Files provider over the portable core.
 #[cfg(windows)]
 fn start_mount_backend(fs: Arc<RommFs>, root: &Path) -> Result<ActiveMount> {
-    let mount = rommfs_winfsp::WindowsMount::mount(fs, root)
+    let mount = rommfs_cfapi::WindowsMount::mount(fs, root)
         .map_err(|e| Error::Unsupported(format!("{e:#}")))?;
     Ok(ActiveMount {
         root: root.to_path_buf(),
@@ -1668,7 +1681,7 @@ fn start_mount_backend(fs: Arc<RommFs>, root: &Path) -> Result<ActiveMount> {
 #[cfg(not(windows))]
 fn start_mount_backend(_fs: Arc<RommFs>, _root: &Path) -> Result<ActiveMount> {
     Err(Error::Unsupported(
-        "mounting requires Windows with WinFsp installed".into(),
+        "mounting requires Windows 10 1709+ with Cloud Files and a local NTFS directory".into(),
     ))
 }
 

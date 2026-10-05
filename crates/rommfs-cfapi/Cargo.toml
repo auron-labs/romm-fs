@@ -1,5 +1,5 @@
 [package]
-name = "rommfs-winfsp"
+name = "rommfs-cfapi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,10 +9,13 @@ rust-version.workspace = true
 anyhow.workspace = true
 rommfs-core.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-winfsp.workspace = true
-windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_Storage_CloudFilters", "Win32_System_CorrelationVector", "Win32_System_IO"] }
 
 [dev-dependencies]
 rommfs-fixture.workspace = true

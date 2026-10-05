@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/rommfs-core",
     "crates/rommfs-fixture",
-    "crates/rommfs-winfsp",
+    "crates/rommfs-cfapi",
     "crates/rommfs-app",
 ]
 
@@ -26,14 +26,13 @@ tempfile = "3"
 thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
-winfsp = { version = "0.13.1", default-features = false, features = ["system"] }
 gpui = "0.2.2"
 httpdate = "1.0.3"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 notify = "8.2.0"
 rommfs-core = { path = "crates/rommfs-core" }
 rommfs-fixture = { path = "crates/rommfs-fixture" }
-rommfs-winfsp = { path = "crates/rommfs-winfsp" }
+rommfs-cfapi = { path = "crates/rommfs-cfapi" }
 windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_Foundation",

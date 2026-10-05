@@ -497,26 +497,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bindgen"
-version = "0.72.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
-dependencies = [
- "bitflags 2.13.2",
- "cexpr",
- "clang-sys",
- "itertools 0.13.0",
- "log",
- "prettyplease",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash 2.1.3",
- "shlex 1.3.0",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2162,7 +2142,7 @@ dependencies = [
  "as-raw-xcb-connection",
  "ashpd 0.11.1",
  "async-task",
- "bindgen 0.71.1",
+ "bindgen",
  "blade-graphics",
  "blade-macros",
  "blade-util",
@@ -2314,7 +2294,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05cb8912ae17371725132d2b7eec6797a255accc95d58ee5c1134b529810f14b"
 dependencies = [
  "anyhow",
- "bindgen 0.71.1",
+ "bindgen",
  "core-foundation 0.10.0",
  "core-video",
  "ctor",
@@ -4634,13 +4614,28 @@ dependencies = [
  "gpui",
  "httpdate",
  "notify",
+ "rommfs-cfapi",
  "rommfs-core",
  "rommfs-fixture",
- "rommfs-winfsp",
  "serde_json",
  "tempfile",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rommfs-cfapi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rommfs-core",
+ "rommfs-fixture",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -4669,19 +4664,6 @@ name = "rommfs-fixture"
 version = "0.1.0"
 dependencies = [
  "serde_json",
-]
-
-[[package]]
-name = "rommfs-winfsp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rommfs-core",
- "rommfs-fixture",
- "tempfile",
- "tracing",
- "windows-sys 0.61.2",
- "winfsp",
 ]
 
 [[package]]
@@ -6516,12 +6498,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "widestring"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
-
-[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6722,17 +6698,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-registry"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02752bf7fbdcce7f2a27a742f798510f3e5ad88dbe84871e5168e2120c3d5720"
-dependencies = [
- "windows-link 0.2.1",
- "windows-result 0.4.1",
- "windows-strings 0.5.1",
-]
-
-[[package]]
 name = "windows-result"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6751,15 +6716,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-result"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
-dependencies = [
- "windows-link 0.2.1",
-]
-
-[[package]]
 name = "windows-strings"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6775,15 +6731,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56e6c93f3a0c3b36176cb1327a4958a0353d5d166c2a35cb268ace15e91d3b57"
 dependencies = [
  "windows-link 0.1.3",
-]
-
-[[package]]
-name = "windows-strings"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
-dependencies = [
- "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -7025,32 +6972,6 @@ name = "windows_x86_64_msvc"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
-
-[[package]]
-name = "winfsp"
-version = "0.13.1+winfsp-2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5132f201f1a350673ec9eb7d13be9162e16ea057a44043ef64635aa749b16c53"
-dependencies = [
- "bytemuck",
- "parking_lot",
- "paste",
- "static_assertions",
- "thiserror 2.0.21",
- "widestring",
- "windows 0.61.3",
- "winfsp-sys",
-]
-
-[[package]]
-name = "winfsp-sys"
-version = "0.12.1+winfsp-2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d42acc30c105f8d33507f556398237c738b681271c775a3b94eefd29d2b8c77e"
-dependencies = [
- "bindgen 0.72.1",
- "windows-registry 0.6.1",
-]
 
 [[package]]
 name = "winnow"

@@ -1,8 +1,8 @@
-# Test WinFsp and RetroBat on Windows
+# Test CFAPI and RetroBat on Windows
 
 Use this guide to test the current checkout on a native Windows host. It is
 written for an LLM with PowerShell, filesystem access, and, for manual checks,
-desktop interaction tools. The filesystem backend is **WinFsp**.
+desktop interaction tools. The filesystem backend is **CFAPI**.
 
 Run the available sections and produce the report below. Do not treat source
 inspection, compilation, or a test command that runs zero tests as a runtime pass.
@@ -18,8 +18,11 @@ Visual Studio Developer PowerShell if the compiler tools are absent from PATH.
 Prerequisites:
 
 - Rust 1.89 or later with an MSVC target.
-- Visual Studio C++ build tools, Windows SDK, and Clang/libclang for bindgen.
-- WinFsp 2.1 or later, with runtime and Developer components installed.
+- Visual Studio C++ build tools and Windows SDK.
+- Windows 10 version 1709+ or Windows 11, with the built-in Cloud Files platform.
+- A local NTFS mount root, outside any OneDrive/Dropbox/other sync root.
+- For installation acceptance, a clean Windows profile with no WinFsp or ProjFS
+  enabled. Record prerequisites as found; do not install a driver to make it pass.
 - An interactive desktop for app, RetroBat, and native picker checks.
 - A disposable RomM server/account for live tests. ROM access requires
   `platforms.read` and `roms.read`; save sync also requires `me.read`,
@@ -39,9 +42,9 @@ rustup show active-toolchain
 Get-Command cl.exe, clang.exe -ErrorAction SilentlyContinue
 ```
 
-Confirm that Rust's host target ends in `windows-msvc`. Record the installed
-WinFsp version and installation location, RetroBat version, and actual RomM
-version. A missing tool or driver is an environment blocker; retain the error.
+Confirm that Rust's host target ends in `windows-msvc`. Record the Windows build,
+`Get-Service CldFlt` result, mount volume filesystem, RetroBat version, and actual
+RomM version. Missing tools/platform support are environment blockers; retain errors.
 Do not change drivers or system installations without host authorization.
 
 Create an evidence folder outside the mount and saves folders:
@@ -78,7 +81,7 @@ cargo build --locked -p rommfs-app
 The headless suite covers catalogue/cache behavior, fixture HTTP contracts,
 discovery, profile validation, consent, durable upload/reconciliation, and
 controller behavior. The workspace suite also builds the desktop feature and
-runs native WinFsp integration. The live-RomM test is ignored by default.
+runs native CFAPI integration. The live-RomM test is ignored by default.
 Record executed, failed, and ignored test counts; do not copy historical counts
 from the acceptance checklist.
 
@@ -86,7 +89,7 @@ Run these native checks explicitly, even if the workspace suite passed, to
 make Windows evidence easy to identify:
 
 ```powershell
-cargo test --locked -p rommfs-winfsp --test winfsp_native -- --nocapture --test-threads=1
+cargo test --locked -p rommfs-cfapi --test cfapi_native cfapi_mount_lists_reads_once_and_stays_read_only -- --exact --nocapture --test-threads=1
 cargo test --locked -p rommfs-core --lib save_sync::path::tests::windows_save_read_handle_denies_concurrent_write_and_delete -- --exact --nocapture
 cargo test --locked -p rommfs-core --lib save_sync::path::tests::windows_directory_guard_blocks_rename_until_released -- --exact --nocapture
 cargo test --locked -p rommfs-app --no-default-features --lib save_sync_agent::files::tests::windows_publication_does_not_replace_a_file_created_at_the_boundary -- --exact --nocapture
@@ -96,13 +99,15 @@ cargo test --locked -p rommfs-app --no-default-features --lib save_sync_agent::t
 Each command must execute one test. If it executes zero, inspect `-- --list`
 and resolve the selector before reporting a result.
 
-The WinFsp test verifies these behaviors through real Windows filesystem calls:
+The CFAPI test verifies these behaviors through real Windows filesystem calls:
 
 - Enumeration/stat request no ROM bodies, including a large directory listing.
 - First read downloads exactly once and returns exact fixture bytes.
 - Reads with different path casing and seek offsets work; warm reads stay cached.
+- A child process opens warm NTFS bytes and refreshes last-use without a download.
+- A truncated download fails without exposing partial bytes; a later read retries.
 - Write, append, delete, rename, hard-link, and file/directory creation fail.
-- Open handles prevent eviction; closing them permits eviction and a new download.
+- Open handles defer eviction; closing them permits dehydration and a new download.
 - Unmount restores an empty folder; remount reuses the private cache.
 - A nonempty mount root is refused without changing its local data.
 
@@ -114,7 +119,7 @@ If a failure occurs, retain the first log. Re-run the failing test alone to
 investigate; record both outcomes if it is intermittent. A build failure blocks
 downstream runtime checks and must not be described as a failed runtime assertion.
 
-## 3. Test a real RomM through WinFsp
+## 3. Test a real RomM through CFAPI
 
 Use the [local harness](romm-harness/README.md) with Docker Desktop running Linux
 containers. From the repository root:
@@ -141,7 +146,7 @@ Run from the repository root:
 
 ```powershell
 $env:ROMM_URL = 'http://127.0.0.1:8080'
-cargo test --locked -p rommfs-winfsp --test live_romm -- --ignored --nocapture --test-threads=1
+cargo test --locked -p rommfs-cfapi --test live_romm -- --ignored --nocapture --test-threads=1
 ```
 
 For different disposable credentials, supply `ROMM_USER` and `ROMM_PASS` privately
@@ -175,9 +180,11 @@ Keep the mount outside RetroBat saves and the evidence folder.
 | Server ownership | Claim a test folder for server A, stop, then try it for a different server identity. | Ownership mismatch is refused. A configured URL base path is part of server identity. |
 
 Replace the quoted placeholders with actual paths. Record errors, screenshots,
-and hashes. Do not remove ownership markers to bypass a rejection. The WinFsp
-backend stores ROM bytes in `%LOCALAPPDATA%\rommfs\cache\<server>`, rather than
-leaving hydrated files in the mount folder.
+and hashes. Do not remove ownership markers to bypass a rejection. The CFAPI
+backend stores a private copy in `%LOCALAPPDATA%\rommfs\cache\<server>` and an
+NTFS hydrated copy while mounted. Eviction must reclaim both. Clean Stop restores
+an empty root and its original ACL; busy/changed entries defer cleanup. Never
+remove ownership markers or run recursive cleanup to bypass a refusal.
 
 Configure the disposable RetroBat installation's Game Boy ROM path to the mounted
 `gb` folder using its supported configuration workflow. Record and restore any
@@ -284,7 +291,7 @@ git status --short
 
 Write a report in the evidence folder with:
 
-- Commit, initial/final workspace status, Windows/toolchain/WinFsp versions,
+- Commit, initial/final workspace status, Windows/toolchain/Cloud Files platform details,
   actual server version/image, RetroBat version, and test scope.
 - A table of case ID or command, PASS/FAIL/BLOCKED/NOT RUN, exit code or observed
   result, executed/ignored counts, and evidence path.

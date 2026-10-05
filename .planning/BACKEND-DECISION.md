@@ -1,44 +1,57 @@
-# Backend decision — WinFsp
+# Backend decision — Windows CFAPI
 
-The user requested replacing the Windows optional-feature backend on
-2026-10-05. `rommfs-winfsp` uses `winfsp` 0.13.1 with WinFsp 2.1 bindings;
-there is one Windows mount implementation and no backend selector.
+On 2026-10-05 the user selected custom Windows Cloud Files API integration,
+with `fsk` reserved for Linux/macOS, then narrowed implementation to Windows.
+This supersedes the WinFsp decision. Linux/macOS have no implementation in this change.
 
-- `FileSystemContext` resolves paths into the existing `RommFs` inode tree.
-  Security queries, opens, metadata and directory enumeration never read ROM
-  contents. `DirBuffer` sorts entries and implements Windows continuation.
-  Opens return the canonical catalogue spelling in WinFsp's normalized-name
-  buffer, including when the caller supplies another capitalization.
-- `read` alone calls `RommFs::read_at`, preserving lazy single-flight download
-  and private-cache reuse. There is no persistent copy in the mounted tree.
-- Each open owns an `ActiveGuard`, released on close. Windows caching is
-  flushed and purged on cleanup; eviction deletes only the private cache.
-- The volume is read-only, with a read/execute security descriptor. Open
-  requests for writes, deletes or ACL changes are also rejected. Unimplemented
-  mutation callbacks cannot change core data.
-- The host owns dispatcher lifetime and removes its junction on drop. RomMFS
-  restores the empty directory after unmount. Ownership is stored beside the
-  root, since WinFsp creates its mount directory and requires an empty path.
-- Nonempty and reparse-point roots are refused, even when marked as owned.
-  Legacy roots are preserved; users must select a fresh empty directory.
-- Final executables and native adapter tests delay-load the WinFsp DLL;
-  initialization finds the installed runtime and reports its absence.
+The constraint is no separately installed filesystem driver or ProjFS optional
+feature. CFAPI uses Windows' built-in `cldflt.sys`; it still requires Windows 10
+1709+ and a local NTFS volume. Native deployment suitability is unverified.
 
-`winfsp_native.rs` covers ordinary OS listing, stat, read, mutations, concurrent
-open guards, case-insensitive opens and canonical spelling, eviction/re-download,
-stop and remount. `live_romm.rs` retains the explicitly runnable live-server
-byte comparison.
+`rommfs-cfapi` uses existing `windows-sys` bindings without another wrapper crate.
+The app retains its portable `RommFs`, download manager, catalogue and cache index.
 
-Verification on 2026-10-05: portable tests and Clippy pass. The Windows
-adapter, native test sources and headless app pass MSVC-target Rust type and
-Clippy checks using the published pregenerated WinFsp bindings. For this
-Linux-only source check, temporary dependency build scripts bypassed native
-C compilation and registry lookup; no patches are committed. This does not
-verify a Windows link, driver, mount or live server. The migration implementation
-is complete. At the user's request, native Windows build, mount and frontend
-verification are deferred to a later Windows session and do not gate this change.
+- Register a sync root with FULL hydration and an eagerly populated metadata tree.
+  Creating/listing/statting placeholders does not read ROM contents.
+- FETCH_DATA downloads through the existing complete-file, single-flight cache,
+  then transfers 1 MiB aligned chunks to NTFS. Progress heartbeats keep the native
+  fetch timeout alive while the complete private download is being verified.
+- NTFS stores a hydrated copy in addition to the private cache. Eviction first
+  obtains exclusive access and dehydrates the owned placeholder, then removes the
+  private copy and index row. Failures defer the whole eviction.
+- Native external open notifications record warm access. Provider metadata opens
+  are excluded to prevent reentry while the index is locked during eviction.
+- Protected read/execute ACLs reject ordinary data writes and namespace changes.
+  Owner WRITE_DAC permits CFAPI operations; this is not a security boundary
+  against the owner intentionally changing permissions. Delete/rename callbacks
+  also reject ordinary mutations while connected.
+- A sibling manifest records server, paths, content/version identities and the
+  original root ACL. Restart accepts only verified unmodified cloud placeholders;
+  it rejects normal files, unknown entries, links and ownership mismatches.
+- Startup rebuilds owned placeholders from the fresh catalogue. Private completed
+  bytes survive; persistent hydrated copies are not trusted across catalogue changes.
+- Shutdown disconnects, drains callbacks and removes only verified owned entries.
+  Unregistration occurs only after the root is empty, because CFAPI unregistration
+  traverses the root and can delete unhydrated placeholders. Busy/changed entries
+  defer cleanup; registration/manifest are retained for recovery. A failed native
+  disconnect aborts the process rather than freeing a still-live callback context.
 
-Sources: [Rust bindings](https://github.com/SnowflakePowered/winfsp-rs),
-[WinFsp mount implementation](https://github.com/winfsp/winfsp/blob/master/src/dll/mount.c),
-[WinFsp API](https://winfsp.dev/doc/WinFsp-API-winfsp.h/).
-The Rust bindings are GPL-3.0; distribution must account for that license.
+Verification: portable regression tests pass. Windows Rust type/Clippy checks
+use temporary C-dependency build stubs on this Linux host; they do not prove
+Windows C compilation, linking, installation, mounting or emulator compatibility.
+No temporary dependency patches are committed. Native tests and frontend smoke
+checks are **not run** and must pass on clean Windows before calling this backend
+validated. The native test includes external warm opens, byte correctness,
+mutation rejection, active-file retention, dehydration/re-download, truncated
+transfer/retry, clean stop/remount and preservation of unowned files.
+
+Remaining acceptance work: native Windows build/runtime; clean-user setup without
+WinFsp/ProjFS; slow downloads, memory-mapped reads, crash recovery and ACL restoration;
+real frontend/emulator launch; actual disk allocation reclaimed from both copies.
+
+Sources: [Cloud Files architecture](https://learn.microsoft.com/en-us/windows/win32/cfapi/build-a-cloud-file-sync-engine),
+[placeholder creation](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/nf-cfapi-cfcreateplaceholders),
+[transfer contracts](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/ns-cfapi-cf_operation_parameters),
+[progress/timeouts](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/nf-cfapi-cfreportproviderprogress),
+[disconnect lifetime](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/nf-cfapi-cfdisconnectsyncroot),
+[unregistration side effects](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/nf-cfapi-cfunregistersyncroot).

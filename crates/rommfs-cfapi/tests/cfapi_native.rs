@@ -1,5 +1,5 @@
-//! Native WinFsp integration test (PRD §6 "Native Windows integration test"):
-//! mounts a real `RommFs` on a temporary WinFsp root via `winfsp` and exercises
+//! Native CFAPI integration test (PRD §6 "Native Windows integration test"):
+//! mounts a real `RommFs` on a temporary CFAPI root and exercises
 //! ordinary Windows file operations — not trait calls.
 //!
 //! Proves: enumeration/stat never request ROM bodies; the first content read
@@ -11,15 +11,17 @@
 
 #![cfg(windows)]
 
-use rommfs_core::cache::clock::DEFAULT_EVICTION_THRESHOLD_SECS;
-use rommfs_core::cache::{CacheIndex, Evictor, FakeClock, LiveState, NoopHydratedRemover};
+use rommfs_cfapi::{
+    check_mount_root, claim_mount_root, RootCheck, WindowsHydratedRemover, WindowsMount,
+};
+use rommfs_core::cache::clock::{Clock, DEFAULT_EVICTION_THRESHOLD_SECS};
+use rommfs_core::cache::{CacheIndex, Evictor, FakeClock, LiveState};
 use rommfs_core::catalog::{build_catalogue, server_id_of, RomKey};
 use rommfs_core::download::DownloadManager;
 use rommfs_core::fscore::RommFs;
 use rommfs_core::romm::{Credentials, RommClient};
 use rommfs_core::tree::RommTree;
 use rommfs_fixture::{contract, FixtureServer, ResponseSpec};
-use rommfs_winfsp::{check_mount_root, claim_mount_root, RootCheck, WindowsMount};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -46,9 +48,7 @@ fn wait_until(mut ready: impl FnMut() -> bool, timeout: Duration, what: &str) {
 }
 
 #[test]
-fn winfsp_mount_lists_reads_once_and_stays_read_only() {
-    winfsp::winfsp_init().expect("UNAVAILABLE: install WinFsp 2.1 or later");
-
+fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     // --- fixture RomM server implementing the verified contract routes ---
     let server = FixtureServer::start();
     let bytes = rom_bytes();
@@ -124,7 +124,7 @@ fn winfsp_mount_lists_reads_once_and_stays_read_only() {
     .expect("catalogue builds");
     assert_eq!(catalogue.skipped_unsupported, 0);
 
-    // --- real core stack; private cache is the only persistent ROM copy ---
+    // --- real core stack; CFAPI hydration and the private download cache ---
     let cache = tempfile::tempdir().expect("cache dir");
     let index = CacheIndex::open(cache.path()).expect("cache index");
     let live = Arc::new(LiveState::default());
@@ -154,11 +154,11 @@ fn winfsp_mount_lists_reads_once_and_stays_read_only() {
     let evictor = Evictor::new(
         DEFAULT_EVICTION_THRESHOLD_SECS,
         Arc::clone(&live),
-        Arc::new(NoopHydratedRemover),
+        Arc::new(WindowsHydratedRemover::new(&root)),
     );
     let clock = Arc::new(FakeClock::new(1_000_000));
     let tree = RommTree::new(catalogue);
-    let fs = Arc::new(RommFs::new(tree, downloads, evictor, clock.clone()));
+    let fs = Arc::new(RommFs::new(tree, downloads.clone(), evictor, clock.clone()));
 
     // --- mount into the checked+claimed empty root ---
     assert!(matches!(
@@ -166,7 +166,7 @@ fn winfsp_mount_lists_reads_once_and_stays_read_only() {
         RootCheck::EmptyReady
     ));
     claim_mount_root(&root, &server_id).unwrap();
-    let mount = WindowsMount::mount(Arc::clone(&fs), &root).expect("WinFsp mount");
+    let mount = WindowsMount::mount(Arc::clone(&fs), &root).expect("CFAPI mount");
 
     let nes_dir: PathBuf = root.join("nes");
     let rom_path = nes_dir.join("Example Game.nes");
@@ -240,7 +240,7 @@ fn winfsp_mount_lists_reads_once_and_stays_read_only() {
     );
 
     // --- warm reads: byte-exact, no second transfer ---
-    let canonical = std::fs::canonicalize(&alias).expect("canonical name through WinFsp");
+    let canonical = std::fs::canonicalize(&alias).expect("canonical name through CFAPI");
     assert_eq!(canonical.file_name().unwrap(), "Example Game.nes");
     assert_eq!(canonical.parent().unwrap().file_name().unwrap(), "nes");
     let got2 = std::fs::read(&alias).expect("second read through a differently cased path");
@@ -265,6 +265,30 @@ fn winfsp_mount_lists_reads_once_and_stays_read_only() {
     assert_read_only(&root, &rom_path);
     assert_eq!(std::fs::read(&rom_path).unwrap(), bytes);
 
+    // A different process reads warm NTFS bytes without invoking FETCH_DATA.
+    // Its open must still refresh the private cache's last-use timestamp.
+    clock.advance(100);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "warm_reader_process"])
+        .env("ROMMFS_TEST_ROM", &rom_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    wait_until(
+        || {
+            downloads
+                .index()
+                .lock()
+                .ready_entries()
+                .unwrap()
+                .iter()
+                .any(|record| record.last_used_unix_secs == clock.unix_secs())
+        },
+        Duration::from_secs(5),
+        "warm external open to refresh last use",
+    );
+    assert_eq!(server.count("GET", "/api/roms/"), 1);
+
     // Multiple simultaneous handles protect the same entry from eviction.
     let first = std::fs::File::open(&rom_path).unwrap();
     let second = std::fs::File::open(&rom_path).unwrap();
@@ -286,6 +310,33 @@ fn winfsp_mount_lists_reads_once_and_stays_read_only() {
         "evicted bytes must download again"
     );
 
+    // Failed downloads expose no partial NTFS hydration; the next read retries.
+    clock.advance(DEFAULT_EVICTION_THRESHOLD_SECS + 1);
+    assert_eq!(fs.evict_stale().unwrap().evicted.len(), 1);
+    server.on(
+        "GET",
+        "/api/roms/",
+        ResponseSpec::Bytes {
+            status: 200,
+            bytes: bytes.clone(),
+            truncate_at: Some(17),
+            stall_after_bytes: None,
+        },
+    );
+    assert!(std::fs::read(&rom_path).is_err());
+    server.on(
+        "GET",
+        "/api/roms/",
+        ResponseSpec::Bytes {
+            status: 200,
+            bytes: bytes.clone(),
+            truncate_at: None,
+            stall_after_bytes: None,
+        },
+    );
+    assert_eq!(std::fs::read(&rom_path).unwrap(), bytes);
+    assert_eq!(server.count("GET", "/api/roms/"), 4);
+
     mount.stop();
     assert!(
         !rom_path.exists(),
@@ -300,7 +351,7 @@ fn winfsp_mount_lists_reads_once_and_stays_read_only() {
     assert_eq!(std::fs::read(&rom_path).unwrap(), bytes);
     assert_eq!(
         server.count("GET", "/api/roms/"),
-        2,
+        4,
         "remount uses the private cache"
     );
     mount2.stop();
@@ -323,4 +374,11 @@ fn assert_read_only(root: &Path, rom: &Path) {
     assert!(std::fs::create_dir(root.join("new-dir")).is_err());
     assert!(std::fs::remove_dir(rom.parent().unwrap()).is_err());
     assert!(rom.exists());
+}
+
+#[test]
+#[ignore = "child-process helper invoked by the native acceptance test"]
+fn warm_reader_process() {
+    let path = std::env::var_os("ROMMFS_TEST_ROM").expect("helper needs ROMMFS_TEST_ROM");
+    assert_eq!(std::fs::read(path).unwrap(), rom_bytes());
 }
