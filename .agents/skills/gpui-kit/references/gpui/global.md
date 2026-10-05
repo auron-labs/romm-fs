@@ -193,4 +193,3 @@ let user_entity = cx.new(|_| UserState { ... });
 - Component-specific state
 - State that changes frequently
 - State that needs notifications
-

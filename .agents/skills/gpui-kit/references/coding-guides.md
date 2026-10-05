@@ -321,7 +321,7 @@ The durable Base rule is:
 > Base owns reusable behavior and the geometry required to implement it. The
 > presentation layer owns the product's visual language.
 
-“Headless” does not mean “one empty `div`.” Popup collision, keyboard
+"Headless" does not mean "one empty `div`." Popup collision, keyboard
 navigation, editing, virtualization, resize arithmetic, focus trapping, and
 dock reconciliation require internal structure and state. Moving that work to
 every caller would not create flexibility; it would duplicate fragile
@@ -888,7 +888,7 @@ For each change, the agent should be able to name:
 5. the theme tokens and intentional exceptions;
 6. the test that would fail if the behavior regressed.
 
-Generated code must be reviewed and tested by a person. “Compiles” is not a UI
+Generated code must be reviewed and tested by a person. "Compiles" is not a UI
 quality bar, and a broad refactor that merely makes generated code look tidy is
 not a substitute for matching the repository's architecture.
 

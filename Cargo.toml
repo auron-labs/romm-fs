@@ -1,23 +1,30 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rommfs-core",
-    "crates/rommfs-fixture",
-    "crates/rommfs-cfapi",
-    "crates/rommfs-app",
+  "crates/rommfs-app",
+  "crates/rommfs-cfapi",
+  "crates/rommfs-core",
+  "crates/rommfs-fixture",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
 rust-version = "1.89"
+license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+gpui = "0.2.2"
+httpdate = "1.0.3"
 isahc = { version = "1.8", features = ["json"] }
+notify = "8.2.0"
 parking_lot = "0.12"
 quick-xml = "0.41"
+rommfs-cfapi = { path = "crates/rommfs-cfapi" }
+rommfs-core = { path = "crates/rommfs-core" }
+rommfs-fixture = { path = "crates/rommfs-fixture" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,17 +33,13 @@ tempfile = "3"
 thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
-gpui = "0.2.2"
-httpdate = "1.0.3"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
-notify = "8.2.0"
-rommfs-core = { path = "crates/rommfs-core" }
-rommfs-fixture = { path = "crates/rommfs-fixture" }
-rommfs-cfapi = { path = "crates/rommfs-cfapi" }
-windows-sys = { version = "0.61", features = [
-    "Win32_Storage_FileSystem",
+windows-sys = {
+  version = "0.61",
+  features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Memory",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
-] }
+  ]
+}

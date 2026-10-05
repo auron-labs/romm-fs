@@ -235,4 +235,3 @@ entity2.subscribe(entity1) → emits event → infinite loop!
 ```
 
 ## Reference Documentation
-

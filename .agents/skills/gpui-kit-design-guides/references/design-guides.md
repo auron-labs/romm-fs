@@ -659,7 +659,7 @@ resource. Do not use Link styling to make a functional command look quiet. A
 link-shaped Delete, Save, Refresh, Add, Open-menu, or in-app navigation action
 hides the control's affordance and exposes the wrong accessibility role.
 
-“View” does not make an in-app destination a Link. A full report, analysis,
+"View" does not make an in-app destination a Link. A full report, analysis,
 details panel, or local record still opens through a Button, row, card, tab, or
 disclosure control. Use concise context-aware labels such as `Full analysis`
 when the containing card already establishes what opens; reserve underlining
@@ -761,7 +761,7 @@ Do not repeat information that the surrounding surface already establishes. A
 sidebar destination is usually the object or domain itself: use `Users`, not
 `User Management`; `Shortcuts`, not `Shortcut Configuration Management`. A
 column whose rows already contain actions can omit a generic `Operation`
-heading. A dialog titled `Delete “Roadmap”?` does not need body text that asks
+heading. A dialog titled `Delete "Roadmap"?` does not need body text that asks
 the same question again.
 
 This is context economy, not deletion for its own sake. Add text when it changes
@@ -781,7 +781,7 @@ Start from shared intent, hierarchy, and terminology, then compose each locale
 as natural interface language. Do not preserve the source language's word
 order, number of words, politeness filler, or grammatical category. English
 `Users` can express a Chinese feature concept that would literally expand to
-“user management”; fidelity means preserving purpose, not preserving tokens.
+"user management"; fidelity means preserving purpose, not preserving tokens.
 
 Remove words supplied by the enclosing information architecture. Inside a
 `Settings` surface, a destination is often simply `Account`, not `Account
@@ -831,15 +831,15 @@ command and is too ambiguous for the standard vocabulary.
 
 A confirmation dialog should form one compact decision:
 
-- title: the decision or condition, such as `Delete “Roadmap”?`;
+- title: the decision or condition, such as `Delete "Roadmap"?`;
 - body: only new scope, consequence, or recovery information;
 - actions: `Cancel` and the result, such as `Delete`;
 - destructive styling: applied to the destructive result, not substituted for
   precise wording.
 
 Avoid generic titles such as `Notice`, `Warning`, `Error`, and `Confirmation`
-when the actual condition can be named. Avoid ritual phrases such as “Are you
-sure you want to…”, “Would you like to…”, “Please note that…”, and “successfully”
+when the actual condition can be named. Avoid ritual phrases such as "Are you
+sure you want to…", "Would you like to…", "Please note that…", and "successfully"
 when the structure or state already communicates them. Courtesy should come
 from a calm, respectful tone, not repeated `please`.
 
@@ -874,7 +874,7 @@ communicate ongoing work.
 
 Errors should say what happened and, when useful, the next recovery action.
 Success feedback should name the resulting state only when that state is not
-already visible. Prefer `Couldn’t save. Check your connection and try again.`
+already visible. Prefer `Couldn't save. Check your connection and try again.`
 to a technical code or a long apology; omit a `Saved successfully` toast when
 the document visibly becomes saved.
 

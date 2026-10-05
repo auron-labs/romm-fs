@@ -1,0 +1,28 @@
+[tools]
+betterleaks = "1.9.0"
+"cargo:cargo-deny" = "0.20.2"
+hk = "2.5.0"
+node = "26.10.0"
+"npm:dclint" = "3.1.0"
+"npm:ls-lint" = "0.1.2"
+pkl = "0.32.1"
+tombi = "1.7.2"
+
+[tools.rust]
+version = "1.99.0"
+components = "clippy,rustfmt"
+
+[vars]
+cargo_args = "--workspace{% if os() != 'windows' %} --no-default-features{% endif %} --all-targets --locked"
+
+[tasks]
+"check:rust" = "cargo check {{vars.cargo_args}}"
+"fix:rust" = "cargo fix {{vars.cargo_args}} --allow-dirty --allow-staged"
+lint = "cargo clippy {{vars.cargo_args}}"
+"lint:fix" = "cargo clippy {{vars.cargo_args}} --fix --allow-dirty --allow-staged"
+test = "cargo test {{vars.cargo_args}}"
+fmt = "cargo fmt --all"
+"fmt:check" = "cargo fmt --all --check"
+check = "hk check --all"
+fix = "hk fix"
+"hooks:install" = "hk install --mise"

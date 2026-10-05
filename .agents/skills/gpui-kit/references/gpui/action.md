@@ -205,4 +205,3 @@ impl MyComponent {
 
 div().on_action(cx.listener(Self::on_action_save))
 ```
-

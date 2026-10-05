@@ -2,34 +2,34 @@
 name = "rommfs-app"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
-[features]
-default = ["ui"]
-ui = ["dep:gpui"]
+[[bin]]
+name = "rommfs-app"
+path = "src/main.rs"
+required-features = ["ui"]
 
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
 gpui = { workspace = true, optional = true }
 httpdate.workspace = true
-rommfs-core.workspace = true
-rommfs-cfapi.workspace = true
 notify.workspace = true
+rommfs-cfapi.workspace = true
+rommfs-core.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-
-# Windows-only platform APIs
-[target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
 
 [dev-dependencies]
 rommfs-fixture.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 
-[[bin]]
-name = "rommfs-app"
-path = "src/main.rs"
-required-features = ["ui"]
+# Windows-only platform APIs
+[target."cfg(windows)".dependencies]
+windows-sys.workspace = true
+
+[features]
+default = ["ui"]
+ui = ["dep:gpui"]

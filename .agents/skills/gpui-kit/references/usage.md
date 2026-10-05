@@ -232,8 +232,8 @@ use gpui_kit::component::button::ButtonVariant;
 
 window.open_alert_dialog(cx, |alert, _, _| {
     alert
-        .title("Remove “Roadmap”?")
-        .description("Files on disk aren’t deleted.")
+        .title("Remove "Roadmap"?")
+        .description("Files on disk aren't deleted.")
         .confirm()
         .ok_text("Remove")
         .ok_variant(ButtonVariant::Danger)

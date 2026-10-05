@@ -5,7 +5,7 @@ library as ordinary filesystem paths (e.g. `C:\RomM\nes\Example Game.nes`)
 so frontends like ES-DE discover ROMs like a normal ROM folder — while ROM
 bytes only download the first time something actually reads them.
 
-Built as a Rust workspace; uses Windows’ built-in **Cloud Files API (CFAPI)**
+Built as a Rust workspace; uses Windows' built-in **Cloud Files API (CFAPI)**
 through a custom `windows-sys` adapter and shows one small **GPUI** window.
 No separately installed filesystem driver or ProjFS optional feature is required.
 The native Windows build and runtime workflow are **not yet verified**.
@@ -22,7 +22,7 @@ The native Windows build and runtime workflow are **not yet verified**.
 ## Requirements
 
 - Windows 10 version 1709+ or Windows 11 with the built-in Cloud Files platform.
-  The mount root must be on a **local NTFS volume**, outside another cloud provider’s
+  The mount root must be on a **local NTFS volume**, outside another cloud provider's
   sync root. Network shares and FAT/exFAT roots are unsupported. RomMFS checks the
   platform and volume; it does not install drivers or elevate.
 - An MSVC Rust toolchain and Visual Studio C++ build tools, including the

@@ -19,7 +19,7 @@ create headless windows too. `VisualTestContext` is available for existing GPUI
 window helpers. For an application UI flow, use `gpui_kit::test::TestWindowExt`
 on the real `Window` and assert the behavior produced by native events.
 
-Import the Kit types you use explicitly and write `#[gpui_kit::test]`. Avoid `use gpui_kit::*;` in test modules: it imports GPUI’s `test` macro and can shadow Rust’s built-in `#[test]`. Add
+Import the Kit types you use explicitly and write `#[gpui_kit::test]`. Avoid `use gpui_kit::*;` in test modules: it imports GPUI's `test` macro and can shadow Rust's built-in `#[test]`. Add
 `test-support` to the application's `gpui-kit` development dependency, using
 exactly the same source and version as its normal dependency. The helpers
 require a Kit revision that includes them; check the installed API before

@@ -222,4 +222,3 @@ cx.spawn(async move |this, cx| {
 
 GPUI has no `Task::then`. Await the background task inside `cx.spawn`. The
 closure receives `(WeakEntity<Self>, &mut AsyncApp)`, not the background result.
-

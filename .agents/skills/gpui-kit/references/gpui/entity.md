@@ -123,7 +123,7 @@ entity.update(cx, |state, inner_cx| {
 
 Nested `entity.update(cx, …)` calls are dangerous. The default posture is: **do not nest them**. The sub-cases below clarify when a panic is guaranteed vs. merely possible.
 
-**Same entity → always panics.**  
+**Same entity → always panics.**
 GPUI locks an entity for the entire duration of its update or render pass. Re-entering that same lock panics immediately:
 
 ```
@@ -137,7 +137,7 @@ entity_a.update(cx, |state, cx| {
 });
 ```
 
-**Different entity → generally safe, but indirect cycles still panic.**  
+**Different entity → generally safe, but indirect cycles still panic.**
 Each entity has its own lock, so updating `entity_b` from within `entity_a`'s update normally succeeds. However, if `entity_b`'s callback reaches back into `entity_a` — directly or through a chain — GPUI will attempt to re-acquire `entity_a`'s lock and panic.
 
 ```rust

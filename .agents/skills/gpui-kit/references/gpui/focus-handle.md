@@ -239,4 +239,3 @@ The ring is painted 3px outside the element, so an ancestor with
 div()
     .on_action(cx.listener(Self::on_enter))
 ```
-
