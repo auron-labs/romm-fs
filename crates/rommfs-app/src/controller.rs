@@ -816,6 +816,19 @@ impl Worker {
                 .as_ref()
                 .is_some_and(|report| report.supported_count() > 0);
 
+        #[cfg(windows)]
+        let available = available
+            && scope.as_ref().is_some_and(|scope| {
+                match crate::save_sync_agent::check_save_root_writable(&scope.effective_saves_root)
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        selected_problem = Some(error.to_string());
+                        false
+                    }
+                }
+            });
+
         if self.save_sync_enabled && available {
             if let (Some(scope), Some(report), Some(client), Some(identity)) = (
                 scope.as_ref(),
@@ -918,10 +931,15 @@ impl Worker {
         if let Some(settings) = &self.save_sync_settings {
             if let Err(error) = settings.save_selected_installation(path) {
                 self.save_sync_settings_problem = Some(format!("Selection was not saved: {error}"));
-                self.log(Level::Error, "save-sync", error.to_string());
+                self.log(
+                    Level::Error,
+                    "save-sync",
+                    format!("Selection was not saved: {error}"),
+                );
                 self.refresh_save_sync();
                 return;
             }
+            self.save_sync_settings_problem = None;
         } else {
             self.save_sync_settings_problem = Some(
                 "Selection cannot be persisted without the application settings database.".into(),
@@ -948,6 +966,16 @@ impl Worker {
                 );
                 self.refresh_save_sync();
                 return;
+            }
+            #[cfg(windows)]
+            if let Some(scope) = &self.save_sync_scope {
+                if let Err(error) =
+                    crate::save_sync_agent::check_save_root_writable(&scope.effective_saves_root)
+                {
+                    self.save_sync_runtime_problem = Some(format!("Enable refused: {error}"));
+                    self.refresh_save_sync();
+                    return;
+                }
             }
         }
         if let (Some(settings), Some(scope)) = (
@@ -1293,11 +1321,12 @@ impl Worker {
         self.log(Level::Error, "connect", e.to_string());
     }
 
-    fn fail_mount(&self, e: &Error) {
+    fn fail_mount(&self, stage: &str, path: &str, e: &Error) {
+        let reason = format!("{stage} for mount {path:?} failed: {e}");
         self.sink.emit(AppEvent::MountFailed {
-            reason: e.to_string(),
+            reason: reason.clone(),
         });
-        self.log(Level::Error, "mount", e.to_string());
+        self.log(Level::Error, "mount", reason);
     }
 
     fn start_mount(&mut self, path: &str) {
@@ -1315,16 +1344,20 @@ impl Worker {
             return;
         }
         let Some(client) = self.client.clone() else {
-            self.fail_mount(&Error::Auth(
-                "connect to a RomM server before mounting".into(),
-            ));
+            self.fail_mount(
+                "check connection",
+                path,
+                &Error::Auth("connect to a RomM server before mounting".into()),
+            );
             self.refresh_save_sync();
             return;
         };
         let Some(server_id) = self.server_id.clone() else {
-            self.fail_mount(&Error::Auth(
-                "connect to a RomM server before mounting".into(),
-            ));
+            self.fail_mount(
+                "check connection",
+                path,
+                &Error::Auth("connect to a RomM server before mounting".into()),
+            );
             self.refresh_save_sync();
             return;
         };
@@ -1333,17 +1366,28 @@ impl Worker {
             path: path.to_string(),
         });
         let root = PathBuf::from(path);
+        let started = Instant::now();
+        self.log(
+            Level::Info,
+            "mount",
+            format!("checking and preparing mount directory {path:?}"),
+        );
 
         // Validate the root BEFORE claiming it: only empty dirs or roots we
         // previously marked for THIS server (PRD §5 — never over an existing
         // ROM library, never recursively cleared).
         if let Err(e) = check_mount_root(&root, &server_id) {
-            self.fail_mount(&e);
+            self.fail_mount("prepare and validate directory", path, &e);
             self.refresh_save_sync();
             return;
         }
 
         // Mounts re-read the catalogue so stop/start never serves stale data.
+        self.log(
+            Level::Info,
+            "mount",
+            format!("loading catalogue for {path:?}"),
+        );
         match self.load_catalogue(&client) {
             Ok(cat) => {
                 self.store_catalogue(cat);
@@ -1351,7 +1395,7 @@ impl Worker {
             }
             Err(e) if e.needs_sign_in() => {
                 self.sink.emit(AppEvent::SignInRequired);
-                self.fail_mount(&e);
+                self.fail_mount("load catalogue", path, &e);
                 self.refresh_save_sync();
                 return;
             }
@@ -1359,26 +1403,44 @@ impl Worker {
                 self.sink.emit(AppEvent::CatalogueFailed {
                     reason: e.to_string(),
                 });
-                self.fail_mount(&e);
+                self.fail_mount("load catalogue", path, &e);
                 self.refresh_save_sync();
                 return;
             }
         }
 
+        self.log(
+            Level::Info,
+            "mount",
+            format!("claiming ownership of {path:?}"),
+        );
         if let Err(e) = claim_mount_root(&root, &server_id) {
-            self.fail_mount(&e);
+            self.fail_mount("claim ownership", path, &e);
             return;
         }
 
         let remover = hydrated_remover(&root);
+        self.log(
+            Level::Info,
+            "mount",
+            format!(
+                "opening private cache {}",
+                cache_dir_for(&server_id).display()
+            ),
+        );
         let fs = match self.build_fs(&client, &root, remover) {
             Ok(fs) => fs,
             Err(e) => {
-                self.fail_mount(&e);
+                self.fail_mount("open cache and build filesystem", path, &e);
                 return;
             }
         };
 
+        self.log(
+            Level::Info,
+            "mount",
+            format!("starting Windows Cloud Files mount at {path:?}"),
+        );
         match start_mount_backend(Arc::clone(&fs), &root) {
             Ok(mount) => {
                 let mounted_path = mount.root.display().to_string();
@@ -1386,12 +1448,19 @@ impl Worker {
                 self.fs = Some(fs);
                 self.sink
                     .emit(AppEvent::MountStarted { path: mounted_path });
-                self.log(Level::Info, "mount", format!("mounted at {path}"));
+                self.log(
+                    Level::Info,
+                    "mount",
+                    format!(
+                        "mounted at {path} in {:.2}s",
+                        started.elapsed().as_secs_f64()
+                    ),
+                );
                 // One immediate sweep so expired entries from previous runs
                 // are reclaimed (PRD R4); per-ROM outcomes become events.
                 self.evict_once();
             }
-            Err(e) => self.fail_mount(&e),
+            Err(e) => self.fail_mount("start filesystem backend", path, &e),
         }
     }
 
@@ -1634,15 +1703,35 @@ impl ContentSource for ClientSource {
 // ---------------------------------------------------------------------------
 
 fn check_mount_root(root: &Path, server_id: &str) -> Result<()> {
+    let parent = root
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| {
+            Error::Unsupported("choose a mount directory below an existing parent directory".into())
+        })?;
+    let _guard = rommfs_core::save_sync::hold_save_directory_chain(parent).map_err(|e| {
+        Error::Unsupported(format!("protect mount parent {}: {e}", parent.display()))
+    })?;
+    match std::fs::create_dir(root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(Error::Unsupported(format!(
+                "cannot create mount directory {}: {e}",
+                root.display()
+            )))
+        }
+    }
     #[cfg(windows)]
     rommfs_cfapi::check_prerequisites(root).map_err(|e| Error::Unsupported(format!("{e:#}")))?;
     rommfs_cfapi::check_mount_root(root, server_id)
         .map(|_| ())
-        .map_err(|e| Error::Unsupported(e.to_string()))
+        .map_err(|e| Error::Unsupported(format!("{e:#}")))
 }
 
 fn claim_mount_root(root: &Path, server_id: &str) -> Result<()> {
-    rommfs_cfapi::claim_mount_root(root, server_id).map_err(|e| Error::Unsupported(e.to_string()))
+    rommfs_cfapi::claim_mount_root(root, server_id)
+        .map_err(|e| Error::Unsupported(format!("{e:#}")))
 }
 
 #[cfg(windows)]
@@ -1768,6 +1857,66 @@ mod tests {
     use rommfs_fixture::{FixtureBodyBarrier, FixtureSaveRecord, FixtureServer, ResponseSpec};
     use std::io::Write;
     use std::time::Duration;
+
+    #[test]
+    fn mount_root_is_created_and_existing_user_files_are_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("roms");
+        check_mount_root(&root, "server").unwrap();
+        assert!(root.is_dir());
+        check_mount_root(&root, "server").unwrap();
+        std::fs::write(root.join("save.srm"), b"user data").unwrap();
+        assert!(check_mount_root(&root, "server").is_err());
+        assert_eq!(std::fs::read(root.join("save.srm")).unwrap(), b"user data");
+    }
+
+    #[test]
+    fn failed_mount_logs_its_stage_and_path_before_and_after_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("roms");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("save.srm"), b"user data").unwrap();
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.client = Some(Arc::new(RommClient::new("http://unused.invalid").unwrap()));
+        worker.server_id = Some("server".into());
+        worker.start_mount(root.to_str().unwrap());
+        let events: Vec<_> = events.try_iter().collect();
+        let checking = events
+            .iter()
+            .position(|event| {
+                matches!(event,
+            AppEvent::Log(line) if line.message.contains("checking and preparing")
+                && line.message.contains("roms"))
+            })
+            .unwrap();
+        let failed = events
+            .iter()
+            .position(|event| {
+                matches!(event,
+            AppEvent::MountFailed { reason } if reason.contains("prepare and validate directory")
+                && reason.contains("roms") && reason.contains("not empty"))
+            })
+            .unwrap();
+        assert!(checking < failed);
+        assert!(events.iter().any(|event| matches!(event,
+            AppEvent::Log(line) if line.level == Level::Error
+                && line.message.contains("prepare and validate directory")
+                && line.message.contains("not empty"))));
+        assert_eq!(std::fs::read(root.join("save.srm")).unwrap(), b"user data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mount_root_creation_rejects_linked_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(check_mount_root(&link.join("roms"), "server").is_err());
+        assert!(!target.join("roms").exists());
+    }
 
     struct UnusedSource;
 
@@ -1951,7 +2100,10 @@ mod tests {
         let mut worker = Worker::new(sink);
         worker.save_sync_settings =
             Some(SaveSyncSettingsStore::open(dir.path().join("settings/save-sync.db")).unwrap());
+        worker.save_sync_settings_problem =
+            Some("Selection was not saved: transient failure".into());
         worker.select_save_sync_installation(&root);
+        assert!(worker.save_sync_settings_problem.is_none());
 
         assert!(matches!(
             events.try_recv(),

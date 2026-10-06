@@ -8,6 +8,41 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
+/// Check directory create permissions without creating a preview/probe file.
+#[cfg(windows)]
+pub(crate) fn check_save_root_writable(root: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    for target in [root.to_path_buf(), root.join("gb")] {
+        ensure_no_reparse_components(&target)?;
+        let directory = target
+            .ancestors()
+            .find(|path| path.exists())
+            .ok_or_else(|| Error::Unsupported("save root has no existing ancestor".into()))?;
+        let handle = OpenOptions::new()
+            .access_mode(FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(directory)
+            .map_err(|error| {
+                Error::Unsupported(format!(
+                    "Save directory is not writable: {}: {error}",
+                    directory.display()
+                ))
+            })?;
+        let metadata = handle.metadata()?;
+        if !metadata.is_dir() || path_is_reparse_point(&metadata) {
+            return Err(Error::Unsupported(
+                "save root is not a plain directory".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Copy verified bytes to a flushed sibling and atomically create `target`
 /// without ever replacing an emulator-created save.
 pub(super) fn publish_missing_save(
@@ -291,6 +326,43 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_save_root_access_check_rejects_denied_create_permissions_without_writing() {
+        use std::process::Command;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("saves");
+        check_save_root_writable(&root).unwrap();
+        assert!(!root.exists());
+        fs::create_dir_all(root.join("gb")).unwrap();
+        check_save_root_writable(&root).unwrap();
+
+        let identity = Command::new("whoami")
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()
+            .unwrap();
+        assert!(identity.status.success());
+        let output = String::from_utf8(identity.stdout).unwrap();
+        let sid = output.trim().split(',').nth(1).unwrap().trim_matches('"');
+        let denied = Command::new("icacls")
+            .arg(&root)
+            .args(["/deny", &format!("*{sid}:(WD,AD)")])
+            .output()
+            .unwrap();
+        assert!(denied.status.success(), "{denied:?}");
+        let result = check_save_root_writable(&root);
+        let restored = Command::new("icacls")
+            .arg(&root)
+            .args(["/remove:d", &format!("*{sid}")])
+            .output()
+            .unwrap();
+        assert!(restored.status.success(), "{restored:?}");
+        assert!(result.is_err(), "write-denied directory accepted");
+        check_save_root_writable(&root).unwrap();
+        assert_eq!(fs::read_dir(root.join("gb")).unwrap().count(), 0);
+    }
 
     fn has_publication_sibling(parent: &Path) -> bool {
         fs::read_dir(parent).unwrap().any(|entry| {

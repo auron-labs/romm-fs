@@ -40,7 +40,8 @@ fn hr(result: i32, action: &str) -> anyhow::Result<()> {
 /// Check the built-in Cloud Files platform and the chosen NTFS volume.
 /// Does not elevate, enable optional components, or install a driver.
 pub fn check_prerequisites(root: &Path) -> anyhow::Result<()> {
-    let canonical = std::fs::canonicalize(root)?;
+    let canonical = std::fs::canonicalize(root)
+        .with_context(|| format!("resolve mount directory {}", root.display()))?;
     anyhow::ensure!(
         matches!(canonical.components().next(), Some(std::path::Component::Prefix(prefix))
         if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_))),
@@ -78,7 +79,7 @@ pub fn check_prerequisites(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn open_metadata(path: &Path, exclusive: bool) -> std::io::Result<File> {
+fn open_metadata(path: &Path, exclusive: bool) -> anyhow::Result<File> {
     OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC)
         .share_mode(if exclusive {
@@ -88,6 +89,7 @@ fn open_metadata(path: &Path, exclusive: bool) -> std::io::Result<File> {
         })
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
+        .with_context(|| format!("open {} for file attributes and ACL access (FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC, exclusive={exclusive})", path.display()))
 }
 
 pub(crate) fn check_root_directory(root: &Path) -> anyhow::Result<()> {
@@ -292,14 +294,20 @@ impl WindowsMount {
         root::check_directory(root.as_ref())?;
         let root = std::fs::canonicalize(root.as_ref())?;
         check_prerequisites(&root)?;
+        let lock_path = root::sibling(&root, ".rommfs-lock")?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .share_mode(0)
-            .open(root::sibling(&root, ".rommfs-lock")?)
-            .context("another RomMFS session is using this root")?;
+            .open(&lock_path)
+            .with_context(|| {
+                format!(
+                    "open exclusive mount lock {}; another session may hold it",
+                    lock_path.display()
+                )
+            })?;
         let directories = rommfs_core::save_sync::hold_save_directory_chain(
             root.parent().context("missing root parent")?,
         )?;
@@ -308,7 +316,8 @@ impl WindowsMount {
         let mut manifest = manifest_for(&core, &previous.server_id)?;
         let root_handle = open_metadata(&root, false)?;
         manifest.root_security = if previous.root_security.is_empty() {
-            security::snapshot(&root_handle)?
+            security::snapshot(&root_handle)
+                .with_context(|| format!("read original ACL for {}", root.display()))?
         } else {
             previous.root_security.clone()
         };
@@ -345,7 +354,8 @@ impl WindowsMount {
         };
         register_root(&mount.root, &manifest.server_id)?;
         mount.registered = true;
-        security::set(&root_handle, security::READ_ONLY)?;
+        security::set(&root_handle, security::READ_ONLY)
+            .with_context(|| format!("apply read-only ACL to {}", mount.root.display()))?;
         root::check_tree(&mount.root, &mount.manifest, verify_owned)?;
         // ponytail: rebuilds owned placeholders on start; reconcile unchanged entries
         // if catalogue startup costs become significant. Private bytes survive.
@@ -392,7 +402,12 @@ impl WindowsMount {
         )?;
         mount.connection = Some(connection);
         for entry in &mount.manifest.entries {
-            create_placeholder(&mount.root, entry)?;
+            create_placeholder(&mount.root, entry).with_context(|| {
+                format!(
+                    "create placeholder {}",
+                    mount.root.join(&entry.path).display()
+                )
+            })?;
         }
         Ok(mount)
     }

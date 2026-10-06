@@ -38,7 +38,9 @@ pub(crate) fn sibling(root: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
 }
 
 pub(crate) fn read_manifest(root: &Path) -> anyhow::Result<Manifest> {
-    let bytes = fs::read(sibling(root, ".rommfs-root")?)?;
+    let marker = sibling(root, ".rommfs-root")?;
+    let bytes = fs::read(&marker)
+        .with_context(|| format!("read ownership manifest {}", marker.display()))?;
     // Old WinFsp markers identify a server, but authorize no persistent files.
     let manifest: Manifest = if bytes.first() == Some(&b'{') {
         serde_json::from_slice(&bytes).context("invalid RomMFS ownership manifest")?
@@ -96,9 +98,11 @@ pub(crate) fn check_directory(root: &Path) -> anyhow::Result<()> {
     let parent = root
         .parent()
         .context("choose a directory below a volume root")?;
-    let _guard = rommfs_core::save_sync::hold_save_directory_chain(parent)?;
+    let _guard = rommfs_core::save_sync::hold_save_directory_chain(parent)
+        .with_context(|| format!("protect mount parent {}", parent.display()))?;
     #[cfg(windows)]
-    crate::imp::check_root_directory(root)?;
+    crate::imp::check_root_directory(root)
+        .with_context(|| format!("inspect mount directory {}", root.display()))?;
     #[cfg(not(windows))]
     {
         let meta = fs::symlink_metadata(root)?;
@@ -181,10 +185,12 @@ pub fn claim_mount_root(root: &Path, server_id: &str) -> anyhow::Result<()> {
     ) {
         return Ok(());
     }
+    let marker = sibling(root, ".rommfs-root")?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(sibling(root, ".rommfs-root")?)?;
+        .open(&marker)
+        .with_context(|| format!("create ownership manifest {}", marker.display()))?;
     file.write_all(&serde_json::to_vec(&Manifest {
         server_id: server_id.into(),
         ..Manifest::default()

@@ -1,0 +1,24 @@
+Use case: ui-mockup
+Asset type: high-fidelity desktop GUI design reference for this Rust GPUI project, RomMFS.
+Primary request: Generate one realistic, implementable redesigned screenshot of RomMFS, using the supplied screenshots as references for product identity, existing dark palette, Windows chrome and feature scope. These are reference images, not edit targets. A polished native Windows utility, not a website or marketing dashboard.
+Composition: one straight-on complete app window at roughly 1200 by 960 logical pixels, landscape image, no surrounding desktop, no device frame, no annotations. Standard Windows title bar with small app icon and "RomMFS", minimize, maximize, close at right. Crisp Segoe UI-style typography, readable body text near 14px, section headings 16px, window heading 20px. Tight but comfortable 32px controls, aligned edges, consistent 8/16/24px spacing. Restrained dark blue-gray palette inherited from screenshots, blue only for default commit and focus, green only for connected/mounted status. Subtle 1px borders, modest 4–6px corner radii. Flat layout, no nested cards, no decorative shadows.
+Task: connect a RomM server, mount ROMs as read-only Windows paths, optionally sync supported RetroBat saves, monitor actual downloads and logs. This is NOT a game launcher and has no game library browser.
+Layout and exact copy:
+Top content header "RomMFS" at left; right a green small dot plus "Connected · aaron".
+Connection section: visible labels "Server URL", "Username", "Password" above a horizontal form row. Fields "https://romm.jcaks.net", "aaron", masked bullet password, quiet outline "Connect" button. URL field wider than credentials.
+Mount section, slightly more visual emphasis than others: heading "ROM mount", green small dot and "Mounted" at right. Visible label "Mount folder", wide field "C:\RomM", disabled quiet "Start" and enabled outline "Stop" buttons. Below field show "25 platforms · 2,448 ROMs · 23 skipped", and one muted sentence "Read-only files download when opened. Closing RomMFS stops the mount." This is illustrative successful mounted state.
+Thin divider.
+Optional section heading "Save sync", neutral state "Disabled" next to heading. Right aligned blue "Enable save sync" button as explicit consent commitment.
+Two compact labeled rows: "RetroBat installation" with select field "D:\RetroBat", outline "Browse…" and ghost "Refresh". Then "Saves folder" with value "D:\RetroBat\saves". Below: "RetroBat 8.2.1 · RetroArch / Gambatte · Game Boy" and small scope line "Server: romm.jcaks.net · Account: aaron (ID 1)".
+Compact preview summary "42 mapped games · 12 supported saves · 3 skipped files" and an outlined disclosure row with right-pointing chevron "Mapping preview and skipped files". Muted safeguard sentence "Existing saves are never replaced. Incoming differences are kept for review." Small caption "Sync runs only while RomMFS is open." Advanced debounce settings are behind the disclosure and not shown. No sync transfers or review items because sync is disabled.
+Thin divider.
+"Downloads" heading. A simple 3-column list/table with labels "File", "Progress", "Status". Two rows of demonstration data: "Super Mario World.sfc", a thin blue filled horizontal track with "65%", and "1.3 MB / 2.0 MB"; "Tetris.gb", a completed track or check glyph with "100%", and "Complete". Keep column baselines aligned. Downloads are on-demand, no fake speed charts, no manual download action.
+Thin divider.
+Bottom "Activity log" header with outline "Copy" at right. Darker inset scrolling log region with monospace lines:
+"07:36:12  INFO   Connected as aaron"
+"07:36:43  INFO   Loaded 25 platforms and 2,448 ROMs"
+"07:36:43  WARN   Skipped 23 unsupported multi-file games"
+"07:36:44  INFO   Mounted C:\RomM"
+"07:37:02  INFO   Tetris.gb download complete"
+Use muted timestamps, mostly neutral text, amber WARN only. Scrollbar at actual right edge of log.
+Constraints: ALL widgets must be realistic GPUI render primitives: flexbox rows and columns, text, buttons, borders, SVG-style simple line icons, input/select/disclosure, scroll regions and rectangular progress fills. Existing app uses plain gpui rather than gpui-kit; the visual should remain feasible in either using standard primitives. No glassmorphism, blur, neon glow, gradients, illustrations, game cover art, large dashboard statistic cards, sidebar navigation, browser navigation, charts, decorative blobs, macOS traffic lights, invented features, or background service/tray functionality. Ensure content fits without clipping and readable exact copy. The image is a concept screenshot, not proof of a running implementation.

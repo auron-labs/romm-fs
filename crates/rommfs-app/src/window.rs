@@ -853,7 +853,9 @@ impl RommfsWindow {
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(error)) => {
-                    let _ = this.update(cx, |view, _| view.show_picker_error(error.to_string()));
+                    let _ = this.update(cx, |view, _| {
+                        view.show_picker_error(format!("RetroBat folder picker failed: {error}"))
+                    });
                 }
                 Err(_) => {
                     let _ = this.update(cx, |view, _| {
@@ -1230,13 +1232,11 @@ impl RommfsWindow {
         let can_export = self.state.save_sync_effective_saves_root.is_some()
             && self.state.save_sync_account_id.is_some();
 
-        div()
+        let content = div()
             .flex()
             .flex_col()
+            .flex_shrink_0()
             .gap_1()
-            .max_h(rems(18.75))
-            .id("save-sync-panel")
-            .overflow_y_scroll()
             .py_1()
             .child(self.section("Save sync"))
             .child(
@@ -1435,8 +1435,6 @@ impl RommfsWindow {
             .child(
                 div()
                     .id("save-sync-games")
-                    .max_h(rems(4.))
-                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -1465,8 +1463,6 @@ impl RommfsWindow {
             .child(
                 div()
                     .id("save-sync-incoming")
-                    .max_h(rems(5.5))
-                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -1512,7 +1508,14 @@ impl RommfsWindow {
                                     .child(format!("Exported to {path}; review remains pending."))
                             }))
                     })),
-            )
+            );
+
+        // One scroll owner; its content must not shrink to the viewport height.
+        div()
+            .id("save-sync-panel")
+            .max_h(rems(18.75))
+            .overflow_y_scroll()
+            .child(content)
     }
 }
 

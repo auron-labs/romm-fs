@@ -14,6 +14,8 @@ mod tests;
 
 pub(crate) use actor::export_pending_incoming;
 pub(crate) use actor::SaveSyncAgent;
+#[cfg(windows)]
+pub(crate) use files::check_save_root_writable;
 pub(crate) use gate::SaveSyncCommandGate;
 #[cfg(test)]
 use transfer::{remote_filename_matches_revision, validate_configuration};
