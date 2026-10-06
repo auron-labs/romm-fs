@@ -13,7 +13,8 @@ required-features = ["ui"]
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-gpui = { workspace = true, optional = true }
+# gpui-kit = GPUI + gpui-base + gpui-component + default icon assets.
+gpui-kit = { workspace = true, optional = true }
 httpdate.workspace = true
 notify.workspace = true
 rommfs-cfapi.workspace = true
@@ -32,4 +33,4 @@ windows-sys.workspace = true
 
 [features]
 default = ["ui"]
-ui = ["dep:gpui"]
+ui = ["dep:gpui-kit"]

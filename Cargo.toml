@@ -16,7 +16,7 @@ license = "MIT"
 [workspace.dependencies]
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-gpui = "0.2.2"
+gpui-kit = "=0.7.0"
 httpdate = "1.0.3"
 isahc = { version = "1.8", features = ["json"] }
 notify = "8.2.0"

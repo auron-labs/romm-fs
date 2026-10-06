@@ -1,0 +1,3 @@
+- [ ] invalid credentials just shows 'sign-in required'
+- [ ] still having issue where we cant mount due to access denied
+- [ ] cant scroll down to the log so its hidden
