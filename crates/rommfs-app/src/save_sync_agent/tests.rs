@@ -1444,6 +1444,32 @@ fn invalid_export_components_and_redirected_parent_fail_before_filesystem_mutati
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn canonicalized_export_parent_accepts_save_export() {
+    const REMOTE_BYTES: &[u8] = b"canonicalized incoming export bytes";
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    let case = case(directory.path(), &fixture, false);
+    let export_root = directory.path().join("exports");
+    fs::create_dir(&export_root).unwrap();
+    let canonical_export_root = fs::canonicalize(&export_root).unwrap();
+    let staged = case.spool.join("canonicalized-export.srm");
+    fs::write(&staged, REMOTE_BYTES).unwrap();
+    let destination = canonical_export_root.join("remote.srm");
+
+    super::files::export_incoming(
+        &staged,
+        &destination,
+        &sha256_content_hash(REMOTE_BYTES),
+        &case.scope,
+        std::slice::from_ref(&case.mapping.target_path),
+    )
+    .unwrap();
+
+    assert_eq!(fs::read(destination).unwrap(), REMOTE_BYTES);
+}
+
 #[test]
 fn save_sync_401_emits_scoped_auth_status_and_pauses_further_requests() {
     let directory = tempfile::tempdir().unwrap();

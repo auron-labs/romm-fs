@@ -14,8 +14,8 @@ use gpui::{
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
     GlobalElementId, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, PathPromptOptions, Pixels, Point, Render,
-    ScrollHandle, ShapedLine, SharedString, Style, TextRun, Timer, UTF16Selection, UnderlineStyle,
-    WeakEntity, Window, WindowBounds, WindowOptions,
+    ScrollHandle, ShapedLine, SharedString, Stateful, Style, TextRun, Timer, UTF16Selection,
+    UnderlineStyle, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use rommfs_core::events::{AppEvent, Level, SaveSyncIncomingStatus};
 use rommfs_core::save_sync::{
@@ -43,7 +43,9 @@ actions!(
         Cut,
         Copy,
         SaveSyncApplyDebounce,
-        ActivateSaveControl,
+        ActivateControl,
+        FocusNext,
+        FocusPrevious,
     ]
 );
 
@@ -104,7 +106,7 @@ impl TextInput {
         let content: SharedString = initial.into();
         let end = content.len();
         Self {
-            focus_handle: cx.focus_handle(),
+            focus_handle: cx.focus_handle().tab_stop(true),
             content,
             placeholder: placeholder.into(),
             masked,
@@ -675,10 +677,11 @@ impl Render for TextInput {
             .bg(rgb(0x14141f))
             .border_1()
             .border_color(if focused {
-                rgb(0x4c8dff)
+                rgb(palette_color(PaletteRole::Focus))
             } else {
-                rgb(0x3a3f55)
+                rgb(palette_color(PaletteRole::Border))
             })
+            .when(focused, |style| style.border_2())
             .rounded_md()
             .w_full()
             .h(px(30.))
@@ -709,12 +712,11 @@ struct RommfsWindow {
     debounce_input: Entity<TextInput>,
     debounce_input_applied: String,
     debounce_error: Option<String>,
-    focus_handle: FocusHandle,
     log_scroll: ScrollHandle,
 }
 
 impl RommfsWindow {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (controller, event_rx) = Controller::spawn();
         let url_input = cx
             .new(|cx| TextInput::new(cx, "http://romm.local:8080", SharedString::default(), false));
@@ -742,7 +744,7 @@ impl RommfsWindow {
         })
         .detach();
 
-        Self {
+        let view = Self {
             controller,
             event_rx,
             state: UiState::new(LOG_CAP),
@@ -753,9 +755,10 @@ impl RommfsWindow {
             debounce_input,
             debounce_input_applied: rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string(),
             debounce_error: None,
-            focus_handle: cx.focus_handle().tab_stop(true),
             log_scroll: ScrollHandle::new(),
-        }
+        };
+        window.focus(&view.url_input.read(cx).focus_handle);
+        view
     }
 
     /// Drain pending worker events into `UiState` and repaint if needed.
@@ -802,7 +805,7 @@ impl RommfsWindow {
         }
     }
 
-    fn on_connect(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_connect(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.state.conn == ConnState::Connecting {
             return;
         }
@@ -813,7 +816,7 @@ impl RommfsWindow {
         });
     }
 
-    fn on_start_mount(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_start_mount(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.state.mount, MountState::Mounting | MountState::Mounted) {
             return;
         }
@@ -823,7 +826,7 @@ impl RommfsWindow {
         self.controller.send(Command::StartMount { path });
     }
 
-    fn on_stop_mount(&mut self, _: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn on_stop_mount(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
         if self.state.mount != MountState::Mounted {
             return;
         }
@@ -966,7 +969,7 @@ impl RommfsWindow {
             });
     }
 
-    fn on_copy_log(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_copy_log(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let body = self
             .state
             .log
@@ -983,6 +986,14 @@ impl RommfsWindow {
             .collect::<Vec<_>>()
             .join("\n");
         cx.write_to_clipboard(ClipboardItem::new_string(body));
+    }
+
+    fn focus_next(&mut self, _: &FocusNext, window: &mut Window, _: &mut Context<Self>) {
+        window.focus_next();
+    }
+
+    fn focus_previous(&mut self, _: &FocusPrevious, window: &mut Window, _: &mut Context<Self>) {
+        window.focus_prev();
     }
 
     // --- render helpers ---
@@ -1020,54 +1031,23 @@ impl RommfsWindow {
             .child(SharedString::from(title.to_uppercase()))
     }
 
-    fn button(
-        &self,
-        label: &str,
-        enabled: bool,
-        on: Option<impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static>,
-    ) -> Div {
-        let mut el = div()
-            .px_3()
-            .h(rems(1.875))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .text_sm()
-            .child(SharedString::from(label.to_string()));
-        if enabled {
-            el = el
-                .bg(rgb(palette_color(PaletteRole::Accent)))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(palette_color(PaletteRole::AccentHover))));
-            if let Some(on) = on {
-                el = el.on_mouse_up(MouseButton::Left, on);
-            }
-        } else {
-            el = el
-                .bg(rgb(palette_color(PaletteRole::Disabled)))
-                .text_color(rgb(palette_color(PaletteRole::Muted)))
-                .cursor_default();
-        }
-        el
-    }
-
-    fn save_control(
-        &self,
+    fn command_control(
         window: &mut Window,
         cx: &mut Context<Self>,
-        id: String,
+        id: impl Into<SharedString>,
         label: impl Into<SharedString>,
         enabled: bool,
+        bordered: bool,
         action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + Clone + 'static,
-    ) -> impl IntoElement {
-        let key: SharedString = format!("save-sync-control-{id}").into();
-        let focus =
-            window.use_keyed_state(key.clone(), cx, |_, cx| cx.focus_handle().tab_stop(true));
-        let focus_handle = focus.read(cx).clone();
+    ) -> Stateful<Div> {
+        let key = id.into();
+        let focus_handle = Self::control_focus_handle(window, cx, key.clone(), enabled);
+        // Keep focus visible if this control becomes disabled while focused.
         let focused = focus_handle.is_focused(window);
         let mut control = div()
-            .id(key.clone())
+            .id(key)
+            .track_focus(&focus_handle)
+            .key_context("CommandControl")
             .px_3()
             .h(rems(1.875))
             .flex()
@@ -1075,34 +1055,33 @@ impl RommfsWindow {
             .justify_center()
             .rounded_md()
             .text_sm()
-            .border_1()
-            .border_color(if focused {
+            .child(label.into());
+        if bordered {
+            control = control.border_1().border_color(if focused {
                 rgb(palette_color(PaletteRole::Focus))
             } else {
                 rgb(palette_color(PaletteRole::Border))
-            })
-            .child(label.into());
+            });
+        }
+        control = control.when(focused, |style| {
+            style
+                .border_2()
+                .border_color(rgb(palette_color(PaletteRole::Focus)))
+        });
         if enabled {
-            let mouse_action = action.clone();
-            let key_action = action;
+            let pointer_action = action.clone();
+            let keyboard_action = action;
             control = control
-                .track_focus(&focus_handle)
-                .key_context("SaveSyncControl")
                 .bg(rgb(palette_color(PaletteRole::Accent)))
                 .cursor_pointer()
-                .hover(|style| style.bg(rgb(palette_color(PaletteRole::AccentHover))))
-                .when(focused, |style| style.border_2())
+                .hover(|s| s.bg(rgb(palette_color(PaletteRole::AccentHover))))
                 .on_mouse_up(
                     MouseButton::Left,
-                    cx.listener(move |view, _, window, cx| {
-                        mouse_action(view, window, cx);
-                    }),
+                    cx.listener(move |view, _, window, cx| pointer_action(view, window, cx)),
                 )
-                .on_action(
-                    cx.listener(move |view, _: &ActivateSaveControl, window, cx| {
-                        key_action(view, window, cx);
-                    }),
-                );
+                .on_action(cx.listener(move |view, _: &ActivateControl, window, cx| {
+                    keyboard_action(view, window, cx);
+                }));
         } else {
             control = control
                 .bg(rgb(palette_color(PaletteRole::Disabled)))
@@ -1110,6 +1089,21 @@ impl RommfsWindow {
                 .cursor_default();
         }
         control
+    }
+
+    fn control_focus_handle(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        key: SharedString,
+        enabled: bool,
+    ) -> FocusHandle {
+        let focus = window.use_keyed_state(key, cx, |_, cx| cx.focus_handle().tab_stop(enabled));
+        if focus.read(cx).tab_stop != enabled {
+            focus.update(cx, |handle, _| {
+                *handle = handle.clone().tab_stop(enabled);
+            });
+        }
+        focus.read(cx).clone()
     }
 
     fn save_sync_status(&self) -> (&'static str, PaletteRole) {
@@ -1251,32 +1245,35 @@ impl RommfsWindow {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(self.save_control(
+                    .child(Self::command_control(
                         window,
                         cx,
-                        "browse".into(),
+                        "save-sync-control-browse",
                         "Browse…",
+                        true,
                         true,
                         |view, _window, cx| view.browse_save_sync(cx),
                     ))
-                    .child(self.save_control(
+                    .child(Self::command_control(
                         window,
                         cx,
-                        "refresh".into(),
+                        "save-sync-control-refresh",
                         "Refresh",
+                        true,
                         true,
                         |view, _window, _cx| view.controller.send(Command::RefreshSaveSync),
                     ))
-                    .child(self.save_control(
+                    .child(Self::command_control(
                         window,
                         cx,
-                        "toggle".into(),
+                        "save-sync-control-toggle",
                         if self.state.save_sync_enabled {
                             "Save sync: on (disable)"
                         } else {
                             "Enable save sync"
                         },
                         self.state.save_sync_available || self.state.save_sync_enabled,
+                        true,
                         |view, _window, cx| {
                             let enabled = !view.state.save_sync_enabled;
                             if !enabled {
@@ -1354,12 +1351,13 @@ impl RommfsWindow {
                             .on_action(cx.listener(Self::on_apply_debounce_action))
                             .child(self.debounce_input.clone()),
                     )
-                    .child(self.save_control(
+                    .child(Self::command_control(
                         window,
                         cx,
-                        "apply-debounce".into(),
+                        "save-sync-control-apply-debounce",
                         "Apply",
                         self.state.save_sync_available || self.state.save_sync_enabled,
+                        true,
                         |view, _window, cx| view.apply_save_sync_debounce(cx),
                     )),
             )
@@ -1382,11 +1380,12 @@ impl RommfsWindow {
                     path.display(),
                     candidate.sources
                 );
-                self.save_control(
+                Self::command_control(
                     window,
                     cx,
-                    format!("candidate-{}", path.display()),
+                    format!("save-sync-control-candidate-{}", path.display()),
                     label,
+                    true,
                     true,
                     move |view, _window, cx| {
                         view.controller
@@ -1489,12 +1488,13 @@ impl RommfsWindow {
                             .flex_col()
                             .gap_1()
                             .child(div().text_xs().child(label))
-                            .child(self.save_control(
+                            .child(Self::command_control(
                                 window,
                                 cx,
-                                format!("export-{id}"),
+                                format!("save-sync-control-export-{id}"),
                                 "Export…",
                                 can_export,
+                                true,
                                 move |view, _window, cx| {
                                     view.prompt_export(incoming.clone(), cx);
                                 },
@@ -1613,7 +1613,9 @@ impl Render for RommfsWindow {
             .bg(rgb(0x1e1e2e))
             .text_color(rgb(0xdde1ee))
             .text_sm()
-            .track_focus(&self.focus_handle(cx))
+            .key_context("RommfsWindow")
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_previous))
             .child(
                 // Header + live status line.
                 div()
@@ -1651,10 +1653,14 @@ impl Render for RommfsWindow {
                             .child(div().flex_1().child(self.url_input.clone()))
                             .child(div().w(px(160.)).child(self.user_input.clone()))
                             .child(div().w(px(160.)).child(self.password_input.clone()))
-                            .child(self.button(
+                            .child(Self::command_control(
+                                window,
+                                cx,
+                                "button-connect",
                                 "Connect",
                                 !connecting,
-                                Some(cx.listener(Self::on_connect)),
+                                false,
+                                |view, window, cx| view.on_connect(window, cx),
                             )),
                     ),
             )
@@ -1671,15 +1677,23 @@ impl Render for RommfsWindow {
                             .flex_row()
                             .gap_2()
                             .child(div().flex_1().child(self.mount_input.clone()))
-                            .child(self.button(
+                            .child(Self::command_control(
+                                window,
+                                cx,
+                                "button-start-mount",
                                 "Start",
                                 !mounted && !mounting,
-                                Some(cx.listener(Self::on_start_mount)),
+                                false,
+                                |view, window, cx| view.on_start_mount(window, cx),
                             ))
-                            .child(self.button(
+                            .child(Self::command_control(
+                                window,
+                                cx,
+                                "button-stop-mount",
                                 "Stop",
                                 mounted,
-                                Some(cx.listener(Self::on_stop_mount)),
+                                false,
+                                |view, window, cx| view.on_stop_mount(window, cx),
                             )),
                     ),
             )
@@ -1770,10 +1784,18 @@ impl Render for RommfsWindow {
                             .items_center()
                             .child(self.section("Log"))
                             .child(
-                                self.button("Copy", true, Some(cx.listener(Self::on_copy_log)))
-                                    .h(px(22.))
-                                    .px_2()
-                                    .text_xs(),
+                                Self::command_control(
+                                    window,
+                                    cx,
+                                    "button-copy-log",
+                                    "Copy",
+                                    true,
+                                    false,
+                                    |view, window, cx| view.on_copy_log(window, cx),
+                                )
+                                .h(px(22.))
+                                .px_2()
+                                .text_xs(),
                             ),
                     )
                     .child(
@@ -1822,12 +1844,6 @@ impl Render for RommfsWindow {
     }
 }
 
-impl Focusable for RommfsWindow {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
 /// Launch the GPUI app; blocks until the window closes. Closing stops the
 /// worker session and mount (PRD: no tray/background process).
 pub fn run() {
@@ -1846,9 +1862,11 @@ pub fn run() {
             KeyBinding::new("secondary-x", Cut, None),
             KeyBinding::new("home", Home, None),
             KeyBinding::new("end", End, None),
+            KeyBinding::new("tab", FocusNext, Some("RommfsWindow")),
+            KeyBinding::new("shift-tab", FocusPrevious, Some("RommfsWindow")),
+            KeyBinding::new("enter", ActivateControl, Some("CommandControl")),
+            KeyBinding::new("space", ActivateControl, Some("CommandControl")),
             KeyBinding::new("enter", SaveSyncApplyDebounce, Some("SaveSyncDebounce")),
-            KeyBinding::new("enter", ActivateSaveControl, Some("SaveSyncControl")),
-            KeyBinding::new("space", ActivateSaveControl, Some("SaveSyncControl")),
         ]);
 
         let bounds = Bounds::centered(None, size(px(720.0), px(680.0)), cx);
@@ -1861,7 +1879,7 @@ pub fn run() {
                 }),
                 ..Default::default()
             },
-            |_, cx| cx.new(RommfsWindow::new),
+            |window, cx| cx.new(|cx| RommfsWindow::new(window, cx)),
         )
         .unwrap();
         cx.activate(true);

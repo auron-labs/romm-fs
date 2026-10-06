@@ -88,8 +88,8 @@ pub fn hold_save_directory_chain(path: &Path) -> Result<SaveDirectoryChainGuard>
     {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
 
         let mut directories = path.ancestors().collect::<Vec<_>>();
@@ -97,7 +97,11 @@ pub fn hold_save_directory_chain(path: &Path) -> Result<SaveDirectoryChainGuard>
         let mut handles = Vec::with_capacity(directories.len());
         for directory in directories {
             let handle = OpenOptions::new()
-                .access_mode(FILE_READ_ATTRIBUTES)
+                // Attribute-only handles do not reliably prevent directory
+                // rename on Windows Server 2022. Request list access as well
+                // so this open handle protects the directory namespace; omit
+                // FILE_SHARE_DELETE to block rename/reparse substitution.
+                .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(directory)?;
@@ -187,11 +191,23 @@ pub(crate) fn open_save_read(root: &Path, relative_path: &Path) -> Result<SaveRe
     })
 }
 
-pub(crate) fn ensure_no_reparse_components(path: &Path) -> Result<()> {
+/// Checks each existing component along `path`, including its ancestors, without
+/// following symlinks or reparse points.
+///
+/// Returns an error if an existing component is a symlink or reparse point. A
+/// missing component allows the remaining suffix; this function never creates
+/// filesystem entries.
+pub fn ensure_no_reparse_components(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+            Component::Prefix(_) => {
+                current.push(component.as_os_str());
+                // A Windows prefix such as `\\?\C:` is not itself a
+                // filesystem path. Inspect it only after its root is joined.
+                continue;
+            }
+            Component::RootDir | Component::Normal(_) => {
                 current.push(component.as_os_str());
             }
             Component::CurDir => continue,
@@ -294,12 +310,71 @@ mod tests {
         let parent = dir.path().join("saves");
         fs::create_dir_all(parent.join("gb")).unwrap();
         let renamed = dir.path().join("saves-renamed");
+        let ancestor = dir.path().to_path_buf();
+        let renamed_ancestor = dir.path().with_file_name(format!(
+            "{}-renamed",
+            dir.path().file_name().unwrap().to_string_lossy()
+        ));
 
         let guard = hold_save_directory_chain(&parent).unwrap();
         assert!(fs::rename(&parent, &renamed).is_err());
+        assert!(fs::rename(&ancestor, &renamed_ancestor).is_err());
 
         drop(guard);
         fs::rename(&parent, &renamed).unwrap();
         fs::rename(&renamed, &parent).unwrap();
+        fs::rename(&ancestor, &renamed_ancestor).unwrap();
+        fs::rename(&renamed_ancestor, &ancestor).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_canonicalized_paths_accept_existing_and_missing_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        let existing = canonical.join("existing");
+        fs::create_dir(&existing).unwrap();
+
+        assert_eq!(
+            resolve_save_target(&existing, Path::new("gb/game.srm")).unwrap(),
+            existing.join("gb/game.srm")
+        );
+        assert!(resolve_save_target(&canonical, Path::new("gb/game.srm")).is_ok());
+        assert!(ensure_no_reparse_components(&canonical.join("missing/child")).is_ok());
+        let _guard = hold_save_directory_chain(&existing).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_canonicalized_ancestor_junction_is_rejected() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        let target = dir.path().join("junction-target");
+        let junction = dir.path().join("junction");
+        let canonical_junction = canonical.join("junction");
+        fs::create_dir_all(target.join("gb")).unwrap();
+
+        let output = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .expect("run cmd to create a directory junction");
+        assert!(
+            output.status.success(),
+            "junction setup failed: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let linked_root = canonical_junction.join("gb");
+        let resolution = resolve_save_target(&canonical_junction, Path::new("gb/game.srm"));
+        let guard = hold_save_directory_chain(&linked_root);
+        fs::remove_dir(&junction).unwrap();
+
+        assert!(resolution.is_err(), "save resolution accepted a junction");
+        assert!(guard.is_err(), "directory guard accepted a junction");
     }
 }

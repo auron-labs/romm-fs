@@ -1,0 +1,35 @@
+# Only reviewed fixture/example values are filtered; keep scanning these files
+# for any other credentials, including provider-specific tokens.
+filter = '''
+(
+    finding["rule_id"] == "generic-password" &&
+    filter.matchesAny(attributes["path"], [
+        `(?:^|/)\.agents/skills/test-master/references/(?:security-testing|performance-testing|e2e-testing|automation-frameworks|integration-testing)\.md$`,
+        `(?:^|/)\.agents/skills/security-reviewer/references/infrastructure-security\.md$`
+    ]) &&
+    finding["secret"] in ["wrong", "correct", "password", "TestPass123!", "AdminPass123!", "vaultpass", "pass"]
+) || (
+    finding["rule_id"] == "generic-password" &&
+    filter.matchesAny(attributes["path"], [
+        `(?:^|/)crates/rommfs-app/src/save_sync_agent/tests\.rs$`,
+        `(?:^|/)crates/rommfs-cfapi/tests/cfapi_native\.rs$`,
+        `(?:^|/)crates/rommfs-core/tests/romm_client\.rs$`
+    ]) &&
+    finding["secret"] in ["fixture-password", "wrong"]
+) || (
+    finding["rule_id"] == "generic-api-key" &&
+    filter.matchesAny(attributes["path"], [`(?:^|/)SAVE-SYNC-CHECKLIST\.md$`]) &&
+    finding["secret"] == "42e8043372522089a3bd724e8f4a0635aa1c6bf9"
+) || (
+    finding["rule_id"] in ["generic-password", "curl-auth-user"] &&
+    filter.matchesAny(attributes["path"], [`(?:^|/)testing/romm-harness/README\.md$`]) &&
+    finding["secret"] in ["admin123", "admin:admin123"]
+) || (
+    finding["rule_id"] == "generic-password" &&
+    filter.matchesAny(attributes["path"], [`(?:^|/)testing/romm-harness/docker-compose\.yml$`]) &&
+    finding["secret"] in ["romm-pass-123", "rootpw"]
+)
+'''
+
+[extend]
+useDefault = true

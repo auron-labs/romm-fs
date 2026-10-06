@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-const VERIFIED_RETROBAT_VERSION: &str = "8.2.1";
+const VERIFIED_RETROBAT_VERSION_MARKERS: [&str; 2] = ["8.2.1", "8.2.1-stable-win64"];
 const MAX_PROFILE_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_OVERRIDE_FILES: usize = 512;
 const MAX_SYSTEM_CONFIG_FILES: usize = 128;
@@ -44,9 +44,9 @@ pub fn resolve_retrobat_gb_profile(
     }
     let version_path = retrobat_root.join("system/version.info");
     let version = read_limited_text(&version_path)?.trim().to_owned();
-    if version != VERIFIED_RETROBAT_VERSION {
+    if !VERIFIED_RETROBAT_VERSION_MARKERS.contains(&version.as_str()) {
         return Err(Error::Unsupported(format!(
-            "RetroBat {version:?} is not the verified {VERIFIED_RETROBAT_VERSION} save profile"
+            "RetroBat {version:?} is not a verified 8.2.1 save profile"
         )));
     }
 
@@ -649,7 +649,7 @@ mod tests {
         fs::create_dir_all(&retroarch).unwrap();
         fs::create_dir_all(root.join("system")).unwrap();
         fs::write(root.join("RetroBat.exe"), b"exe").unwrap();
-        fs::write(root.join("system/version.info"), "8.2.1\n").unwrap();
+        fs::write(root.join("system/version.info"), "8.2.1-stable-win64\r\n").unwrap();
         fs::write(
             root.join("emulators/retroarch/retroarch.cfg"),
             "savefile_directory = \":\\saves\"\nsavefiles_in_content_dir = \"false\"\nsort_savefiles_enable = \"false\"\n",
@@ -682,7 +682,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = stock_fixture(dir.path());
         let profile = resolve_retrobat_gb_profile(&root, &["Tiny Game.gb".into()]).unwrap();
-        assert_eq!(profile.version, "8.2.1");
+        assert_eq!(profile.version, "8.2.1-stable-win64");
         assert_eq!(profile.effective_saves_root, root.join("saves"));
         assert!(!profile.effective_saves_root.exists());
     }
@@ -725,6 +725,37 @@ mod tests {
         )
         .unwrap();
         assert!(resolve_retrobat_gb_profile(&root, &[]).is_ok());
+    }
+
+    #[test]
+    fn accepts_only_verified_retrobat_version_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = stock_fixture(dir.path());
+        let version_path = root.join("system/version.info");
+
+        fs::write(&version_path, " \t8.2.1-stable-win64 \r\n").unwrap();
+        let shipped = resolve_retrobat_gb_profile(&root, &[]).unwrap();
+        assert_eq!(shipped.version, "8.2.1-stable-win64");
+
+        fs::write(&version_path, "8.2.1\r\n").unwrap();
+        let legacy = resolve_retrobat_gb_profile(&root, &[]).unwrap();
+        assert_eq!(legacy.version, "8.2.1");
+
+        for marker in [
+            "8.3.0",
+            "8.2.1-beta",
+            "8.2.1-stable-linux64",
+            "8.2.1-stable-win32",
+            "8.2.1-stable-win64-extra",
+            "8.2.1-stable-win64-build.1",
+            "8.2.1-stable-win64.1",
+        ] {
+            fs::write(&version_path, marker).unwrap();
+            assert!(
+                resolve_retrobat_gb_profile(&root, &[]).is_err(),
+                "unexpectedly accepted RetroBat version marker {marker:?}"
+            );
+        }
     }
 
     #[test]

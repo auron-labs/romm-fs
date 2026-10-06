@@ -1,6 +1,8 @@
+name: rommfs-harness
+
 services:
   romm:
-    image: rommapp/romm:latest
+    image: rommapp/romm:5.3.1
     container_name: romm
     depends_on:
       romm-db:
@@ -24,7 +26,7 @@ services:
     restart: unless-stopped
 
   romm-db:
-    image: mariadb:latest
+    image: mariadb:11.8
     container_name: romm-db
     volumes:
       - romm_mysql_data:/var/lib/mysql

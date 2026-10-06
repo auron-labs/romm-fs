@@ -24,9 +24,9 @@ pub use mapping::{
     RETROBAT_GB_SRM_PROFILE,
 };
 pub use path::{
-    hold_save_directory_chain, path_is_reparse_point, resolve_save_target,
-    validate_relative_save_path, validate_windows_path_component, SaveDirectoryChainGuard,
-    MAX_SAVE_BYTES,
+    ensure_no_reparse_components, hold_save_directory_chain, path_is_reparse_point,
+    resolve_save_target, validate_relative_save_path, validate_windows_path_component,
+    SaveDirectoryChainGuard, MAX_SAVE_BYTES,
 };
 pub use preview::{
     preview_existing_saves, ExistingSavePreview, ExistingSaveScanStatus, ExistingSaveSkipCount,

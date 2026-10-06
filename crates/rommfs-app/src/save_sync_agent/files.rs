@@ -1,7 +1,7 @@
 use rommfs_core::error::{Error, Result};
 use rommfs_core::save_sync::{
-    hold_save_directory_chain, path_is_reparse_point, sha256_content_hash,
-    validate_windows_path_component, SaveSyncScope, MAX_SAVE_BYTES,
+    ensure_no_reparse_components, hold_save_directory_chain, path_is_reparse_point,
+    sha256_content_hash, validate_windows_path_component, SaveSyncScope, MAX_SAVE_BYTES,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -51,7 +51,7 @@ fn publish_no_clobber(
     let sibling = flushed_sibling_copy(staged, destination, expected_hash, &validate)?;
 
     // Revalidate at the atomic publication boundary, not just before staging.
-    if let Err(error) = validate().and_then(|()| reject_reparse_components(parent)) {
+    if let Err(error) = validate().and_then(|()| ensure_no_reparse_components(parent)) {
         let _ = fs::remove_file(&sibling);
         return Err(error);
     }
@@ -69,8 +69,8 @@ fn validate_save_destination(destination: &Path, approved_root: &Path) -> Result
     let parent = destination
         .parent()
         .ok_or_else(|| Error::Unsupported("save destination has no parent directory".into()))?;
-    reject_reparse_components(approved_root)?;
-    reject_reparse_components(parent)?;
+    ensure_no_reparse_components(approved_root)?;
+    ensure_no_reparse_components(parent)?;
     let canonical_root = fs::canonicalize(approved_root)?;
     let canonical_parent = fs::canonicalize(parent)?;
     let target = canonical_parent.join(
@@ -95,13 +95,13 @@ fn validate_export_destination(
     let parent = destination
         .parent()
         .ok_or_else(|| Error::Unsupported("incoming export has no parent directory".into()))?;
-    reject_reparse_components(parent)?;
+    ensure_no_reparse_components(parent)?;
     let canonical_parent = fs::canonicalize(parent)?;
     let canonical_target =
         canonical_parent.join(destination.file_name().ok_or_else(|| {
             Error::Unsupported("incoming export destination has no filename".into())
         })?);
-    reject_reparse_components(&scope.effective_saves_root)?;
+    ensure_no_reparse_components(&scope.effective_saves_root)?;
     let save_root = fs::canonicalize(&scope.effective_saves_root)?;
     if path_is_within(&canonical_target, &save_root)
         || mapped_targets.iter().any(|mapped| {
@@ -163,7 +163,7 @@ fn flushed_sibling_copy(
         .parent()
         .ok_or_else(|| Error::Unsupported("destination has no parent directory".into()))?;
     validate()?;
-    reject_reparse_components(parent)?;
+    ensure_no_reparse_components(parent)?;
 
     let source_metadata = fs::symlink_metadata(source)?;
     if !source_metadata.is_file() || path_is_reparse_point(&source_metadata) {
@@ -192,7 +192,7 @@ fn flushed_sibling_copy(
     // Check the approved root and every existing parent again immediately
     // before creating any sibling file at the user-selected destination.
     validate()?;
-    reject_reparse_components(parent)?;
+    ensure_no_reparse_components(parent)?;
     let name = destination
         .file_name()
         .ok_or_else(|| Error::Unsupported("destination has no filename".into()))?
@@ -254,25 +254,6 @@ fn atomic_create_only(source: &Path, destination: &Path) -> Result<()> {
         fs::remove_file(source)?;
         Ok(())
     }
-}
-
-fn reject_reparse_components(path: &Path) -> Result<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if path_is_reparse_point(&metadata) => {
-                return Err(Error::Unsupported(format!(
-                    "save path traverses a symbolic link or reparse point: {}",
-                    current.display()
-                )));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
 }
 
 fn sync_parent(path: &Path) -> Result<()> {
@@ -418,5 +399,43 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), b"emulator-created bytes");
         assert_eq!(fs::read(&staged).unwrap(), b"incoming bytes");
         assert!(!has_publication_sibling(&parent));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_canonicalized_save_paths_publish_without_replacing() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("saves");
+        let parent = root.join("gb");
+        fs::create_dir_all(&parent).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let canonical_parent = fs::canonicalize(&parent).unwrap();
+        let staged = directory.path().join("incoming.stage");
+        let destination = canonical_parent.join("Game.srm");
+        fs::write(&staged, b"canonicalized save bytes").unwrap();
+
+        publish_missing_save(
+            &staged,
+            &destination,
+            &sha256_content_hash(b"canonicalized save bytes"),
+            &canonical_root,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"canonicalized save bytes");
+
+        let replacement = directory.path().join("replacement.stage");
+        fs::write(&replacement, b"replacement bytes").unwrap();
+        assert!(publish_missing_save(
+            &replacement,
+            &destination,
+            &sha256_content_hash(b"replacement bytes"),
+            &canonical_root,
+            || Ok(()),
+        )
+        .is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"canonicalized save bytes");
+        assert!(!has_publication_sibling(&canonical_parent));
     }
 }
