@@ -1716,22 +1716,37 @@ fn check_mount_root(root: &Path, server_id: &str) -> Result<()> {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => {
-            return Err(Error::Unsupported(format!(
-                "cannot create mount directory {}: {e}",
+            return Err(mount_root_error(anyhow::Error::new(e).context(format!(
+                "cannot create mount directory {}",
                 root.display()
-            )))
+            ))))
         }
     }
     #[cfg(windows)]
-    rommfs_cfapi::check_prerequisites(root).map_err(|e| Error::Unsupported(format!("{e:#}")))?;
+    rommfs_cfapi::check_prerequisites(root).map_err(mount_root_error)?;
     rommfs_cfapi::check_mount_root(root, server_id)
         .map(|_| ())
-        .map_err(|e| Error::Unsupported(format!("{e:#}")))
+        .map_err(mount_root_error)
 }
 
 fn claim_mount_root(root: &Path, server_id: &str) -> Result<()> {
-    rommfs_cfapi::claim_mount_root(root, server_id)
-        .map_err(|e| Error::Unsupported(format!("{e:#}")))
+    rommfs_cfapi::claim_mount_root(root, server_id).map_err(mount_root_error)
+}
+
+fn mount_root_error(e: anyhow::Error) -> Error {
+    let mut message = format!("{e:#}");
+    if let Some(io) = e.downcast_ref::<std::io::Error>() {
+        let kind = io.kind();
+        if kind == std::io::ErrorKind::PermissionDenied {
+            message.push_str(
+                "; choose a mount directory whose parent is writable, such as \
+                 %USERPROFILE%\\RomM; RomMFS stores ownership and lock files beside the directory",
+            );
+        }
+        Error::Io(std::io::Error::new(kind, message))
+    } else {
+        Error::Unsupported(message)
+    }
 }
 
 #[cfg(windows)]
@@ -1759,8 +1774,7 @@ impl ActiveMount {
 /// Connect the Windows Cloud Files provider over the portable core.
 #[cfg(windows)]
 fn start_mount_backend(fs: Arc<RommFs>, root: &Path) -> Result<ActiveMount> {
-    let mount = rommfs_cfapi::WindowsMount::mount(fs, root)
-        .map_err(|e| Error::Unsupported(format!("{e:#}")))?;
+    let mount = rommfs_cfapi::WindowsMount::mount(fs, root).map_err(mount_root_error)?;
     Ok(ActiveMount {
         root: root.to_path_buf(),
         stop_fn: Box::new(move || mount.stop()),
@@ -1857,6 +1871,33 @@ mod tests {
     use rommfs_fixture::{FixtureBodyBarrier, FixtureSaveRecord, FixtureServer, ResponseSpec};
     use std::io::Write;
     use std::time::Duration;
+
+    #[test]
+    fn mount_root_errors_preserve_io_kind_context_and_permission_guidance() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+        ] {
+            let error = mount_root_error(
+                anyhow::Error::new(std::io::Error::new(kind, "filesystem failure"))
+                    .context("create ownership manifest C:\\RomM.rommfs-root"),
+            );
+            let Error::Io(io) = error else {
+                panic!("filesystem failures must remain I/O errors");
+            };
+            assert_eq!(io.kind(), kind);
+            let message = io.to_string();
+            assert!(message.contains("C:\\RomM.rommfs-root: filesystem failure"));
+            assert_eq!(
+                message.contains("parent is writable"),
+                kind == std::io::ErrorKind::PermissionDenied
+            );
+        }
+        assert!(matches!(
+            mount_root_error(anyhow::anyhow!("root is not empty")),
+            Error::Unsupported(_)
+        ));
+    }
 
     #[test]
     fn mount_root_is_created_and_existing_user_files_are_preserved() {
