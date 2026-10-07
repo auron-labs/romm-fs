@@ -182,6 +182,10 @@ impl UiState {
             AppEvent::Connected => {
                 self.conn = ConnState::Connected;
                 self.conn_error = None;
+                // A failed mount attempt belongs to the previous connection;
+                // keep it from rendering as a stale banner after reconnect.
+                self.mount = MountState::NotMounted;
+                self.mount_error = None;
             }
             AppEvent::ConnectFailed { reason } => {
                 self.conn = ConnState::Failed;
@@ -1941,6 +1945,20 @@ mod tests {
                 && line.message.contains("prepare and validate directory")
                 && line.message.contains("not empty"))));
         assert_eq!(std::fs::read(root.join("save.srm")).unwrap(), b"user data");
+    }
+
+    #[test]
+    fn connect_clears_a_stale_mount_failure() {
+        let mut state = UiState::new(32);
+        state.apply(&AppEvent::MountFailed {
+            reason: "connect to a RomM server before mounting".into(),
+        });
+        assert_eq!(state.mount, MountState::Failed);
+        assert!(state.mount_error.is_some());
+
+        state.apply(&AppEvent::Connected);
+        assert_eq!(state.mount, MountState::NotMounted);
+        assert!(state.mount_error.is_none());
     }
 
     #[cfg(unix)]

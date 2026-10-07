@@ -21,9 +21,9 @@ use gpui_kit::component::{
     StyledExt as _, Theme, ThemeMode,
 };
 use gpui_kit::{
-    actions, div, point, prelude::*, px, size, App, Bounds, ClipboardItem,
-    Context, Entity, Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollHandle,
-    SharedString, Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
+    actions, div, point, prelude::*, px, size, App, Bounds, ClipboardItem, Context, Entity,
+    Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollHandle, SharedString,
+    Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use rommfs_core::events::{AppEvent, Level, SaveSyncIncomingStatus};
 use rommfs_core::save_sync::{
