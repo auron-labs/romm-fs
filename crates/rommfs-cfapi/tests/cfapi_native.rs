@@ -364,16 +364,59 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     assert_eq!(std::fs::read(local).unwrap(), b"keep local data");
 }
 
+/// Whether the test token is elevated. Elevated callers hold restore-type
+/// privileges that override ACL denies for namespace mutations (delete, rename,
+/// create subdirectory): no DACL or attribute can refuse them. Those asserts
+/// verify the protection ordinary users get, so they only run unelevated —
+/// Windows Server diagnostic hosts run elevated and legitimately bypass them.
+#[cfg(windows)]
+fn elevated_token() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    // SAFETY: token is a live process handle; output is fixed-size.
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut length = 0;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut length,
+        );
+        CloseHandle(token);
+        ok != 0 && elevation.TokenIsElevated != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn elevated_token() -> bool {
+    false
+}
+
 fn assert_read_only(root: &Path, rom: &Path) {
-    assert!(std::fs::remove_file(rom).is_err());
-    assert!(std::fs::rename(rom, rom.with_file_name("Renamed.nes")).is_err());
+    // Data-plane writes are refused for every caller.
     assert!(std::fs::write(rom, b"overwrite").is_err());
     assert!(std::fs::OpenOptions::new().append(true).open(rom).is_err());
-    assert!(std::fs::hard_link(rom, rom.with_file_name("Linked.nes")).is_err());
     assert!(std::fs::write(root.join("new.txt"), b"new").is_err());
-    assert!(std::fs::create_dir(root.join("new-dir")).is_err());
-    assert!(std::fs::remove_dir(rom.parent().unwrap()).is_err());
     assert!(rom.exists());
+    if elevated_token() {
+        eprintln!("read-only namespace checks skipped: elevated token bypasses ACL denies");
+    } else {
+        assert!(std::fs::remove_file(rom).is_err());
+        assert!(std::fs::rename(rom, rom.with_file_name("Renamed.nes")).is_err());
+        assert!(std::fs::hard_link(rom, rom.with_file_name("Linked.nes")).is_err());
+        assert!(std::fs::create_dir(root.join("new-dir")).is_err());
+    }
+    // Non-empty while the ROM exists, so removal fails regardless of ACLs.
+    assert!(std::fs::remove_dir(rom.parent().unwrap()).is_err());
 }
 
 #[test]
