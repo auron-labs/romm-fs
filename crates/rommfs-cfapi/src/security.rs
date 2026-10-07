@@ -13,7 +13,14 @@ use windows_sys::Win32::Security::{
     PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 
-pub(crate) const READ_ONLY: &str = "D:P(A;OICI;FRFX;;;WD)(A;OICI;0x001600a9;;;OW)(A;OICI;FA;;;SY)";
+// The deny ACE must precede the allows: access checks walk the DACL in order.
+// Without it the OWNER_RIGHTS allow grants DELETE to the interactive user, so
+// "read-only" placeholders stayed deletable. Authenticated Users is denied
+// every data/namespace write (delete child, delete, write/append data, write
+// EA, write attributes) while SYSTEM and the implicit owner WRITE_DAC remain,
+// which is how allow_delete and CfCreatePlaceholders keep working.
+pub(crate) const READ_ONLY: &str =
+    "D:P(D;OICI;0x10156;;;AU)(A;OICI;FRFX;;;WD)(A;OICI;0x001600a9;;;OW)(A;OICI;FA;;;SY)";
 const DELETE_OWNED: &str = "D:P(A;;FRFX;;;WD)(A;;FA;;;OW)(A;;FA;;;SY)";
 
 struct Descriptor(*mut std::ffi::c_void);
