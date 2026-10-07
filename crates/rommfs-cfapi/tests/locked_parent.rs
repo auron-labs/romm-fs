@@ -132,6 +132,51 @@ fn mount_root_under_file_locked_parent_mounts_via_fallback_sidecars() {
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
 }
 
+/// Claiming through an 8.3 short-name alias must not strand the sidecars:
+/// the backend canonicalizes the root before reading, so the alias spelling
+/// and the resolved path have to name the same files. A junction or symlink
+/// root is refused as a reparse point, which makes the 8.3 name the one
+/// spelling that can reach claim and mount differently.
+#[test]
+fn claiming_through_a_short_name_alias_resolves_with_the_canonical_path() {
+    let base = tempfile::tempdir().unwrap();
+    let real = base.path().join("Long Name Root");
+    std::fs::create_dir(&real).unwrap();
+    // fsutil assigns an explicit 8.3 alias even where auto-generation is off.
+    let status = Command::new("fsutil")
+        .args(["file", "setshortname"])
+        .arg(&real)
+        .arg("LONRNA~1")
+        .output()
+        .expect("run fsutil setshortname");
+    if !status.status.success() {
+        eprintln!(
+            "short-name aliases unavailable on this host, skipping: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        return;
+    }
+    let alias = base.path().join("LONRNA~1");
+    assert!(alias.exists());
+    assert_eq!(
+        std::fs::canonicalize(&alias).unwrap(),
+        std::fs::canonicalize(&real).unwrap()
+    );
+
+    claim_mount_root(&alias, "server").unwrap();
+    assert!(
+        base.path().join("Long Name Root.rommfs-root").exists(),
+        "claim must land beside the canonical root, not the alias spelling"
+    );
+    assert!(
+        matches!(
+            check_mount_root(&real, "server").unwrap(),
+            RootCheck::RecognizedOwned
+        ),
+        "mount-path lookup must find a claim made through the alias"
+    );
+}
+
 /// With a writable parent the sidecars stay beside the root, preserving the
 /// layout earlier releases created and every existing claim relies on.
 #[test]

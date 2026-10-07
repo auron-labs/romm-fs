@@ -38,11 +38,18 @@ pub(crate) fn sibling(root: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
     Ok(root.with_file_name(name))
 }
 
+/// Resolve the root's canonical path so a claim made through one spelling
+/// (an 8.3 alias, a junction) is found by callers using another; the mount
+/// backend always canonicalizes before reading.
+fn canonical_root(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
 /// Per-user sidecar directory for roots whose parent rejects new files
 /// (e.g. `C:\`, where standard users may create directories but not files).
 /// Keyed by the canonical mount path so distinct roots never share entries.
 fn state_dir(root: &Path) -> anyhow::Result<PathBuf> {
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let canonical = canonical_root(root);
     let mut key = canonical.to_string_lossy().replace('/', "\\");
     key.make_ascii_lowercase();
     let hash = Sha256::digest(key.as_bytes());
@@ -71,13 +78,16 @@ fn fallback_sidecar(root: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
 
 /// Sidecars live beside the mount root when its parent accepts new files and
 /// under the per-user state store otherwise. An existing file wins either way
-/// so a claim survives the parent's permissions changing between mounts.
+/// so a claim survives the parent's permissions changing between mounts. The
+/// canonical root is used throughout so the input path's spelling — an 8.3
+/// short name or a junction — cannot make claim and mount disagree.
 pub(crate) fn sidecar_path(root: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
-    let primary = sibling(root, suffix)?;
+    let root = canonical_root(root);
+    let primary = sibling(&root, suffix)?;
     if primary.try_exists()? {
         return Ok(primary);
     }
-    let fallback = fallback_sidecar(root, suffix)?;
+    let fallback = fallback_sidecar(&root, suffix)?;
     if fallback.try_exists()? {
         return Ok(fallback);
     }
