@@ -1,13 +1,12 @@
 [tools]
 betterleaks = "1.9.0"
 "cargo:cargo-deny" = "0.20.2"
+"github:rui314/mold" = "3.0.0"
 hk = "2.5.0"
-node = "26.10.0"
 "npm:dclint" = "3.1.0"
+"npm:@ls-lint/ls-lint" = "2.3.1"
 pkl = "0.32.1"
 tombi = "1.7.2"
-"github:rui314/mold" = "2.42.1"
-"npm:ls-lint" = "0.1.2"
 
 [tools.rust]
 version = "1.99.0"
@@ -27,3 +26,6 @@ fmt = "cargo fmt --all"
 check = "hk check --all"
 fix = "hk fix"
 "hooks:install" = "hk install --mise"
+
+[env]
+BETTERLEAKS_CONFIG = "{{ config_root }}/.betterleaks.toml"

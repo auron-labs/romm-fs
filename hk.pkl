@@ -17,7 +17,6 @@ local linters = new Mapping<String, Step> {
   ["dclint"] = Builtins.dclint
   ["detect_private_key"] = Builtins.detect_private_key
   ["fix_smart_quotes"] = Builtins.fix_smart_quotes
-  ["ls_lint"] = Builtins.ls_lint
   ["mixed_line_ending"] = Builtins.mixed_line_ending
   ["newlines"] = Builtins.newlines
   ["pkl_format"] = Builtins.pkl_format
