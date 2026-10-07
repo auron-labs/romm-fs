@@ -9,20 +9,21 @@
 use crate::controller::{Command, ConnState, Controller, MountState, UiState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, Theme,
-    ThemeMode, h_flex, try_parse_color, v_flex,
     button::{Button, ButtonVariants as _},
     collapsible::Collapsible,
+    h_flex,
     input::{Input, InputContentType, InputEvent, InputState},
     label::Label,
     progress::Progress,
     select::{Select, SelectEvent, SelectState},
     separator::Separator,
+    try_parse_color, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
+    StyledExt as _, Theme, ThemeMode,
 };
 use gpui_kit::{
-    AppContext as _, KeyBinding, PathPromptOptions, SharedString, Subscription, actions, div,
-    point, prelude::*, px, size, App, Bounds, ClipboardItem, Context, Entity, Focusable as _,
-    FontWeight, Hsla, ScrollHandle, WeakEntity, Window, WindowBounds, WindowOptions,
+    actions, div, point, prelude::*, px, size, App, Bounds, ClipboardItem, Context, Entity,
+    Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollHandle, SharedString,
+    Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use rommfs_core::events::{AppEvent, Level, SaveSyncIncomingStatus};
 use rommfs_core::save_sync::{
@@ -118,12 +119,11 @@ fn field_column(label: &'static str, control: impl IntoElement, cx: &App) -> imp
         .child(control)
 }
 
-
 fn fmt_count(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -156,17 +156,23 @@ impl RommfsWindow {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (controller, event_rx) = Controller::spawn();
 
-        let url_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("http://romm.local:8080")
-        });
+        let url_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("http://romm.local:8080"));
         let user_input = cx.new(|cx| InputState::new(window, cx).placeholder("username"));
-        let password_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("password").masked(true));
-        let mount_input =
-            cx.new(|cx| InputState::new(window, cx).default_value("C:\\RomM"));
-        let install_select = cx.new(|cx| {
-            SelectState::new(Vec::<SharedString>::new(), None, window, cx)
+        let password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("password")
+                .masked(true)
         });
+        // Drive roots reject directory creation for standard users on many
+        // systems; the profile directory is always writable.
+        let default_mount = std::env::var_os("USERPROFILE")
+            .map(|profile| std::path::PathBuf::from(profile).join("RomM"))
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "C:\\RomM".to_string());
+        let mount_input = cx.new(|cx| InputState::new(window, cx).default_value(default_mount));
+        let install_select =
+            cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
         let debounce_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string())
@@ -204,18 +210,13 @@ impl RommfsWindow {
                 {
                     return;
                 }
-                if let Some(candidate) = view
-                    .state
-                    .save_sync_candidates
-                    .iter()
-                    .find(|candidate| {
-                        candidate
-                            .info
-                            .install_root
-                            .to_string_lossy()
-                            .eq_ignore_ascii_case(&value)
-                    })
-                {
+                if let Some(candidate) = view.state.save_sync_candidates.iter().find(|candidate| {
+                    candidate
+                        .info
+                        .install_root
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&value)
+                }) {
                     let path = candidate.info.install_root.clone();
                     view.controller
                         .send(Command::SelectSaveSyncInstallation { path });
@@ -236,13 +237,15 @@ impl RommfsWindow {
 
         // Worker events arrive on the channel; poll it on the UI executor —
         // every applied event is a real fact, nothing fabricated (R5).
-        cx.spawn_in(window, async move |this: WeakEntity<RommfsWindow>, cx| loop {
-            cx.background_executor().timer(POLL_INTERVAL).await;
-            if this
-                .update_in(cx, |view, window, cx| view.drain_events(window, cx))
-                .is_err()
-            {
-                break;
+        cx.spawn_in(window, async move |this: WeakEntity<RommfsWindow>, cx| {
+            loop {
+                cx.background_executor().timer(POLL_INTERVAL).await;
+                if this
+                    .update_in(cx, |view, window, cx| view.drain_events(window, cx))
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -285,14 +288,10 @@ impl RommfsWindow {
             }
             match &event {
                 AppEvent::SaveSyncSessionChanged { .. } => {
-                    if self.debounce_input.read(cx).value().to_string()
-                        == self.debounce_input_applied
-                    {
-                        let default =
-                            rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string();
-                        self.debounce_input.update(cx, |input, cx| {
-                            input.set_value(default.clone(), window, cx)
-                        });
+                    if self.debounce_input.read(cx).value() == self.debounce_input_applied {
+                        let default = rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string();
+                        self.debounce_input
+                            .update(cx, |input, cx| input.set_value(default.clone(), window, cx));
                         self.debounce_input_applied = default;
                     }
                     self.debounce_error = None;
@@ -304,7 +303,7 @@ impl RommfsWindow {
                 } if *session_id == self.state.save_sync_session_id => {
                     let previous = self.debounce_input_applied.clone();
                     let next = debounce_secs.to_string();
-                    if self.debounce_input.read(cx).value().to_string() == previous {
+                    if self.debounce_input.read(cx).value() == previous {
                         self.debounce_input
                             .update(cx, |input, cx| input.set_value(next.clone(), window, cx));
                     }
@@ -520,7 +519,7 @@ impl RommfsWindow {
             .state
             .log
             .lines()
-            .map(|l| format_log_line(l))
+            .map(format_log_line)
             .collect::<Vec<_>>()
             .join("\n");
         cx.write_to_clipboard(ClipboardItem::new_string(body));
@@ -537,10 +536,7 @@ impl RommfsWindow {
                 if user.is_empty() {
                     ("Connected".into(), StatusKind::Success)
                 } else {
-                    (
-                        format!("Connected · {user}").into(),
-                        StatusKind::Success,
-                    )
+                    (format!("Connected · {user}").into(), StatusKind::Success)
                 }
             }
             ConnState::Failed => ("Connection failed".into(), StatusKind::Danger),
@@ -679,23 +675,16 @@ impl RommfsWindow {
                 h_flex()
                     .gap_3()
                     .items_end()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(field_column(
-                                "Server URL",
-                                Input::new(&self.url_input).w_full(),
-                                cx,
-                            )),
-                    )
-                    .child(
-                        div().w_48().child(field_column(
-                            "Username",
-                            Input::new(&self.user_input).w_full(),
-                            cx,
-                        )),
-                    )
+                    .child(div().flex_1().min_w_0().child(field_column(
+                        "Server URL",
+                        Input::new(&self.url_input).w_full(),
+                        cx,
+                    )))
+                    .child(div().w_48().child(field_column(
+                        "Username",
+                        Input::new(&self.user_input).w_full(),
+                        cx,
+                    )))
                     .child(
                         div().w_48().child(field_column(
                             "Password",
@@ -798,7 +787,10 @@ impl RommfsWindow {
             .as_deref()
             .map(|version| format!("RetroBat {version} · RetroArch / Gambatte · Game Boy"))
             .unwrap_or_else(|| "RetroBat profile not verified".into());
-        let scope = match (&self.state.save_sync_server_id, self.state.save_sync_account_id) {
+        let scope = match (
+            &self.state.save_sync_server_id,
+            self.state.save_sync_account_id,
+        ) {
             (Some(server), Some(account)) => format!(
                 "Server: {server} · Account: {} (ID {account})",
                 self.user_input.read(cx).value()
@@ -857,27 +849,19 @@ impl RommfsWindow {
                 h_flex()
                     .gap_3()
                     .items_center()
+                    .child(div().w_40().flex_shrink_0().child("RetroBat installation"))
                     .child(
-                        div()
-                            .w_40()
-                            .flex_shrink_0()
-                            .child("RetroBat installation"),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                Select::new(&self.install_select)
-                                    .w_full()
-                                    .accessibility_label("RetroBat installation")
-                                    .placeholder(if has_candidates {
-                                        "Select a RetroBat installation…"
-                                    } else {
-                                        "No RetroBat installations found"
-                                    })
-                                    .disabled(!has_candidates),
-                            ),
+                        div().flex_1().min_w_0().child(
+                            Select::new(&self.install_select)
+                                .w_full()
+                                .accessibility_label("RetroBat installation")
+                                .placeholder(if has_candidates {
+                                    "Select a RetroBat installation…"
+                                } else {
+                                    "No RetroBat installations found"
+                                })
+                                .disabled(!has_candidates),
+                        ),
                     )
                     .child(
                         Button::new("save-sync-browse")
@@ -916,16 +900,12 @@ impl RommfsWindow {
             )
             .child(muted(profile, cx))
             .child(muted(scope, cx))
-            .child(
-                div()
-                    .text_sm()
-                    .child(format!(
-                        "{} mapped games · {} supported saves · {} skipped files",
-                        fmt_count(self.state.save_sync_mapped_targets),
-                        supported,
-                        skipped,
-                    )),
-            )
+            .child(div().text_sm().child(format!(
+                "{} mapped games · {} supported saves · {} skipped files",
+                fmt_count(self.state.save_sync_mapped_targets),
+                supported,
+                skipped,
+            )))
             .child(self.render_mapping_disclosure(window, cx))
             .child(muted(
                 "Existing saves are never replaced. Incoming differences are kept for review.",
@@ -993,22 +973,18 @@ impl RommfsWindow {
             h_flex()
                 .gap_3()
                 .items_end()
-                .child(
-                    div().w_32().child(field_column(
-                        "Debounce (seconds)",
-                        Input::new(&self.debounce_input).w_full().small(),
-                        cx,
-                    )),
-                )
+                .child(div().w_32().child(field_column(
+                    "Debounce (seconds)",
+                    Input::new(&self.debounce_input).w_full().small(),
+                    cx,
+                )))
                 .child(
                     Button::new("save-sync-apply-debounce")
                         .label("Apply")
                         .outline()
                         .small()
                         .disabled(!can_apply_debounce)
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            view.apply_save_sync_debounce(cx)
-                        })),
+                        .on_click(cx.listener(|view, _, _, cx| view.apply_save_sync_debounce(cx))),
                 ),
         );
 
@@ -1047,7 +1023,11 @@ impl RommfsWindow {
                             queue.attention_games,
                         )),
                 );
-            if let Some(failure) = queue.failure.clone().or(self.state.save_sync_failure.clone()) {
+            if let Some(failure) = queue
+                .failure
+                .clone()
+                .or(self.state.save_sync_failure.clone())
+            {
                 detail = detail.child(error_line(format!("Last failure: {failure}"), cx));
             }
             if let Some(problem) = self.state.save_sync_problem.clone() {
@@ -1068,11 +1048,10 @@ impl RommfsWindow {
                     game.remote_id.as_deref().unwrap_or("none"),
                     game.remote_hash.as_deref().unwrap_or("unknown"),
                 );
-                let mut row = v_flex().child(
-                    div()
-                        .text_xs()
-                        .child(format!("{} (ROM {}) · {hashes}", game.rom_name, game.rom_id)),
-                );
+                let mut row = v_flex().child(div().text_xs().child(format!(
+                    "{} (ROM {}) · {hashes}",
+                    game.rom_name, game.rom_id
+                )));
                 if let Some(issue) = &game.issue {
                     row = row.child(
                         div()
@@ -1119,19 +1098,15 @@ impl RommfsWindow {
             .cloned();
         let mut row = v_flex()
             .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .child(format!(
-                        "{} · RomM save {} · pending revision {} · {} · {} · {}",
-                        incoming.rom_name,
-                        incoming.remote_id,
-                        incoming.incoming_id,
-                        incoming.state,
-                        incoming.reason,
-                        incoming.content_hash,
-                    )),
-            )
+            .child(div().text_xs().child(format!(
+                "{} · RomM save {} · pending revision {} · {} · {} · {}",
+                incoming.rom_name,
+                incoming.remote_id,
+                incoming.incoming_id,
+                incoming.state,
+                incoming.reason,
+                incoming.content_hash,
+            )))
             .child(
                 Button::new(format!("export-{}", incoming.incoming_id))
                     .label("Export…")
@@ -1207,7 +1182,9 @@ impl RommfsWindow {
         let (status_text, status_kind) = match &download.finished {
             None => (
                 match download.total {
-                    Some(total) => format!("{} / {}", fmt_bytes(download.received), fmt_bytes(total)),
+                    Some(total) => {
+                        format!("{} / {}", fmt_bytes(download.received), fmt_bytes(total))
+                    }
                     None => format!("{} —", fmt_bytes(download.received)),
                 },
                 StatusKind::Muted,
@@ -1343,7 +1320,12 @@ fn fmt_time(unix_secs: u64) -> String {
 
 fn format_log_line(line: &rommfs_core::events::LogLine) -> String {
     if line.op.is_empty() {
-        format!("{} {:<5} {}", fmt_time(line.unix_secs), level_str(line.level), line.message)
+        format!(
+            "{} {:<5} {}",
+            fmt_time(line.unix_secs),
+            level_str(line.level),
+            line.message
+        )
     } else {
         format!(
             "{} {:<5} [{}] {}",
@@ -1368,11 +1350,11 @@ fn render_log_line(line: &rommfs_core::events::LogLine, cx: &App) -> impl IntoEl
     } else {
         format!("[{}] {}", line.op, line.message)
     };
-    h_flex().gap_2().child(time).child(level).child(
-        div()
-            .text_color(cx.theme().foreground)
-            .child(body),
-    )
+    h_flex()
+        .gap_2()
+        .child(time)
+        .child(level)
+        .child(div().text_color(cx.theme().foreground).child(body))
 }
 
 fn fmt_bytes(n: u64) -> String {

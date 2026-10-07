@@ -182,6 +182,10 @@ impl UiState {
             AppEvent::Connected => {
                 self.conn = ConnState::Connected;
                 self.conn_error = None;
+                // A failed mount attempt belongs to the previous connection;
+                // keep it from rendering as a stale banner after reconnect.
+                self.mount = MountState::NotMounted;
+                self.mount_error = None;
             }
             AppEvent::ConnectFailed { reason } => {
                 self.conn = ConnState::Failed;
@@ -1709,24 +1713,66 @@ fn check_mount_root(root: &Path, server_id: &str) -> Result<()> {
         .ok_or_else(|| {
             Error::Unsupported("choose a mount directory below an existing parent directory".into())
         })?;
-    let _guard = rommfs_core::save_sync::hold_save_directory_chain(parent).map_err(|e| {
-        Error::Unsupported(format!("protect mount parent {}: {e}", parent.display()))
+    // Guard the existing ancestor chain before mutating anything: creating
+    // under a link or reparse point would mutate its target, not the path the
+    // user chose.
+    let existing = parent
+        .ancestors()
+        .find(|path| path.exists())
+        .ok_or_else(|| {
+            Error::Unsupported("choose a mount directory below an existing parent directory".into())
+        })?;
+    let _guard = rommfs_core::save_sync::hold_save_directory_chain(existing).map_err(|e| {
+        Error::Unsupported(format!("protect mount parent {}: {e}", existing.display()))
     })?;
-    match std::fs::create_dir(root) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => {
-            return Err(mount_root_error(anyhow::Error::new(e).context(format!(
-                "cannot create mount directory {}",
-                root.display()
-            ))))
-        }
+    if let Err(e) = create_mount_dir_chain(existing, root) {
+        return Err(mount_root_error(anyhow::Error::new(e).context(format!(
+            "cannot create mount directory {}",
+            root.display()
+        ))));
     }
     #[cfg(windows)]
     rommfs_cfapi::check_prerequisites(root).map_err(mount_root_error)?;
     rommfs_cfapi::check_mount_root(root, server_id)
         .map(|_| ())
         .map_err(mount_root_error)
+}
+
+/// Create every missing component from `existing` down to `root`, rejecting an
+/// existing component that is a link, reparse point, or non-directory before
+/// it can be followed — `create_dir_all` alone would silently create into a
+/// link's target. Each new component is held so a racing process cannot swap
+/// it for a link before the next level is created.
+fn create_mount_dir_chain(existing: &Path, root: &Path) -> Result<()> {
+    let mut _created = Vec::new();
+    let mut current = existing.to_path_buf();
+    let suffix = root.strip_prefix(existing).unwrap_or(root);
+    for component in suffix.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || rommfs_core::save_sync::path_is_reparse_point(&metadata) {
+                    return Err(Error::Unsupported(format!(
+                        "mount path traverses a symbolic link or reparse point: {}",
+                        current.display()
+                    )));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(Error::Io)?;
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+        _created.push(
+            rommfs_core::save_sync::hold_save_directory_chain(&current).map_err(|e| {
+                Error::Unsupported(format!(
+                    "protect mount directory {}: {e}",
+                    current.display()
+                ))
+            })?,
+        );
+    }
+    Ok(())
 }
 
 fn claim_mount_root(root: &Path, server_id: &str) -> Result<()> {
@@ -1739,8 +1785,7 @@ fn mount_root_error(e: anyhow::Error) -> Error {
         let kind = io.kind();
         if kind == std::io::ErrorKind::PermissionDenied {
             message.push_str(
-                "; choose a mount directory whose parent is writable, such as \
-                 %USERPROFILE%\\RomM; RomMFS stores ownership and lock files beside the directory",
+                "; choose a mount directory you can create and own, such as %USERPROFILE%\\RomM",
             );
         }
         Error::Io(std::io::Error::new(kind, message))
@@ -1889,7 +1934,7 @@ mod tests {
             let message = io.to_string();
             assert!(message.contains("C:\\RomM.rommfs-root: filesystem failure"));
             assert_eq!(
-                message.contains("parent is writable"),
+                message.contains("%USERPROFILE%\\RomM"),
                 kind == std::io::ErrorKind::PermissionDenied
             );
         }
@@ -1947,6 +1992,20 @@ mod tests {
         assert_eq!(std::fs::read(root.join("save.srm")).unwrap(), b"user data");
     }
 
+    #[test]
+    fn connect_clears_a_stale_mount_failure() {
+        let mut state = UiState::new(32);
+        state.apply(&AppEvent::MountFailed {
+            reason: "connect to a RomM server before mounting".into(),
+        });
+        assert_eq!(state.mount, MountState::Failed);
+        assert!(state.mount_error.is_some());
+
+        state.apply(&AppEvent::Connected);
+        assert_eq!(state.mount, MountState::NotMounted);
+        assert!(state.mount_error.is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn mount_root_creation_rejects_linked_ancestors() {
@@ -1955,6 +2014,28 @@ mod tests {
         let link = tmp.path().join("link");
         std::fs::create_dir(&target).unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(check_mount_root(&link.join("roms"), "server").is_err());
+        assert!(!target.join("roms").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mount_root_creation_rejects_junction_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .expect("mklink junction");
+        assert!(
+            output.status.success(),
+            "junction creation failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
         assert!(check_mount_root(&link.join("roms"), "server").is_err());
         assert!(!target.join("roms").exists());
     }

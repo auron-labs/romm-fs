@@ -29,7 +29,7 @@ tempfile.workspace = true
 
 # Windows-only platform APIs
 [target."cfg(windows)".dependencies]
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Security"] }
 
 [features]
 default = ["ui"]

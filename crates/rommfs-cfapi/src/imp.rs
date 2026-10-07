@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
-    ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, STATUS_CLOUD_FILE_ACCESS_DENIED,
+    ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, ERROR_INVALID_FUNCTION, STATUS_CLOUD_FILE_ACCESS_DENIED,
     STATUS_CLOUD_FILE_REQUEST_ABORTED, STATUS_CLOUD_FILE_UNSUCCESSFUL,
 };
 use windows_sys::Win32::Storage::CloudFilters::*;
@@ -294,7 +294,8 @@ impl WindowsMount {
         root::check_directory(root.as_ref())?;
         let root = std::fs::canonicalize(root.as_ref())?;
         check_prerequisites(&root)?;
-        let lock_path = root::sibling(&root, ".rommfs-lock")?;
+        let lock_path = root::sidecar_path(&root, ".rommfs-lock")?;
+        std::fs::create_dir_all(lock_path.parent().context("missing parent")?)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -579,8 +580,12 @@ fn registration_flags(root: &Path, identity: &str) -> anyhow::Result<CF_REGISTER
         );
         flags |= CF_REGISTER_FLAG_UPDATE;
     } else {
+        // Windows Server reports ERROR_INVALID_FUNCTION where client Windows
+        // reports ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT for a directory that is
+        // not registered; both mean "not under a sync root".
         let not_registered = (0x80070000u32 | ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT) as i32;
-        if existing != not_registered {
+        let server_not_registered = (0x80070000u32 | ERROR_INVALID_FUNCTION) as i32;
+        if existing != not_registered && existing != server_not_registered {
             hr(existing, "inspect existing sync root")?;
         }
     }
