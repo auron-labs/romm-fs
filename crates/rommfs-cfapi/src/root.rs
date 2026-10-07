@@ -1,6 +1,7 @@
 use anyhow::Context;
 use rommfs_core::save_sync::validate_windows_path_component;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -37,8 +38,64 @@ pub(crate) fn sibling(root: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
     Ok(root.with_file_name(name))
 }
 
+/// Per-user sidecar directory for roots whose parent rejects new files
+/// (e.g. `C:\`, where standard users may create directories but not files).
+/// Keyed by the canonical mount path so distinct roots never share entries.
+fn state_dir(root: &Path) -> anyhow::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut key = canonical.to_string_lossy().replace('/', "\\");
+    key.make_ascii_lowercase();
+    let hash = Sha256::digest(key.as_bytes());
+    let mut tag = String::with_capacity(16);
+    for byte in &hash[..8] {
+        tag.push_str(&format!("{byte:02x}"));
+    }
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    Ok(base.join("rommfs").join("mounts").join(tag))
+}
+
+fn fallback_sidecar(root: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
+    let mut name = root
+        .file_name()
+        .context("choose a directory below a volume root")?
+        .to_os_string();
+    name.push(suffix);
+    Ok(state_dir(root)?.join(name))
+}
+
+/// Sidecars live beside the mount root when its parent accepts new files and
+/// under the per-user state store otherwise. An existing file wins either way
+/// so a claim survives the parent's permissions changing between mounts.
+pub(crate) fn sidecar_path(root: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
+    let primary = sibling(root, suffix)?;
+    if primary.try_exists()? {
+        return Ok(primary);
+    }
+    let fallback = fallback_sidecar(root, suffix)?;
+    if fallback.try_exists()? {
+        return Ok(fallback);
+    }
+    let parent = primary.parent().context("missing parent")?;
+    match tempfile::NamedTempFile::new_in(parent) {
+        Ok(_) => Ok(primary),
+        Err(_) => Ok(fallback),
+    }
+}
+
+/// Parent directory of the marker may not exist yet for fallback paths.
+fn ensure_parent(path: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(path.parent().context("missing parent")?)?;
+    Ok(())
+}
+
 pub(crate) fn read_manifest(root: &Path) -> anyhow::Result<Manifest> {
-    let marker = sibling(root, ".rommfs-root")?;
+    let marker = sidecar_path(root, ".rommfs-root")?;
     let bytes = fs::read(&marker)
         .with_context(|| format!("read ownership manifest {}", marker.display()))?;
     // Old WinFsp markers identify a server, but authorize no persistent files.
@@ -86,7 +143,8 @@ fn validate_manifest(manifest: &Manifest) -> anyhow::Result<()> {
 #[cfg(windows)]
 pub(crate) fn write_manifest(root: &Path, manifest: &Manifest) -> anyhow::Result<()> {
     validate_manifest(manifest)?;
-    let marker = sibling(root, ".rommfs-root")?;
+    let marker = sidecar_path(root, ".rommfs-root")?;
+    ensure_parent(&marker)?;
     let mut file = tempfile::NamedTempFile::new_in(marker.parent().context("missing parent")?)?;
     serde_json::to_writer(file.as_file_mut(), manifest)?;
     file.as_file().sync_all()?;
@@ -185,7 +243,8 @@ pub fn claim_mount_root(root: &Path, server_id: &str) -> anyhow::Result<()> {
     ) {
         return Ok(());
     }
-    let marker = sibling(root, ".rommfs-root")?;
+    let marker = sidecar_path(root, ".rommfs-root")?;
+    ensure_parent(&marker)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)

@@ -1709,19 +1709,16 @@ fn check_mount_root(root: &Path, server_id: &str) -> Result<()> {
         .ok_or_else(|| {
             Error::Unsupported("choose a mount directory below an existing parent directory".into())
         })?;
+    // Create missing parents first so the guard below can hold the whole chain.
+    if let Err(e) = std::fs::create_dir_all(root) {
+        return Err(mount_root_error(anyhow::Error::new(e).context(format!(
+            "cannot create mount directory {}",
+            root.display()
+        ))));
+    }
     let _guard = rommfs_core::save_sync::hold_save_directory_chain(parent).map_err(|e| {
         Error::Unsupported(format!("protect mount parent {}: {e}", parent.display()))
     })?;
-    match std::fs::create_dir(root) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => {
-            return Err(mount_root_error(anyhow::Error::new(e).context(format!(
-                "cannot create mount directory {}",
-                root.display()
-            ))))
-        }
-    }
     #[cfg(windows)]
     rommfs_cfapi::check_prerequisites(root).map_err(mount_root_error)?;
     rommfs_cfapi::check_mount_root(root, server_id)
@@ -1739,8 +1736,7 @@ fn mount_root_error(e: anyhow::Error) -> Error {
         let kind = io.kind();
         if kind == std::io::ErrorKind::PermissionDenied {
             message.push_str(
-                "; choose a mount directory whose parent is writable, such as \
-                 %USERPROFILE%\\RomM; RomMFS stores ownership and lock files beside the directory",
+                "; choose a mount directory you can create and own, such as %USERPROFILE%\\RomM",
             );
         }
         Error::Io(std::io::Error::new(kind, message))
@@ -1889,7 +1885,7 @@ mod tests {
             let message = io.to_string();
             assert!(message.contains("C:\\RomM.rommfs-root: filesystem failure"));
             assert_eq!(
-                message.contains("parent is writable"),
+                message.contains("%USERPROFILE%\\RomM"),
                 kind == std::io::ErrorKind::PermissionDenied
             );
         }
