@@ -305,14 +305,22 @@ impl SaveSyncScheduler {
                 (Some(generation), Some(hash)) => Ok(Some((generation, hash))),
                 _ => journal
                     .observe_local_save(&pending.mapping)
-                    .map(
-                        |observation| match (observation.present, observation.content_hash) {
-                            (true, Some(hash)) if observation.changed => {
-                                Some((observation.generation, hash))
+                    .and_then(|observation| {
+                        match (observation.present, observation.content_hash) {
+                            (true, Some(hash)) => {
+                                // Reconciliation can observe a write before its
+                                // watcher hint is processed. Capture the durable
+                                // dirty generation even if this hash is unchanged.
+                                let uncaptured = observation.changed
+                                    || journal
+                                        .dirty_mappings()?
+                                        .iter()
+                                        .any(|mapping| mapping.rom_key == pending.mapping.rom_key);
+                                Ok(uncaptured.then_some((observation.generation, hash)))
                             }
-                            _ => None,
-                        },
-                    ),
+                            _ => Ok(None),
+                        }
+                    }),
             };
             let Some((generation, content_hash)) = (match observed {
                 Ok(observed) => observed,
@@ -411,6 +419,8 @@ mod tests {
             missing_from_fs: false,
             is_physical: false,
             updated_at: String::new(),
+            metadata: Default::default(),
+            fs_path: String::new(),
             files: vec![RomFileDto {
                 id: file_id,
                 file_name: name.into(),
@@ -420,6 +430,8 @@ mod tests {
                 md5_hash: None,
                 sha1_hash: None,
                 is_top_level: true,
+                file_path: String::new(),
+                category: None,
             }],
         };
         let catalogue =
@@ -465,6 +477,42 @@ mod tests {
                 .unwrap();
         }
         (journal, vec![first, second])
+    }
+
+    #[test]
+    fn watcher_hint_captures_a_generation_already_observed_by_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut journal, mappings) = setup(dir.path());
+        let mapping = &mappings[0];
+        let first = journal.observe_local_save(mapping).unwrap();
+        journal
+            .capture_snapshot(
+                mapping,
+                first.generation,
+                first.content_hash.as_deref().unwrap(),
+            )
+            .unwrap();
+        fs::write(&mapping.target_path, b"next-save-generation").unwrap();
+        // The actor may reconcile the live file before processing its queued
+        // watcher hint. Unchanged since observation does not mean captured.
+        let next = journal.observe_local_save(mapping).unwrap();
+        let now = Instant::now();
+        let mut scheduler = SaveSyncScheduler::with_seconds(0);
+        scheduler.hint(mapping, now);
+        let captured = scheduler.capture_due(&mut journal, now);
+        assert_eq!(
+            captured.len(),
+            1,
+            "an observed but uncaptured generation must not be stranded"
+        );
+        let snapshot = captured[0].1.as_ref().unwrap();
+        assert_eq!(snapshot.generation, next.generation);
+        assert_eq!(fs::read(&snapshot.path).unwrap(), b"next-save-generation");
+        scheduler.hint(mapping, now);
+        assert!(
+            scheduler.capture_due(&mut journal, now).is_empty(),
+            "an already captured generation must not be duplicated"
+        );
     }
 
     #[test]

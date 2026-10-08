@@ -37,6 +37,8 @@ fn mapping() -> SaveMapping {
             missing_from_fs: false,
             is_physical: false,
             updated_at: String::new(),
+            metadata: Default::default(),
+            fs_path: String::new(),
             files: vec![RomFileDto {
                 id: 120,
                 file_name: "Tetris.gb".into(),
@@ -46,6 +48,8 @@ fn mapping() -> SaveMapping {
                 md5_hash: None,
                 sha1_hash: None,
                 is_top_level: true,
+                file_path: String::new(),
+                category: None,
             }],
         }],
         |_| {},

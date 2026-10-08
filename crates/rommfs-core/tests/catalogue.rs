@@ -86,7 +86,7 @@ fn single_file_roms_become_visible_entries() {
 }
 
 #[test]
-fn multi_file_roms_are_skipped_and_counted() {
+fn multi_file_roms_keep_individual_original_files() {
     let mut warned = Vec::new();
     let cat = build_catalogue(
         "srv",
@@ -99,9 +99,13 @@ fn multi_file_roms_are_skipped_and_counted() {
     )
     .unwrap();
 
-    assert_eq!(cat.skipped_unsupported, 1);
-    assert_eq!(entry_names(&cat, "psx"), vec!["Single.bin"]);
-    assert!(!warned.is_empty(), "a skip must be logged");
+    assert_eq!(cat.skipped_unsupported, 0);
+    assert_eq!(
+        entry_names(&cat, "psx"),
+        vec!["Single.bin", "disc.bin", "disc.cue"]
+    );
+    assert_eq!(cat.entries.iter().filter(|e| e.key.rom_id == 20).count(), 2);
+    assert!(warned.is_empty());
 }
 
 #[test]

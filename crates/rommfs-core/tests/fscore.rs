@@ -57,6 +57,8 @@ fn rom(rom_id: i64, file_id: i64, name: &str, size: u64, sha1: &str) -> RomDto {
         missing_from_fs: false,
         is_physical: true,
         updated_at: "2026-10-01T00:00:00".into(),
+        metadata: Default::default(),
+        fs_path: String::new(),
         files: vec![RomFileDto {
             id: file_id,
             file_name: name.into(),
@@ -66,6 +68,8 @@ fn rom(rom_id: i64, file_id: i64, name: &str, size: u64, sha1: &str) -> RomDto {
             md5_hash: None,
             sha1_hash: Some(sha1.into()),
             is_top_level: true,
+            file_path: String::new(),
+            category: None,
         }],
     }
 }

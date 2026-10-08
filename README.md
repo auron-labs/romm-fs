@@ -2,19 +2,23 @@
 
 Windows-first proof of concept that mounts a [RomM](https://romm.app)
 library as ordinary filesystem paths (e.g. `C:\RomM\nes\Example Game.nes`)
-so frontends like ES-DE discover ROMs like a normal ROM folder — while ROM
+with **Generic folders** and **RetroBat** layouts — while ROM
 bytes only download the first time something actually reads them.
 
 Built as a Rust workspace; uses Windows' built-in **Cloud Files API (CFAPI)**
 through a custom `windows-sys` adapter and shows one small **GPUI** window.
 No separately installed filesystem driver or ProjFS optional feature is required.
-The native Windows build and runtime workflow are **not yet verified**.
+This checkout is under development. Native Windows runtime behavior is **not
+yet verified**; portable tests and cross-target checking are not runtime evidence.
+Installer automation, generalized save sync, external BIOS/cheat materialization,
+and tray/start-at-login remain unfinished. See
+[implementation status](.planning/IMPLEMENTATION-STATUS.md).
 
 ## Workspace
 
 | crate | role |
 |---|---|
-| `rommfs-core` | RomM HTTP client, catalogue→inode tree, sanitization, SQLite cache index, atomic download manager, eviction policy, `RommFs` facade. No Windows APIs — all unit tests run headless. |
+| `rommfs-core` | RomM client, portable catalogue/cache/save logic, RetroBat setup/metadata, and a Windows-only Credential Manager adapter. Portable tests run headless. |
 | `rommfs-fixture` | In-process HTTP fixture server implementing the verified RomM 5.3.1 contract for tests (route hit counters prove no-download-on-listing, single-flight downloads). |
 | `rommfs-cfapi` | CFAPI adapter: NTFS placeholders, lazy hydration, read-only ACLs, safe dehydration, and ownership validation. |
 | `rommfs-app` | The GPUI window + headless controller (connect → catalogue → mount, live download progress, bounded log). |
@@ -31,7 +35,9 @@ The native Windows build and runtime workflow are **not yet verified**.
   requires Rust 1.89)
 - A reachable RomM server. Tested against **RomM 5.3.1** — see
   `.planning/API-CONTRACT.md` for the verified API surface (token grant,
-  `/api/platforms`, `/api/roms` pagination, `/api/roms/{id}/content/{name}`).
+   `/api/platforms`, `/api/roms` pagination and individual original-file content).
+   Pairing and metadata extensions are source-backed and fixture-tested, not
+   live-validated against that original instance.
 
 ## Run
 
@@ -39,7 +45,9 @@ The native Windows build and runtime workflow are **not yet verified**.
 cargo run -p rommfs-app
 ```
 
-Enter the server URL + credentials, press **Connect**, choose a mount root
+Enter the server URL and choose **Sign in with browser**. Approve the pairing
+in RomM. Windows remembers the paired secret in Credential Manager; password
+sign-in remains available but is not remembered. Choose a mount root
 (an empty directory, or one RomMFS previously claimed), press **Start**.
 The ownership marker is stored beside the mount directory as
 `<folder>.rommfs-root`; keep it for subsequent mounts.
@@ -50,8 +58,19 @@ native sharing/dehydration failures defer eviction while files are in use.
 While mounted, NTFS also stores hydrated ROM bytes; eviction must dehydrate
 that copy before removing the private cache. Allow disk space for both copies.
 
-Closing the window stops the mount — there is no tray/background process,
-and no credentials are ever persisted or logged.
+Closing the window currently stops the mount; tray/start-at-login is not yet
+implemented. Passwords and tokens are never logged. Logout removes the remembered
+sign-in and cancels its active work.
+
+Authentication precedes cached-catalogue restoration. A warm connection uses the
+last complete account-scoped snapshot and schedules one background refresh.
+**Refresh catalogue** also requests fresh metadata. Starting/remounting reuses the
+loaded catalogue rather than fetching it twice. Structural changes take effect
+on the next mount; a failed refresh retains the previous complete snapshot.
+
+The **Activity** view shows transfers and diagnostics. **Settings → Open log
+folder** opens `%LOCALAPPDATA%\rommfs\logs`. Logs rotate at 2 MiB with three
+archives; relevant paths, IDs and error stages are retained, not sign-in secrets.
 
 ## Test
 
@@ -64,8 +83,12 @@ Portable core, fixture, and headless app-controller tests run on Linux,
 macOS, and Windows:
 
 ```bash
-cargo test -p rommfs-core -p rommfs-fixture -p rommfs-cfapi -p rommfs-app --no-default-features
+cargo test -p rommfs-core -p rommfs-fixture -p rommfs-cfapi -p rommfs-app --no-default-features -- --test-threads=1
 ```
+
+Serial execution reduces simultaneous native watchers. A shared Linux host near
+its inotify-instance limit can still reject watcher creation; see
+[validation notes](.planning/IMPLEMENTATION-STATUS.md#validation-boundary).
 
 The desktop app and native CFAPI mount require Windows. On Windows, run the workspace
 tests (including the native CFAPI mount test) with:
@@ -78,7 +101,7 @@ cargo test -p rommfs-cfapi --test cfapi_native
 
 The native test (`cfapi_native.rs`) mounts a real `RommFs` on a temp root
 and checks that enumeration never downloads, first read downloads once
-byte-exact, warm reads are cached, mutations and new file creation fail,
+byte-exact, warm reads are cached, ROM mutations fail,
 open handles prevent eviction, eviction triggers a fresh download, and remount
 reuses the private cache. Native Windows build and runtime tests have not run
 on this Linux development host and are required to validate the backend.
@@ -96,13 +119,49 @@ cargo test -p rommfs-cfapi --test live_romm -- --ignored
 The E2E connects the live server through real CFAPI and byte-compares every
 projected ROM against the committed sources.
 
-## Frontend setup (example: ES-DE)
+## Generic folders
 
 Point the frontend's ROM directory at the mount root, e.g.
 `C:\RomM` — platform folders appear as `C:\RomM\nes`, `C:\RomM\snes`, …
 ES-DE's scraped-folder config maps each to its system (`nes`, `snes`,
 `gb`, …) the same way it would a local ROM library. Scraping/listing is
 instant (metadata only); the first launch of a game downloads its file once.
+
+## Set up RetroBat
+
+> The RetroBat integration requires a fresh installation configured through
+> RomMFS setup. Its ROM directory must be empty or already managed by RomMFS.
+
+Install RetroBat from its [official releases](https://github.com/RetroBat-Official/retrobat/releases)
+and stop RetroBat and its emulators. Installer download/execution automation is
+not yet available in RomMFS. Compatible versions are accepted by required layout,
+not version equality; 8.2.1 is the source/package research reference.
+
+In **Settings**, select RetroBat, choose its installation and a separate managed
+ROM folder, then choose **Set up RetroBat**. Setup links `<RetroBat>/roms` to that
+folder. Windows directory symlink creation requires Developer Mode or the
+appropriate link privilege; RomMFS does not elevate. Setup refuses unowned ROM
+files, including stock helper files, and lists their paths. Nothing is migrated,
+backed up or deleted from a nonempty ROM library. Other RetroBat folders remain
+in place.
+
+Setup records link ownership in `<RetroBat>/.rommfs-setup.json`. Rerunning with
+the same server/root verifies the existing link and can recover an interrupted
+link step. A changed/unowned link is preserved and rejected. Targeted frontend
+settings edits get an `es_settings.cfg.rommfs-<id>.bak` configuration backup.
+The system-level Switch save option is enabled; RetroBat's Eden/Citron launchers
+then generate their distinct save-location keys. Missing emulators are reported
+separately. Existing per-game overrides that disable that option prevent setup.
+
+Mounting generates per-platform `gamelist.xml` with local artwork and actual
+projected filenames. Existing favourites/play history are captured by stable
+ROM/file identity before publication. Complete XML files are replaced atomically
+while the frontend is stopped; ready publication waits while it is running.
+Stop/remount retains these ordinary writable files and their identity index.
+Unrelated unowned content is still refused. Missing artwork does not fail a
+gamelist. Switch update/DLC `.nsp` files go in flat `switchupdates` and are not
+listed as launchable games. Actual RetroBat loading and Windows ACL protection
+remain awaiting native validation.
 
 ## Optional save sync
 
@@ -112,7 +171,8 @@ existing-file supported/skipped counts, mapped game target count, and target
 path preview, then explicitly enable it.
 The debounce defaults to 5 seconds; only whole seconds from 1 through 3600 are
 accepted, and invalid values are not saved. Consent is scoped to that server,
-account, installation, and effective saves folder; credentials are not persisted.
+account, installation, and effective saves folder. Paired sign-in is remembered
+separately and never enables a new sync scope by itself.
 
 On Windows, discovery checks fixed/removable `X:\RetroBat` roots, then image
 paths of running RetroBat/EmulationStation processes. Candidates are validated
@@ -121,13 +181,14 @@ previously selected path is shown first even if discovery does not return it,
 and **Browse…** can select an installation discovery missed. A missing prior
 selection stays selected and paused rather than silently switching to another.
 Sync runs only while this app is open, connected, authenticated, and opted in.
-It is not a daemon/autostart task and does not edit RetroBat, RetroArch, or
-emulator configuration files. The account needs RomM `platforms.read` and
+It is not a daemon/autostart task. The explicit RetroBat setup action described
+above is separate from enabling saves. The account needs RomM `platforms.read` and
 `roms.read` for existing ROM features, plus `me.read`, `assets.read`, and
 `assets.write` for network save sync; exporting a save already staged locally
 does not make save API requests or require those save scopes.
 
-The only supported profile is source-verified RetroBat 8.2.1 using
+Generalized ordinary-file save sync is **not yet implemented**. The current
+supported profile was researched against RetroBat 8.2.1 using
 RetroArch/Gambatte for Game Boy. It maps visible catalogue `.gb` ROMs to
 `gb/<visible ROM stem>.srm`; `.gbc`, Gambatte `.rtc` sidecars, ambiguous names,
 save states, memory cards, multi-file ROMs, compressed/converted saves, and

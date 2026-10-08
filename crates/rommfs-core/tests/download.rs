@@ -219,6 +219,60 @@ fn concurrent_callers_share_a_single_fetch() {
 }
 
 #[test]
+fn cancelled_transfer_never_publishes_and_a_new_mount_can_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = key(7, 70);
+    let e = entry(k.clone(), "Game.nes", BYTES.len() as u64, Some("v1"));
+    let gate = Arc::new(Barrier::new(2));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let source = Arc::new(BytesSource {
+        bytes: BYTES.to_vec(),
+        calls: AtomicUsize::new(0),
+        gate: Some(gate.clone()),
+        entered: Some(entered_tx),
+    });
+    let (dm, rx) = manager(source, dir.path(), std::slice::from_ref(&e));
+    let worker_dm = dm.clone();
+    let worker_entry = e.clone();
+    let transfer = std::thread::spawn(move || worker_dm.ensure_ready(&worker_entry));
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    dm.cancel();
+    assert!(matches!(dm.ensure_ready(&e), Err(Error::Cancelled)));
+    gate.wait();
+    assert!(matches!(transfer.join().unwrap(), Err(Error::Cancelled)));
+    assert!(!dm.is_ready(&k));
+    assert!(!dm.index().lock().part_path(&k).exists());
+    assert!(!dm.index().lock().bin_path(&k).exists());
+    let events = drain(&rx);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AppEvent::DownloadFailed {
+            rom_id: 7,
+            file_id: 70,
+            ..
+        }
+    )));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AppEvent::DownloadFinished { .. })));
+    drop(dm);
+    let source = Arc::new(BytesSource {
+        bytes: BYTES.to_vec(),
+        calls: AtomicUsize::new(0),
+        gate: None,
+        entered: None,
+    });
+    let (retry, _) = manager(source.clone(), dir.path(), std::slice::from_ref(&e));
+    assert_eq!(
+        std::fs::read(retry.ensure_ready(&e).unwrap()).unwrap(),
+        BYTES
+    );
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn failed_download_leaves_no_ready_entry_and_retry_succeeds() {
     let dir = tempfile::tempdir().unwrap();
     let k = key(7, 70);
@@ -337,7 +391,7 @@ fn real_client_fetches_through_the_content_source_impl() {
     let fx = FixtureServer::start();
     fx.on(
         "GET",
-        "/api/roms/",
+        "/api/roms/70/files/content/70",
         ResponseSpec::Bytes {
             status: 200,
             bytes: BYTES.to_vec(),
@@ -354,9 +408,10 @@ fn real_client_fetches_through_the_content_source_impl() {
 
     let path = dm.ensure_ready(&e).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), BYTES);
+    assert_eq!(fx.count_requests("GET", "/api/roms/7/content/"), 0);
     dm.ensure_ready(&e).unwrap();
     assert_eq!(
-        fx.count("GET", "/api/roms/"),
+        fx.count("GET", "/api/roms/70/files/content/70"),
         1,
         "second ensure_ready must not request content again"
     );

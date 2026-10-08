@@ -12,17 +12,19 @@
 #![cfg(windows)]
 
 use rommfs_cfapi::{
-    check_mount_root, claim_mount_root, RootCheck, WindowsHydratedRemover, WindowsMount,
+    check_mount_root, claim_mount_root, publish_frontend_metadata, read_frontend_metadata,
+    RootCheck, WindowsHydratedRemover, WindowsMount,
 };
 use rommfs_core::cache::clock::{Clock, DEFAULT_EVICTION_THRESHOLD_SECS};
 use rommfs_core::cache::{CacheIndex, Evictor, FakeClock, LiveState};
 use rommfs_core::catalog::{build_catalogue, server_id_of, RomKey};
 use rommfs_core::download::DownloadManager;
 use rommfs_core::fscore::RommFs;
+use rommfs_core::retrobat::{generate_gamelists, MetadataIndex};
 use rommfs_core::romm::{Credentials, RommClient};
 use rommfs_core::tree::RommTree;
 use rommfs_fixture::{contract, FixtureServer, ResponseSpec};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -139,13 +141,14 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
         .map(|e| (e.key.clone(), e.version.as_ref().map(|v| v.0.clone())))
         .collect();
     let (sink, _rx) = rommfs_core::events::channel();
+    let client = Arc::new(client);
     let downloads = Arc::new(DownloadManager::new(
         index,
         Arc::clone(&live),
-        Arc::new(client),
+        client.clone(),
         sink,
-        expected,
-        versions,
+        expected.clone(),
+        versions.clone(),
     ));
 
     let workspace = tempfile::tempdir().expect("test workspace");
@@ -229,6 +232,43 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
         0,
         "failed mutations must not download content"
     );
+
+    // Ordinary metadata must be writable without hydrating ROMs, while parent
+    // delete-child access must still not bypass a ROM's protected descriptor.
+    let publication = generate_gamelists(
+        fs.catalogue(),
+        &roms,
+        &server_id,
+        1,
+        &MetadataIndex::default(),
+        &BTreeMap::new(),
+        &HashMap::new(),
+    )
+    .unwrap();
+    publish_frontend_metadata(&root, &server_id, &publication, &BTreeMap::new()).unwrap();
+    let gamelist = root.join("nes/gamelist.xml");
+    let updated = std::fs::read_to_string(&gamelist).unwrap().replace(
+        "</game>",
+        "<favorite>true</favorite><playcount>7</playcount></game>",
+    );
+    std::fs::write(&gamelist, &updated).unwrap();
+    let (index, existing) = read_frontend_metadata(&root, &server_id).unwrap();
+    let refreshed = generate_gamelists(
+        fs.catalogue(),
+        &roms,
+        &server_id,
+        1,
+        &index,
+        &existing,
+        &HashMap::new(),
+    )
+    .unwrap();
+    publish_frontend_metadata(&root, &server_id, &refreshed, &BTreeMap::new()).unwrap();
+    assert!(std::fs::read_to_string(&gamelist)
+        .unwrap()
+        .contains("<playcount>7</playcount>"));
+    assert_eq!(server.count("GET", "/api/roms/"), 0);
+    assert_read_only(&root, &rom_path);
 
     // --- first content read: one download, byte-exact ---
     let got = std::fs::read(&rom_path).expect("first read");
@@ -342,12 +382,36 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
         !rom_path.exists(),
         "unmount leaves no ROM copies at the mount root"
     );
-    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    assert!(gamelist.is_file(), "stop preserves frontend state");
     assert!(matches!(
         check_mount_root(&root, &server_id).unwrap(),
         RootCheck::RecognizedOwned
     ));
+    // Stopping irreversibly cancels that session's transfer manager. Like the
+    // controller, remount builds a new session over the persistent private cache.
+    let (sink, _events) = rommfs_core::events::channel();
+    let downloads2 = Arc::new(DownloadManager::new(
+        CacheIndex::open(cache.path()).unwrap(),
+        live.clone(),
+        client,
+        sink,
+        expected,
+        versions,
+    ));
+    let fs = Arc::new(RommFs::new(
+        RommTree::new(fs.catalogue().clone()),
+        downloads2,
+        Evictor::new(
+            DEFAULT_EVICTION_THRESHOLD_SECS,
+            live,
+            Arc::new(WindowsHydratedRemover::new(&root)),
+        ),
+        clock,
+    ));
     let mount2 = WindowsMount::mount(Arc::clone(&fs), &root).expect("remount");
+    assert!(std::fs::read_to_string(&gamelist)
+        .unwrap()
+        .contains("<playcount>7</playcount>"));
     assert_eq!(std::fs::read(&rom_path).unwrap(), bytes);
     assert_eq!(
         server.count("GET", "/api/roms/"),
@@ -405,7 +469,11 @@ fn assert_read_only(root: &Path, rom: &Path) {
     // Data-plane writes are refused for every caller.
     assert!(std::fs::write(rom, b"overwrite").is_err());
     assert!(std::fs::OpenOptions::new().append(true).open(rom).is_err());
-    assert!(std::fs::write(root.join("new.txt"), b"new").is_err());
+    // Mixed roots allow frontend files, not ROM mutation. Unowned content must
+    // still be refused on remount; remove this probe before normal cleanup.
+    let frontend_probe = root.join("new.txt");
+    std::fs::write(&frontend_probe, b"new").unwrap();
+    std::fs::remove_file(frontend_probe).unwrap();
     assert!(rom.exists());
     if elevated_token() {
         eprintln!("read-only namespace checks skipped: elevated token bypasses ACL denies");
@@ -413,7 +481,6 @@ fn assert_read_only(root: &Path, rom: &Path) {
         assert!(std::fs::remove_file(rom).is_err());
         assert!(std::fs::rename(rom, rom.with_file_name("Renamed.nes")).is_err());
         assert!(std::fs::hard_link(rom, rom.with_file_name("Linked.nes")).is_err());
-        assert!(std::fs::create_dir(root.join("new-dir")).is_err());
     }
     // Non-empty while the ROM exists, so removal fails regardless of ACLs.
     assert!(std::fs::remove_dir(rom.parent().unwrap()).is_err());

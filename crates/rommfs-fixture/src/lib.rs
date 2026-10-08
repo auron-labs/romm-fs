@@ -93,6 +93,18 @@ impl FixtureBodyBarrier {
     pub fn release(&self) {
         let _ = self.release_tx.send(());
     }
+
+    fn wait_for_release(&self, shutdown: &AtomicBool) -> bool {
+        let receiver = self.release_rx.lock().unwrap();
+        while !shutdown.load(Ordering::SeqCst) {
+            match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(()) => return true,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+        false
+    }
 }
 
 impl Default for FixtureBodyBarrier {
@@ -445,7 +457,7 @@ fn handle_conn(mut stream: TcpStream, state: &FixtureState) {
                 return;
             }
             let _ = barrier.started_tx.send(());
-            if barrier.release_rx.lock().unwrap().recv().is_err() {
+            if !barrier.wait_for_release(&state.shutdown) {
                 return;
             }
             let _ = stream.write_all(&bytes);
@@ -469,7 +481,7 @@ fn handle_conn(mut stream: TcpStream, state: &FixtureState) {
         }
         ResponseSpec::HeldRomMSaveUpload { user_id, barrier } => {
             let _ = barrier.started_tx.send(());
-            if barrier.release_rx.lock().unwrap().recv().is_err() {
+            if !barrier.wait_for_release(&state.shutdown) {
                 return;
             }
             let Some(save) = store_uploaded_save(&request, user_id, &state.next_save_id) else {
@@ -839,5 +851,45 @@ pub mod contract {
             "sha1_hash": sha1,
             "is_top_level": true,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_releases_held_bodies_and_uploads_without_a_test_barrier_release() {
+        for upload in [false, true] {
+            let server = FixtureServer::start();
+            let barrier = FixtureBodyBarrier::new();
+            let response = if upload {
+                ResponseSpec::HeldRomMSaveUpload {
+                    user_id: 1,
+                    barrier: barrier.clone(),
+                }
+            } else {
+                ResponseSpec::HeldBytes {
+                    status: 200,
+                    bytes: b"held-body".to_vec(),
+                    barrier: barrier.clone(),
+                }
+            };
+            server.on("POST", "/held", response);
+            let address = server.url().strip_prefix("http://").unwrap().to_owned();
+            let request = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(address).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream.write_all(b"POST /held HTTP/1.1\r\nHost: fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes).unwrap();
+                bytes
+            });
+            assert!(barrier.wait_until_blocked(Duration::from_secs(2)));
+            drop(server);
+            assert!(!request.join().unwrap().ends_with(b"held-body"));
+        }
     }
 }

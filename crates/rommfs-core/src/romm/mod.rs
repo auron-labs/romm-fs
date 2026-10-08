@@ -4,7 +4,9 @@
 //! transfers are never killed by a total-time budget (PRD R3).
 
 pub mod client;
+mod pairing;
 mod saves;
+pub use pairing::{PairedSession, PairingPoll, PairingRequest};
 pub mod types;
 
 pub use client::{Credentials, DownloadConfig, MetadataConfig, RommClient};

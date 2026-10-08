@@ -7,13 +7,15 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 isahc.workspace = true
 parking_lot.workspace = true
-quick-xml.workspace = true
+quick-xml = { workspace = true, features = ["serialize"] }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
@@ -23,4 +25,4 @@ rommfs-fixture.workspace = true
 tempfile.workspace = true
 
 [target."cfg(windows)".dependencies]
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Security_Credentials"] }

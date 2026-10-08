@@ -15,8 +15,10 @@ use gpui_kit::component::{
     input::{Input, InputContentType, InputEvent, InputState},
     label::Label,
     progress::Progress,
+    radio::RadioGroup,
     select::{Select, SelectEvent, SelectState},
     separator::Separator,
+    tab::{Tab, TabBar},
     try_parse_color, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
     StyledExt as _, Theme, ThemeMode,
 };
@@ -25,6 +27,7 @@ use gpui_kit::{
     Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollHandle, SharedString,
     Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
 };
+use rommfs_core::connection_settings::IntegrationMode;
 use rommfs_core::events::{AppEvent, Level, SaveSyncIncomingStatus};
 use rommfs_core::save_sync::{
     ExistingSavePreview, ExistingSaveScanStatus, MAX_EXISTING_SAVE_SCAN_DEPTH,
@@ -147,6 +150,11 @@ struct RommfsWindow {
     debounce_input: Entity<InputState>,
     debounce_input_applied: String,
     debounce_error: Option<String>,
+    active_view: usize,
+    password_sign_in: bool,
+    integration_choice: usize,
+    retrobat_input: Entity<InputState>,
+    completed_open: bool,
     mapping_open: bool,
     log_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
@@ -178,6 +186,8 @@ impl RommfsWindow {
                 .default_value(rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string())
         });
 
+        let retrobat_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("RetroBat installation folder"));
         let mut subscriptions = Vec::new();
 
         // Enter in a connection field is the section's default commit.
@@ -262,6 +272,11 @@ impl RommfsWindow {
             debounce_input,
             debounce_input_applied: rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string(),
             debounce_error: None,
+            active_view: 3,
+            password_sign_in: false,
+            integration_choice: 0,
+            retrobat_input,
+            completed_open: false,
             mapping_open: false,
             log_scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -287,6 +302,28 @@ impl RommfsWindow {
                 _ => {}
             }
             match &event {
+                AppEvent::IntegrationUpdated {
+                    mode,
+                    retrobat_root,
+                    ..
+                } => {
+                    self.integration_choice = usize::from(*mode == IntegrationMode::RetroBat);
+                    if let Some(root) = retrobat_root {
+                        self.retrobat_input
+                            .update(cx, |input, cx| input.set_value(root.clone(), window, cx));
+                    }
+                }
+                AppEvent::PairingReady { url, .. } => cx.open_url(url),
+                AppEvent::Connected => self.active_view = 0,
+                AppEvent::SignedOut => self.active_view = 3,
+                AppEvent::ConnectionRestored { server, mount_root } => {
+                    self.url_input
+                        .update(cx, |input, cx| input.set_value(server.clone(), window, cx));
+                    if let Some(root) = mount_root {
+                        self.mount_input
+                            .update(cx, |input, cx| input.set_value(root.clone(), window, cx));
+                    }
+                }
                 AppEvent::SaveSyncSessionChanged { .. } => {
                     if self.debounce_input.read(cx).value() == self.debounce_input_applied {
                         let default = rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string();
@@ -359,6 +396,12 @@ impl RommfsWindow {
 
     fn on_connect(&mut self, cx: &mut Context<Self>) {
         if self.state.conn == ConnState::Connecting {
+            return;
+        }
+        if !self.password_sign_in {
+            self.controller.send(Command::BeginPairing {
+                url: self.url_input.read(cx).value().to_string(),
+            });
             return;
         }
         self.controller.send(Command::Connect {
@@ -668,45 +711,69 @@ impl RommfsWindow {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let connecting = self.state.conn == ConnState::Connecting;
-        v_flex()
-            .gap_2()
+        v_flex().gap_3()
             .child(section_heading("Connection"))
-            .child(
-                h_flex()
-                    .gap_3()
-                    .items_end()
-                    .child(div().flex_1().min_w_0().child(field_column(
-                        "Server URL",
-                        Input::new(&self.url_input).w_full(),
-                        cx,
-                    )))
-                    .child(div().w_48().child(field_column(
-                        "Username",
-                        Input::new(&self.user_input).w_full(),
-                        cx,
-                    )))
-                    .child(
-                        div().w_48().child(field_column(
-                            "Password",
-                            Input::new(&self.password_input)
-                                .w_full()
-                                .content_type(InputContentType::Password)
-                                .mask_toggle(),
-                            cx,
-                        )),
-                    )
-                    .child(
-                        Button::new("connect")
-                            .label("Connect")
-                            .primary()
-                            .loading(connecting)
-                            .disabled(connecting)
-                            .on_click(cx.listener(|view, _, _, cx| view.on_connect(cx))),
-                    ),
-            )
-            .when_some(self.state.conn_error.clone(), |this, error| {
-                this.child(error_line(error, cx))
-            })
+            .child(field_column("Server URL", Input::new(&self.url_input).w_full(), cx))
+            .child(h_flex().gap_2()
+                .child(Button::new("browser-sign-in").label("Sign in with browser…")
+                    .primary().loading(connecting && !self.password_sign_in).disabled(connecting)
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.password_sign_in = false; view.on_connect(cx); cx.notify();
+                    })))
+                .child(Button::new("cancel-sign-in").label("Cancel sign-in")
+                    .disabled(!connecting).on_click(cx.listener(|view, _, _, cx| { view.controller.send(Command::CancelPairing); cx.notify(); })))
+                .child(Button::new("sign-out").label("Sign out")
+                    .disabled(self.state.conn != ConnState::Connected).on_click(cx.listener(|view, _, _, cx| { view.controller.send(Command::Logout); cx.notify(); }))))
+            .when_some(self.state.pairing_code.clone(), |this, code| this.child(muted(format!("Approve RomMFS in your browser · code {code}"), cx)))
+            .child(Collapsible::new().open(self.password_sign_in)
+                .child(Button::new("password-sign-in-options").ghost().label(if self.password_sign_in { "Hide password sign-in" } else { "Use password instead" })
+                    .disabled(connecting).on_click(cx.listener(|view,_,_,cx| { view.password_sign_in = !view.password_sign_in; cx.notify(); })))
+                .content(v_flex().gap_3()
+                    .child(h_flex().gap_3().items_stretch()
+                        .child(div().flex_1().min_w_0().child(field_column("Username", Input::new(&self.user_input).w_full(), cx)))
+                        .child(div().flex_1().min_w_0().child(field_column("Password", Input::new(&self.password_input).w_full().content_type(InputContentType::Password).mask_toggle(), cx))))
+                    .child(Button::new("connect").label("Connect with password").disabled(connecting)
+                        .on_click(cx.listener(|view,_,_,cx| view.on_connect(cx))))
+                    .child(muted("Password sign-in is not remembered. Browser sign-in uses Windows Credential Manager.", cx))))
+            .when_some(self.state.conn_error.clone(), |this,error| this.child(error_line(error,cx)))
+    }
+
+    fn render_integration(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let locked = self.state.retrobat_setup_running
+            || matches!(self.state.mount, MountState::Mounted | MountState::Mounting);
+        v_flex().gap_3()
+            .child(section_heading("Library layout"))
+            .child(RadioGroup::horizontal("library-layout").children(["Generic folders", "RetroBat"])
+                .selected_index(Some(self.integration_choice)).disabled(locked)
+                .on_change(cx.listener(|view,index,_,cx| { view.integration_choice = *index; cx.notify(); })))
+            .when(self.integration_choice == 1, |this| this
+                .child(field_column("RetroBat installation", Input::new(&self.retrobat_input).w_full(), cx))
+                .child(muted("Requires a fresh installation configured through RomMFS setup. Its ROM directory must be empty or already managed by RomMFS.",cx))
+                .child(field_column("Managed ROM folder", Input::new(&self.mount_input).w_full(), cx))
+                .child(muted("Setup links RetroBat's ROM folder to this folder and configures Switch saves. Stop RetroBat and its emulators first. Unowned ROM files are never moved or removed.",cx))
+                .child(Button::new("setup-retrobat").label("Set up RetroBat")
+                    .disabled(locked || self.state.conn != ConnState::Connected)
+                    .on_click(cx.listener(|view,_,_,cx| {
+                        view.controller.send(Command::SetupRetroBat {
+                            installation: PathBuf::from(view.retrobat_input.read(cx).value().trim()),
+                            managed_root: PathBuf::from(view.mount_input.read(cx).value().trim()),
+                        });
+                        cx.notify();
+                    }))))
+            .child(Button::new("apply-library-layout").label("Apply layout")
+                .disabled(locked || self.state.conn != ConnState::Connected)
+                .on_click(cx.listener(|view,_,_,cx| {
+                    let mode = if view.integration_choice == 1 { IntegrationMode::RetroBat } else { IntegrationMode::Generic };
+                    let root = view.retrobat_input.read(cx).value().trim().to_owned();
+                    view.controller.send(Command::SetIntegration { mode, retrobat_root: (!root.is_empty()).then(|| PathBuf::from(root)) });
+                    cx.notify();
+                })))
+            .when(locked, |this| this.child(muted("Stop the mount before changing its layout.",cx)))
+            .when_some(self.state.integration_error.clone(), |this,error| this.child(error_line(error,cx)))
+            .when_some(self.state.retrobat_setup_detail.clone(), |this,detail| this.child(muted(detail,cx)))
+            .when_some(self.state.retrobat_setup_error.clone(), |this,error| this.child(error_line(error,cx)))
+            .when_some(self.state.frontend_metadata_detail.clone(), |this,detail| this.child(muted(detail,cx)))
+            .when_some(self.state.frontend_metadata_error.clone(), |this,error| this.child(error_line(error,cx)))
     }
 
     fn render_mount(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -760,6 +827,51 @@ impl RommfsWindow {
                     ),
                     cx,
                 ))
+            })
+            .child(
+                Button::new("refresh-catalogue")
+                    .label("Refresh library")
+                    .disabled(self.state.conn != ConnState::Connected)
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.controller.send(Command::RefreshCatalogue);
+                        cx.notify();
+                    })),
+            )
+            .when_some(self.state.catalogue_refreshed_at, |this, timestamp| {
+                this.child(muted(
+                    format!("Last complete catalogue: {timestamp} (UTC Unix time)"),
+                    cx,
+                ))
+            })
+            .when(self.state.catalogue_pending_remount, |this| {
+                this.child(muted(
+                    "A complete refresh is ready; stop and start the mount to publish it.",
+                    cx,
+                ))
+            })
+            .when_some(
+                self.state.catalogue_progress.clone(),
+                |this, (stage, completed, total, elapsed)| {
+                    this.child(operation_progress(
+                        "catalogue-progress",
+                        &stage,
+                        completed,
+                        total,
+                        elapsed,
+                        cx,
+                    ))
+                },
+            )
+            .when(mounting, |this| match self.state.mount_progress.clone() {
+                Some((stage, completed, total, elapsed)) => this.child(operation_progress(
+                    "mount-progress",
+                    &stage,
+                    completed,
+                    total,
+                    elapsed,
+                    cx,
+                )),
+                None => this.child(Progress::new("mount-progress").loading(true).small()),
             })
             .child(muted(
                 "Read-only files download when opened. Closing RomMFS stops the mount.",
@@ -1136,42 +1248,82 @@ impl RommfsWindow {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let header = |text: &'static str| {
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(text)
-        };
+        let active: Vec<_> = self
+            .state
+            .downloads
+            .iter()
+            .filter(|d| d.finished.is_none())
+            .cloned()
+            .collect();
+        let history: Vec<_> = self
+            .state
+            .downloads
+            .iter()
+            .filter(|d| d.finished.is_some())
+            .cloned()
+            .collect();
         v_flex()
             .gap_2()
-            .child(section_heading("Downloads"))
-            .child(
-                h_flex()
-                    .gap_3()
-                    .child(div().flex_1().min_w_0().child(header("File")))
-                    .child(div().w_64().child(header("Progress")))
-                    .child(div().w_40().child(header("Status"))),
-            )
+            .child(section_heading("Active transfers"))
             .child(
                 div()
-                    .id("downloads")
+                    .id("active-downloads")
                     .v_flex()
                     .gap_2()
                     .max_h_40()
-                    .children(if self.state.downloads.is_empty() {
-                        vec![muted("No downloads yet", cx).into_any_element()]
-                    } else {
-                        self.state
-                            .downloads
-                            .iter()
-                            .map(|download| {
-                                self.render_download_row(download.clone(), cx)
-                                    .into_any_element()
-                            })
-                            .collect::<Vec<_>>()
+                    .when(active.is_empty(), |this| {
+                        this.child(muted("No active transfers", cx))
                     })
+                    .children(
+                        active
+                            .into_iter()
+                            .map(|d| self.render_download_row(d, cx).into_any_element()),
+                    )
                     .overflow_y_scrollbar(),
             )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("toggle-completed")
+                            .label(if self.completed_open {
+                                "Collapse history"
+                            } else {
+                                "Show history"
+                            })
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.completed_open = !view.completed_open;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("clear-completed")
+                            .label("Clear completed")
+                            .disabled(!history.iter().any(|d| matches!(d.finished, Some(Ok(())))))
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.state.clear_completed_downloads();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when(self.completed_open, |this| {
+                this.child(
+                    div()
+                        .id("completed-downloads")
+                        .v_flex()
+                        .gap_2()
+                        .max_h_40()
+                        .when(history.is_empty(), |this| {
+                            this.child(muted("No completed or failed transfers", cx))
+                        })
+                        .children(
+                            history
+                                .into_iter()
+                                .map(|d| self.render_download_row(d, cx).into_any_element()),
+                        )
+                        .overflow_y_scrollbar(),
+                )
+            })
     }
 
     fn render_download_row(
@@ -1214,8 +1366,11 @@ impl RommfsWindow {
                         .gap_2()
                         .child(
                             div().flex_1().child(
-                                Progress::new(("download", download.rom_id))
+                                Progress::new(("download", download.file_id))
                                     .value(percent)
+                                    .loading(
+                                        download.finished.is_none() && download.total.is_none(),
+                                    )
                                     .xsmall(),
                             ),
                         )
@@ -1224,7 +1379,13 @@ impl RommfsWindow {
                                 .w_10()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(format!("{percent:.0}%")),
+                                .child(
+                                    if download.finished.is_none() && download.total.is_none() {
+                                        "—".into()
+                                    } else {
+                                        format!("{percent:.0}%")
+                                    },
+                                ),
                         ),
                 ),
             )
@@ -1247,6 +1408,23 @@ impl RommfsWindow {
                 h_flex()
                     .justify_between()
                     .child(section_heading("Activity log"))
+                    .child(
+                        Button::new("open-log-folder")
+                            .label("Open log folder")
+                            .outline()
+                            .small()
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if let Some(path) = crate::controller::diagnostic_log_directory() {
+                                    cx.reveal_path(&path);
+                                } else {
+                                    view.controller.sink().emit(AppEvent::log(
+                                        Level::Error,
+                                        "diagnostics",
+                                        "No application log directory is available",
+                                    ));
+                                }
+                            })),
+                    )
                     .child(
                         Button::new("copy-log")
                             .label("Copy")
@@ -1412,24 +1590,102 @@ fn existing_save_inventory_summary(preview: Option<&ExistingSavePreview>) -> Str
 
 impl Render for RommfsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = match self.active_view {
+            0 => div()
+                .id("library-view")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scrollbar()
+                .child(v_flex().p_6().gap_4().child(self.render_mount(window, cx)))
+                .into_any_element(),
+            1 => div()
+                .id("save-sync-view")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scrollbar()
+                .child(
+                    v_flex()
+                        .p_6()
+                        .gap_4()
+                        .child(self.render_save_sync(window, cx)),
+                )
+                .into_any_element(),
+            2 => v_flex()
+                .flex_1()
+                .min_h_0()
+                .p_6()
+                .gap_4()
+                .child(self.render_downloads(window, cx))
+                .child(self.render_log(window, cx))
+                .into_any_element(),
+            _ => div()
+                .id("settings-view")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scrollbar()
+                .child(
+                    v_flex()
+                        .p_6()
+                        .gap_6()
+                        .child(self.render_connection(window, cx))
+                        .child(Separator::horizontal())
+                        .child(self.render_integration(cx)),
+                )
+                .into_any_element(),
+        };
         v_flex()
             .size_full()
-            .p_6()
-            .gap_4()
+            .min_w_0()
+            .min_h_0()
+            .gap_2()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .text_sm()
-            .child(self.render_header(window, cx))
-            .child(self.render_connection(window, cx))
+            .child(div().px_6().pt_4().child(self.render_header(window, cx)))
+            .child(
+                TabBar::new("application-views")
+                    .selected_index(self.active_view)
+                    .on_click(cx.listener(|view, index, _, cx| {
+                        view.active_view = *index;
+                        cx.notify();
+                    }))
+                    .child(Tab::new().label("Library / Mount"))
+                    .child(Tab::new().label("Save sync"))
+                    .child(Tab::new().label("Activity"))
+                    .child(Tab::new().label("Settings")),
+            )
             .child(Separator::horizontal())
-            .child(self.render_mount(window, cx))
-            .child(Separator::horizontal())
-            .child(self.render_save_sync(window, cx))
-            .child(Separator::horizontal())
-            .child(self.render_downloads(window, cx))
-            .child(Separator::horizontal())
-            .child(self.render_log(window, cx))
+            .child(content)
     }
+}
+
+fn operation_progress(
+    id: &'static str,
+    stage: &str,
+    completed: u64,
+    total: Option<u64>,
+    elapsed_ms: u64,
+    cx: &App,
+) -> impl IntoElement {
+    let count = total.map_or_else(
+        || completed.to_string(),
+        |total| format!("{completed} / {total}"),
+    );
+    let percent = total
+        .filter(|t| *t > 0)
+        .map_or(0.0, |t| (100.0 * completed as f32 / t as f32).min(100.0));
+    v_flex()
+        .gap_1()
+        .child(muted(
+            format!("{stage} · {count} · {:.1}s", elapsed_ms as f64 / 1000.0),
+            cx,
+        ))
+        .child(
+            Progress::new(id)
+                .value(percent)
+                .loading(total.is_none())
+                .small(),
+        )
 }
 
 /// The app's dark palette — blue-gray tones per the mockup, applied over the
@@ -1485,6 +1741,7 @@ pub fn run() {
             gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(720.0), px(480.0))),
                     titlebar: Some(gpui_kit::TitlebarOptions {
                         title: Some("RomMFS".into()),
                         ..Default::default()

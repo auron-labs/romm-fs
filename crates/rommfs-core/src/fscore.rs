@@ -46,6 +46,13 @@ impl RommFs {
         }
     }
 
+    pub fn events(&self) -> crate::events::EventSink {
+        self.downloads.events()
+    }
+    pub fn cancel_transfers(&self) {
+        self.downloads.cancel();
+    }
+
     // --- metadata: never downloads ---
 
     pub fn catalogue(&self) -> &crate::catalog::Catalogue {

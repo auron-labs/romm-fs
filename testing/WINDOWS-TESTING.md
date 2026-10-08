@@ -13,6 +13,13 @@ record the blocked case rather than silently skipping it. Do not modify the
 application or a real RetroBat installation to make acceptance pass; report
 reproducible defects separately.
 
+**Current validation status:** all Windows runtime and human cases remain
+pending on the Linux implementation host. Do not run them as a prerequisite for
+continuing implementation. [Implementation status](../.planning/IMPLEMENTATION-STATUS.md)
+separates finished code from remaining installer, save, auxiliary and tray work.
+The existing GB-save cases below remain regression coverage, not evidence of
+generalized ordinary-file save support.
+
 ## 1. Prepare the host and evidence
 
 Use native Windows PowerShell in the repository root, rather than WSL. Open a
@@ -36,7 +43,8 @@ Prerequisites:
 - A disposable RomM server/account for live tests. ROM access requires
   `platforms.read` and `roms.read`; save sync also requires `me.read`,
   `assets.read`, and `assets.write`.
-- Two disposable RetroBat **8.2.1** installations for the save-sync checks.
+- Two disposable compatible RetroBat installations for the save-sync checks.
+  **8.2.1** is the package/source reference, not an exact-version gate.
   Use RetroArch/Gambatte for a single-file Game Boy `.gb` game.
 
 Record the environment before testing using the logged commands below; retain
@@ -60,7 +68,7 @@ Record the actual RetroBat installation, not a renamed or synthetic fixture:
 the unmodified `system/version.info` text, its hash, the release/package hash
 if the original package is available, and the file version/hash of the installed
 `RetroBat.exe` and EmulationStation executable. The code accepts the official
-`8.2.1-stable-win64` marker as well as legacy bare `8.2.1`; record what the real
+compatible layout regardless of version string; record what the real
 file says and never relabel it to force profile acceptance. Record
 EmulationStation's version as corroborating evidence, not as a replacement for
 `system/version.info`. If the package or version metadata is unavailable, say
@@ -232,21 +240,44 @@ The CFAPI test verifies these behaviors through real Windows filesystem calls:
 - Reads with different path casing and seek offsets work; warm reads stay cached.
 - A child process opens warm NTFS bytes and refreshes last-use without a download.
 - A truncated download fails without exposing partial bytes; a later read retries.
-- Write, append, delete, rename, hard-link, and file/directory creation fail.
+- ROM write, append, delete, rename and hard-link attempts fail. Ordinary
+  frontend files may be created; unrelated unowned files still prevent remount.
 - Open handles defer eviction; closing them permits dehydration and a new download.
-- Unmount restores an empty folder; remount reuses the private cache.
+- Unmount removes ROM placeholders but preserves owned frontend metadata;
+  remount reuses the private cache and retains favourites/history.
 - A nonempty mount root is refused without changing its local data.
 
 The remaining tests exercise canonicalized paths, ancestor-junction rejection,
 Windows sharing/rename protection, no-clobber save publication/export, and
-actual filesystem notifications. The profile marker test accepts both
-`8.2.1-stable-win64` (the shipped marker) and legacy `8.2.1`, and rejects
-unsupported markers. These tests use disposable fixtures and do not verify a
+actual filesystem notifications. Compatible version markers are diagnostic;
+missing required layout/settings must produce capability-specific errors.
+These tests use disposable fixtures and do not verify a
 live RomM server or a real RetroBat installation.
 
 If a failure occurs, retain the first log. Re-run the failing test alone to
 investigate; record both outcomes if it is intermittent. A build failure blocks
 downstream runtime checks and must not be described as a failed runtime assertion.
+
+### New setup/metadata acceptance cases — all pending
+
+Use disposable installs and roots, never a real game/save library. Run the
+native CFAPI regression above as a standard user; it now publishes writable
+metadata beside protected ROMs, checks no ROM request during publication, and
+retains frontend state across a fresh-session remount. Record any elevated-token
+exceptions rather than treating skipped protection checks as passes.
+
+| Case | Procedure | Required evidence |
+| --- | --- | --- |
+| `SETUP-OWNERSHIP` | Try setup with stock/user files in `roms`; then with an empty directory tree. Repeat setup and test an unowned/wrong-target link. | Conflicting paths listed, bytes untouched, no ROM-folder migration/backups; owned link verified/reused and other RetroBat directories unchanged. |
+| `SETUP-RECOVERY` | Interrupt before/after link creation; rerun for the same root. Repeat on a compatible upgrade with different `version.info`. | Setup intent recovers without acquiring another link; version difference alone does not reject. Record link privilege/Developer Mode. |
+| `SETUP-SWITCH` | Back up settings, enable setup, inspect unrelated values and per-game disabling overrides. Launch each installed emulator through RetroBat. | Config backup, unrelated XML unchanged, override rejection, and actual distinct Eden/Citron serialized keys plus effective save paths. Missing emulator is separate from configuration failure. |
+| `META-ACL` | Publish XML/artwork; edit and atomically replace a gamelist as the frontend does. Try ordinary overwrite/delete/rename of ROMs, including via the same parent and another process. | Local metadata writes work; parent `FILE_DELETE_CHILD` cannot bypass ROM protection. Cross-target/portable checks do not count. |
+| `META-LIFETIME` | Change favourites/play counts in the frontend, exit, refresh, stop/remount, then exercise interrupted publication and projected-name changes. | Frontend values survive; launch paths remain actual filenames; removed games disappear without losing archived history. |
+| `META-ACTIVITY` | Refresh while EmulationStation or a Switch emulator runs, then exit. Also exercise unavailable access permissions. | Ready metadata waits, does not clobber in-memory history, publishes after safe exclusive access, and reports access/capability failures. |
+| `META-NETWORK` | Trace listing, XML generation and artwork requests separately. Include missing artwork and a rejected session. | No ROM bodies/detail requests; missing artwork nonfatal, authentication rejection requires sign-in, local references load in RetroBat. |
+
+Installer automation, generalized saves, external auxiliary materialization and
+tray/login cases remain unimplemented; record those as `NOT RUN`, not passes.
 
 ## 3. Test a real RomM through CFAPI
 
@@ -495,7 +526,7 @@ earlier password grant and GET preflight window from all app request counts.
 | `UI-MOUNT-LIST` | Run `Get-ChildItem -LiteralPath '<mount>' -Recurse` before opening a ROM. | Metadata appears. Use native fixture counters from section 2 as proof of no content downloads; Explorer may have other readers. |
 | `UI-MOUNT-READ` | Run `Get-FileHash -LiteralPath '<mounted ROM>' -Algorithm SHA256`; compare with its known source. Repeat. | Hashes match; warm reads do not create a new ROM transfer. Hashing performs a content read. |
 | `UI-MOUNT-STOP` | Press **Stop**, inspect the folder, then **Start** again. | Folder is restored empty; sibling `<folder>.rommfs-root` marker remains; cached bytes are reused. |
-| `UI-MOUNT-CLOSE` | Close the app while mounted, then inspect the folder. | Mount stops and the empty folder returns; no tray/background app remains. |
+| `UI-MOUNT-CLOSE` | Close the app while mounted, then inspect the folder. | Mount currently stops; owned frontend metadata remains. No tray/background app exists yet. |
 | `UI-MOUNT-LEGACY-ROOT` | Put a sentinel file in a separate disposable folder; record its hash; attempt to mount there. | Mount is refused; sentinel and hash remain unchanged. Never test against a real old ROM/save library. |
 | `UI-MOUNT-OWNERSHIP` | Claim a test folder for server A, stop, then try it for a different server identity. | Ownership mismatch is refused. A configured URL base path is part of server identity. |
 
@@ -756,6 +787,6 @@ backing up valid saves/configuration. Stop at deadlines, report residual
 blockers, and do not give an overall `PASS` while a required runtime case is
 blocked or not run.
 
-Use [SAVE-SYNC-CHECKLIST.md](../SAVE-SYNC-CHECKLIST.md) for acceptance contracts
+Use [the approved save-sync scope](../.scratch/PLAN.md#step-6--generalize-save-synchronization) for acceptance contracts
 and [README.md](../README.md) for supported behavior. Preserve historical
 verification statements unless this run supplies evidence to update them.

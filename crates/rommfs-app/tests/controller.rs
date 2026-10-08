@@ -88,6 +88,7 @@ fn reconnect_clears_previous_session_state() {
             skipped_unsupported: 0,
         },
         AppEvent::DownloadStarted {
+            file_id: 1,
             rom_id: 7,
             file_name: "a.nes".into(),
             total: Some(10),
@@ -173,16 +174,19 @@ fn mount_failure_never_shows_mounted_and_recovers() {
 fn stop_mount_marks_inflight_downloads_failed() {
     let mut ui = UiState::new(64);
     ui.apply(&AppEvent::DownloadStarted {
+        file_id: 1,
         rom_id: 9,
         file_name: "g.gb".into(),
         total: Some(64),
     });
     ui.apply(&AppEvent::DownloadStarted {
+        file_id: 1,
         rom_id: 10,
         file_name: "h.gb".into(),
         total: Some(64),
     });
     ui.apply(&AppEvent::DownloadFinished {
+        file_id: 1,
         rom_id: 10,
         file_name: "h.gb".into(),
     });
@@ -206,6 +210,7 @@ fn stop_mount_marks_inflight_downloads_failed() {
 fn download_events_drive_progress_and_terminal_state() {
     let mut ui = UiState::new(64);
     ui.apply(&AppEvent::DownloadStarted {
+        file_id: 1,
         rom_id: 7,
         file_name: "a.nes".into(),
         total: Some(100),
@@ -220,6 +225,7 @@ fn download_events_drive_progress_and_terminal_state() {
     }
 
     ui.apply(&AppEvent::DownloadProgress {
+        file_id: 1,
         rom_id: 7,
         received: 40,
         total: Some(100),
@@ -227,6 +233,7 @@ fn download_events_drive_progress_and_terminal_state() {
     assert_eq!(ui.downloads[0].received, 40);
 
     ui.apply(&AppEvent::DownloadFinished {
+        file_id: 1,
         rom_id: 7,
         file_name: "a.nes".into(),
     });
@@ -238,16 +245,19 @@ fn download_events_drive_progress_and_terminal_state() {
 fn download_failure_is_terminal_and_retryable() {
     let mut ui = UiState::new(64);
     ui.apply(&AppEvent::DownloadStarted {
+        file_id: 1,
         rom_id: 8,
         file_name: "b.sfc".into(),
         total: None,
     });
     ui.apply(&AppEvent::DownloadProgress {
+        file_id: 1,
         rom_id: 8,
         received: 12,
         total: None,
     });
     ui.apply(&AppEvent::DownloadFailed {
+        file_id: 1,
         rom_id: 8,
         file_name: "b.sfc".into(),
         reason: "truncated body".into(),
@@ -258,6 +268,7 @@ fn download_failure_is_terminal_and_retryable() {
 
     // Retry replaces the terminal failure with a fresh in-flight row.
     ui.apply(&AppEvent::DownloadStarted {
+        file_id: 1,
         rom_id: 8,
         file_name: "b.sfc".into(),
         total: None,
@@ -273,11 +284,13 @@ fn download_failure_is_terminal_and_retryable() {
 fn download_without_total_stays_indeterminate() {
     let mut ui = UiState::new(64);
     ui.apply(&AppEvent::DownloadStarted {
+        file_id: 1,
         rom_id: 5,
         file_name: "m.bin".into(),
         total: None,
     });
     ui.apply(&AppEvent::DownloadProgress {
+        file_id: 1,
         rom_id: 5,
         received: 1024,
         total: None,
@@ -317,4 +330,70 @@ fn evict_events_land_in_log() {
     let messages: Vec<String> = ui.log.lines().map(|l| l.message.clone()).collect();
     assert!(messages.iter().any(|m| m.contains("old.nes")));
     assert!(messages.iter().any(|m| m.contains("rom 4")));
+}
+
+#[test]
+fn file_id_separates_transfers_and_history_never_prunes_active_or_failed_rows() {
+    let mut ui = UiState::new(32);
+    for file_id in 1..=150 {
+        ui.apply(&AppEvent::DownloadStarted {
+            rom_id: 7,
+            file_id,
+            file_name: format!("file{file_id}.nsp"),
+            total: Some(10),
+        });
+    }
+    ui.apply(&AppEvent::DownloadProgress {
+        rom_id: 7,
+        file_id: 2,
+        received: 5,
+        total: Some(10),
+    });
+    assert_eq!(ui.downloads.len(), 150);
+    assert_eq!(
+        ui.downloads
+            .iter()
+            .find(|d| d.file_id == 1)
+            .unwrap()
+            .received,
+        0
+    );
+    assert_eq!(
+        ui.downloads
+            .iter()
+            .find(|d| d.file_id == 2)
+            .unwrap()
+            .received,
+        5
+    );
+    for file_id in 151..=300 {
+        ui.apply(&AppEvent::DownloadFinished {
+            rom_id: 7,
+            file_id,
+            file_name: format!("file{file_id}.nsp"),
+        });
+    }
+    ui.apply(&AppEvent::DownloadFailed {
+        rom_id: 7,
+        file_id: 301,
+        file_name: "failed.nsp".into(),
+        reason: "HTTP 500".into(),
+    });
+    assert_eq!(
+        ui.downloads.iter().filter(|d| d.finished.is_none()).count(),
+        150
+    );
+    assert_eq!(
+        ui.downloads
+            .iter()
+            .filter(|d| matches!(d.finished, Some(Ok(()))))
+            .count(),
+        128
+    );
+    ui.clear_completed_downloads();
+    assert_eq!(ui.downloads.len(), 151);
+    assert!(matches!(
+        ui.downloads.last().unwrap().finished,
+        Some(Err(_))
+    ));
 }

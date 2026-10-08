@@ -1,4 +1,22 @@
-# RomMFS — Windows-first proof of concept
+# RomMFS — Windows-first desktop application
+
+## Approved scope update — 2026-10-07
+
+[The approved plan](../.scratch/PLAN.md) supersedes conflicting original PoC
+restrictions in this document. It requires Generic folders and RetroBat,
+remembered browser pairing, persisted account-scoped catalogues, explicit
+refresh, nested original files, safe RetroBat setup and local metadata,
+ordinary-file save sync, auxiliary materialization, and tray/start-at-login.
+Keep one server, one mount, the existing Rust crates, GPUI Kit, CFAPI and SQLite.
+ROM hydration stays lazy; preserve unrelated files and explicit save consent.
+Shared saves/cards are excluded. RetroBat 8.2.1 is a research reference, never
+an exact-version compatibility gate.
+
+This is **required scope**, not a claim that every feature is implemented.
+See [implementation status](IMPLEMENTATION-STATUS.md) for outstanding work.
+Complete applicable Linux checks; Windows runtime and human validation remain
+deferred and do not block implementation. The original PoC baseline below is
+retained for historical context, not as authority for conflicting restrictions.
 
 ## 1. Goal and scope authority
 
@@ -6,7 +24,7 @@ Build a small Rust desktop application that exposes an existing RomM library as 
 
 The application is **not a game launcher or library browser**. Its UI is only for connection/login, mount controls, status, download progress, and logs.
 
-This document defines the complete PoC scope. Reference projects are API documentation, not permission to copy their features. Do not invent additional product requirements, production-readiness milestones, or infrastructure.
+The approved scope update above defines current deliverables. Reference projects remain API documentation, not permission to add unrelated product requirements or infrastructure.
 
 ### MVP decisions
 

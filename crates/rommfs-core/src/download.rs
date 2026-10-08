@@ -43,13 +43,29 @@ impl ContentSource for RommClient {
         writer: &mut dyn std::io::Write,
         progress: &mut dyn FnMut(u64, Option<u64>),
     ) -> Result<u64> {
-        self.download_file(key.rom_id, &key.file_id.to_string(), writer, progress)
+        self.download_original_file(key.file_id, &key.file_id.to_string(), writer, progress)
     }
 }
 
 /// One shared transfer: waiters block on `done` until the leader stores a
 /// terminal `state` and notifies. The error is shared as text (the
 /// `Error` enum is not `Clone`); the leader still returns the real error.
+struct CancelWriter<'a> {
+    file: &'a mut std::fs::File,
+    cancelled: &'a std::sync::atomic::AtomicBool,
+}
+impl std::io::Write for CancelWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(std::io::Error::other("transfer cancelled"));
+        }
+        std::io::Write::write(self.file, bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(self.file)
+    }
+}
+
 struct Flight {
     state: Mutex<FlightState>,
     done: Condvar,
@@ -72,6 +88,7 @@ impl Flight {
 /// Shared, cloneable engine. All `ensure_ready` callers for the same key are
 /// coalesced by an internal in-flight map.
 pub struct DownloadManager {
+    cancelled: std::sync::atomic::AtomicBool,
     index: Mutex<CacheIndex>,
     live: std::sync::Arc<LiveState>,
     source: Arc<dyn ContentSource>,
@@ -94,6 +111,7 @@ impl DownloadManager {
         versions: HashMap<RomKey, Option<String>>,
     ) -> Self {
         Self {
+            cancelled: std::sync::atomic::AtomicBool::new(false),
             index: Mutex::new(index),
             live,
             source,
@@ -107,7 +125,19 @@ impl DownloadManager {
     /// Path of the ready private file for `entry`, downloading once if
     /// needed. Subsequent calls return the existing path without
     /// downloading. Errors fail every waiter and leave the entry not-ready.
+    pub fn events(&self) -> EventSink {
+        self.events.clone()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     pub fn ensure_ready(&self, entry: &RomEntry) -> Result<PathBuf> {
+        if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
         let key = &entry.key;
         let version = entry.version.as_ref().map(|v| v.0.as_str());
 
@@ -180,6 +210,7 @@ impl DownloadManager {
         let expected = self.expected.get(key).copied().unwrap_or(entry.size);
         let rom_id = key.rom_id.max(0) as u64;
         self.events.emit(AppEvent::DownloadStarted {
+            file_id: key.file_id.max(0) as u64,
             rom_id,
             file_name: entry.file_name.clone(),
             total: Some(expected),
@@ -189,6 +220,7 @@ impl DownloadManager {
         let result = self.fetch_and_publish(key, &part, &bin, expected, version, &rel_path);
         match &result {
             Ok(_) => self.events.emit(AppEvent::DownloadFinished {
+                file_id: key.file_id.max(0) as u64,
                 rom_id,
                 file_name: entry.file_name.clone(),
             }),
@@ -198,6 +230,7 @@ impl DownloadManager {
                 let _ = std::fs::remove_file(&bin);
                 let _ = self.index.lock().mark_failed(key);
                 self.events.emit(AppEvent::DownloadFailed {
+                    file_id: key.file_id.max(0) as u64,
                     rom_id,
                     file_name: entry.file_name.clone(),
                     reason: e.to_string(),
@@ -222,14 +255,26 @@ impl DownloadManager {
         let mut file = std::fs::File::create(part).map_err(Error::Io)?;
         let rom_id = key.rom_id.max(0) as u64;
         let events = self.events.clone();
+        let file_id = key.file_id.max(0) as u64;
         let mut progress = move |received: u64, total: Option<u64>| {
             events.emit(AppEvent::DownloadProgress {
+                file_id,
                 rom_id,
                 received,
                 total,
             });
         };
-        let written = self.source.fetch(key, &mut file, &mut progress);
+        let written = self.source.fetch(
+            key,
+            &mut CancelWriter {
+                file: &mut file,
+                cancelled: &self.cancelled,
+            },
+            &mut progress,
+        );
+        if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
         // The file handle must be released before the publish rename —
         // renaming an open file is an error on Windows.
         let written = match written {

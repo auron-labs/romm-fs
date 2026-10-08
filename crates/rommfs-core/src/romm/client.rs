@@ -89,9 +89,19 @@ impl RommClient {
         let base_url = base_url.trim().trim_end_matches('/').to_string();
         // Validate the URL shape early so catalogue calls never build a bad
         // request mid-mount.
-        isahc::Request::get(&base_url)
+        let request = isahc::Request::get(&base_url)
             .body(())
             .map_err(|_| Error::InvalidCatalogue("invalid server URL".into()))?;
+        let uri = request.uri();
+        if !matches!(uri.scheme_str(), Some("http" | "https"))
+            || uri.authority().is_none_or(|a| a.as_str().contains('@'))
+            || uri.query().is_some()
+            || base_url.contains('#')
+        {
+            return Err(Error::InvalidCatalogue(
+                "server URL must use HTTP(S), without credentials, query, or fragment".into(),
+            ));
+        }
         Ok(Self {
             base_url,
             download: DownloadConfig::default(),
@@ -165,15 +175,19 @@ impl RommClient {
         let mut resp = request.send().map_err(transport)?;
         match resp.status().as_u16() {
             s if (200..300).contains(&s) => {
-                let token: TokenResponse = resp.json().map_err(invalid_payload)?;
+                let token: TokenResponse = resp
+                    .json()
+                    .map_err(|_| Error::Auth("invalid token response; sign in again".into()))?;
                 *self.token.write().unwrap() = Some(token.access_token);
                 Ok(())
             }
             401 => Err(Error::Auth("credentials rejected by server".into())),
-            403 => Err(Error::Forbidden(detail_of(&mut resp))),
+            403 => Err(Error::Forbidden(
+                "requested authentication scopes denied".into(),
+            )),
             s => Err(Error::Http {
                 status: s,
-                message: detail_of(&mut resp),
+                message: "token request rejected".into(),
             }),
         }
     }
@@ -238,6 +252,64 @@ impl RommClient {
             rom_id,
             path_encode(file_name)
         );
+        self.download_content(url, writer, progress)
+    }
+
+    /// Download exactly one original file, never RomM's generated ROM ZIP.
+    /// The numeric selector is a RomFile.id, not its parent Rom.id.
+    pub fn download_original_file(
+        &self,
+        file_id: i64,
+        file_name: &str,
+        writer: &mut dyn Write,
+        progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<u64> {
+        if file_id <= 0 {
+            return Err(Error::InvalidCatalogue("invalid original file ID".into()));
+        }
+        let url = format!(
+            "{}/api/roms/{}/files/content/{}",
+            self.base_url,
+            file_id,
+            path_encode(file_name)
+        );
+        self.download_content(url, writer, progress)
+    }
+
+    /// Only source-provided local RomM resource paths. Never attach the session
+    /// token to an external metadata-provider URL or a ROM content route.
+    pub fn download_artwork(&self, resource: &str, writer: &mut dyn Write) -> Result<u64> {
+        let path = resource.split('?').next().unwrap_or_default();
+        if !path.starts_with("/assets/romm/resources/")
+            || path.contains('\\')
+            || path.chars().any(char::is_control)
+            || resource.contains('#')
+            || path.split('/').skip(1).any(|p| {
+                p.is_empty()
+                    || p == "."
+                    || p == ".."
+                    || p.to_ascii_lowercase().contains("%2e")
+                    || p.to_ascii_lowercase().contains("%2f")
+                    || p.to_ascii_lowercase().contains("%5c")
+            })
+        {
+            return Err(Error::Unsupported(
+                "artwork must use a safe server-local RomM resource path".into(),
+            ));
+        }
+        self.download_content(
+            format!("{}{}", self.base_url, resource.replace(' ', "%20")),
+            writer,
+            &mut |_, _| {},
+        )
+    }
+
+    fn download_content(
+        &self,
+        url: String,
+        writer: &mut dyn Write,
+        progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<u64> {
         let mut builder = isahc::Request::get(url)
             .connect_timeout(self.download.connect_timeout)
             .low_speed_timeout(

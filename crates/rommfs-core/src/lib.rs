@@ -6,10 +6,16 @@
 
 pub mod cache;
 pub mod catalog;
+pub mod catalogue_store;
+pub mod connection_settings;
+pub mod credential_store;
+pub mod diagnostics;
 pub mod download;
 pub mod error;
 pub mod events;
 pub mod fscore;
+pub mod layout;
+pub mod retrobat;
 pub mod romm;
 pub mod sanitize;
 pub mod save_sync;

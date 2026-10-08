@@ -3,18 +3,25 @@
 //! Tests exercise this path — no duplicate state machine in the UI (PRD §6).
 
 use crate::save_sync_agent::{SaveSyncAgent, SaveSyncCommandGate};
+use anyhow::Context as _;
 use rommfs_core::cache::clock::{Clock, SystemClock, DEFAULT_EVICTION_THRESHOLD_SECS};
 #[cfg(not(windows))]
 use rommfs_core::cache::NoopHydratedRemover;
 use rommfs_core::cache::{CacheIndex, Evictor, HydratedRemover, LiveState};
-use rommfs_core::catalog::{build_catalogue, server_id_of, Catalogue, RomKey};
+#[cfg(test)]
+use rommfs_core::catalog::build_catalogue;
+use rommfs_core::catalog::{server_id_of, Catalogue, RomKey};
+use rommfs_core::catalogue_store::{CatalogueSnapshot, CatalogueStore};
+use rommfs_core::connection_settings::{
+    ConnectionPreferences, ConnectionSettings, IntegrationMode,
+};
 use rommfs_core::download::{ContentSource, DownloadManager};
 use rommfs_core::error::{Error, Result};
 use rommfs_core::events::{
     AppEvent, EventSink, Level, LogBuffer, SaveSyncGameStatus, SaveSyncQueueStatus,
 };
 use rommfs_core::fscore::RommFs;
-use rommfs_core::romm::{Credentials, RommClient};
+use rommfs_core::romm::{Credentials, PairedSession, PairingPoll, PairingRequest, RommClient};
 use rommfs_core::save_sync::{
     discover_installations, map_catalogue, resolve_retrobat_gb_profile, validate_installation,
     ConsentSettings, DiscoveryInput, InstallationCandidate, InstallationProblem, MappingReport,
@@ -49,6 +56,7 @@ pub enum MountState {
 
 #[derive(Clone, Debug)]
 pub struct DownloadView {
+    pub file_id: u64,
     pub rom_id: u64,
     pub file_name: String,
     pub received: u64,
@@ -71,12 +79,27 @@ const MAX_DOWNLOAD_ROWS: usize = 128;
 
 /// Everything the window draws — derived ONLY from real worker events.
 pub struct UiState {
+    pub integration: IntegrationMode,
+    pub retrobat_root: Option<String>,
+    pub integration_error: Option<String>,
+    pub retrobat_setup_running: bool,
+    pub retrobat_setup_detail: Option<String>,
+    pub retrobat_setup_error: Option<String>,
+    pub frontend_metadata_pending: bool,
+    pub frontend_metadata_detail: Option<String>,
+    pub frontend_metadata_error: Option<String>,
+    pub pairing_code: Option<String>,
     pub conn: ConnState,
     pub conn_error: Option<String>,
     pub mount: MountState,
     pub mount_path: Option<String>,
     pub mount_error: Option<String>,
     pub downloads: Vec<DownloadView>,
+    pub catalogue_progress: Option<(String, u64, Option<u64>, u64)>,
+    pub mount_progress: Option<(String, u64, Option<u64>, u64)>,
+    pub catalogue_refreshed_at: Option<u64>,
+    pub catalogue_pending_remount: bool,
+    catalogue_operation_id: u64,
     pub catalogue: Option<(usize, usize, usize)>, // platforms, roms, skipped
     pub save_sync_candidates: Vec<InstallationCandidate>,
     pub save_sync_skipped: usize,
@@ -111,12 +134,27 @@ pub struct UiState {
 impl UiState {
     pub fn new(log_cap: usize) -> Self {
         Self {
+            integration: IntegrationMode::Generic,
+            retrobat_root: None,
+            integration_error: None,
+            retrobat_setup_running: false,
+            retrobat_setup_detail: None,
+            retrobat_setup_error: None,
+            frontend_metadata_pending: false,
+            frontend_metadata_detail: None,
+            frontend_metadata_error: None,
+            pairing_code: None,
             conn: ConnState::Idle,
             conn_error: None,
             mount: MountState::NotMounted,
             mount_path: None,
             mount_error: None,
             downloads: Vec::new(),
+            catalogue_progress: None,
+            mount_progress: None,
+            catalogue_refreshed_at: None,
+            catalogue_pending_remount: false,
+            catalogue_operation_id: 0,
             catalogue: None,
             save_sync_candidates: Vec::new(),
             save_sync_skipped: 0,
@@ -152,6 +190,54 @@ impl UiState {
     /// Apply one worker event. This is THE transition table the UI uses.
     pub fn apply(&mut self, event: &AppEvent) {
         match event {
+            AppEvent::FrontendMetadata {
+                pending,
+                detail,
+                error,
+            } => {
+                self.frontend_metadata_pending = *pending;
+                self.frontend_metadata_detail = Some(detail.clone());
+                self.frontend_metadata_error = error.clone();
+            }
+            AppEvent::RetroBatSetup {
+                running,
+                detail,
+                error,
+            } => {
+                self.retrobat_setup_running = *running;
+                self.retrobat_setup_detail = Some(detail.clone());
+                self.retrobat_setup_error = error.clone();
+            }
+            AppEvent::IntegrationUpdated {
+                mode,
+                retrobat_root,
+                error,
+            } => {
+                self.integration = *mode;
+                self.retrobat_root = retrobat_root.clone();
+                self.integration_error = error.clone();
+            }
+            AppEvent::ConnectionRestored { .. } => {}
+            AppEvent::SignedOut => {
+                self.conn = ConnState::Idle;
+                self.conn_error = None;
+                self.catalogue = None;
+                self.catalogue_refreshed_at = None;
+                self.catalogue_pending_remount = false;
+                self.catalogue_progress = None;
+                self.downloads.clear();
+                self.pairing_code = None;
+            }
+            AppEvent::PairingReady { user_code, .. } => {
+                self.pairing_code = Some(user_code.clone());
+            }
+            AppEvent::PairingEnded { reason } => {
+                self.pairing_code = None;
+                if let Some(reason) = reason {
+                    self.conn = ConnState::Failed;
+                    self.conn_error = Some(reason.clone());
+                }
+            }
             AppEvent::Connecting => {
                 self.conn = ConnState::Connecting;
                 self.conn_error = None;
@@ -159,6 +245,9 @@ impl UiState {
                 // catalogue/downloads — never show stale data for a server
                 // we may no longer be talking to.
                 self.catalogue = None;
+                self.catalogue_progress = None;
+                self.catalogue_refreshed_at = None;
+                self.catalogue_pending_remount = false;
                 self.downloads.clear();
                 self.save_sync_games.clear();
                 self.save_sync_reconciled_games = 0;
@@ -196,19 +285,53 @@ impl UiState {
                 self.conn_error = Some("sign-in required".to_string());
             }
 
-            AppEvent::CatalogueLoading => {}
+            AppEvent::CatalogueProgress {
+                operation_id,
+                stage,
+                completed,
+                total,
+                elapsed_ms,
+            } => {
+                if *operation_id >= self.catalogue_operation_id {
+                    self.catalogue_operation_id = *operation_id;
+                    self.catalogue_progress =
+                        Some((stage.clone(), *completed, *total, *elapsed_ms));
+                }
+            }
+            AppEvent::CatalogueSnapshot {
+                refreshed_at,
+                pending_remount,
+                ..
+            } => {
+                self.catalogue_refreshed_at = Some(*refreshed_at);
+                self.catalogue_pending_remount = *pending_remount;
+            }
+            AppEvent::MountProgress {
+                stage,
+                completed,
+                total,
+                elapsed_ms,
+            } => {
+                self.mount_progress = Some((stage.clone(), *completed, *total, *elapsed_ms));
+            }
+            AppEvent::CatalogueLoading => {
+                self.conn_error = None;
+            }
             AppEvent::CatalogueLoaded {
                 platforms,
                 roms,
                 skipped_unsupported,
             } => {
                 self.catalogue = Some((*platforms, *roms, *skipped_unsupported));
+                self.catalogue_progress = None;
+                self.conn_error = None;
             }
             AppEvent::CatalogueFailed { reason } => {
                 // Auth may have succeeded while the catalogue fetch failed:
                 // stay Connected but surface the error — a failed catalogue
                 // must never render as a successful (empty) library (R1).
                 self.conn_error = Some(reason.clone());
+                self.catalogue_progress = None;
             }
 
             AppEvent::MountStarting { path } => {
@@ -218,6 +341,8 @@ impl UiState {
             }
             AppEvent::MountStarted { path } => {
                 self.mount = MountState::Mounted;
+                self.catalogue_pending_remount = false;
+                self.mount_progress = None;
                 self.mount_path = Some(path.clone());
                 self.mount_error = None;
             }
@@ -382,37 +507,44 @@ impl UiState {
             }
 
             AppEvent::DownloadStarted {
+                file_id,
                 rom_id,
                 file_name,
                 total,
             } => {
-                let row = self.download_row(*rom_id, file_name);
+                let row = self.download_row(*rom_id, *file_id, file_name);
                 row.received = 0;
                 row.total = *total;
                 row.finished = None;
             }
             AppEvent::DownloadProgress {
+                file_id,
                 rom_id,
                 received,
                 total,
             } => {
                 let file_name = String::new();
-                let row = self.download_row(*rom_id, &file_name);
+                let row = self.download_row(*rom_id, *file_id, &file_name);
                 row.received = *received;
                 if total.is_some() {
                     row.total = *total;
                 }
             }
-            AppEvent::DownloadFinished { rom_id, file_name } => {
-                let row = self.download_row(*rom_id, file_name);
+            AppEvent::DownloadFinished {
+                rom_id,
+                file_id,
+                file_name,
+            } => {
+                let row = self.download_row(*rom_id, *file_id, file_name);
                 row.finished = Some(Ok(()));
             }
             AppEvent::DownloadFailed {
+                file_id,
                 rom_id,
                 file_name,
                 reason,
             } => {
-                let row = self.download_row(*rom_id, file_name);
+                let row = self.download_row(*rom_id, *file_id, file_name);
                 row.finished = Some(Err(reason.clone()));
             }
 
@@ -444,8 +576,12 @@ impl UiState {
         self.mount_error = None;
     }
 
-    fn download_row(&mut self, rom_id: u64, file_name: &str) -> &mut DownloadView {
-        if let Some(pos) = self.downloads.iter().position(|d| d.rom_id == rom_id) {
+    fn download_row(&mut self, rom_id: u64, file_id: u64, file_name: &str) -> &mut DownloadView {
+        if let Some(pos) = self
+            .downloads
+            .iter()
+            .position(|d| d.rom_id == rom_id && d.file_id == file_id)
+        {
             let row = &mut self.downloads[pos];
             if !file_name.is_empty() {
                 row.file_name = file_name.to_string();
@@ -454,6 +590,7 @@ impl UiState {
         }
         self.downloads.push(DownloadView {
             rom_id,
+            file_id,
             file_name: file_name.to_string(),
             received: 0,
             total: None,
@@ -462,21 +599,47 @@ impl UiState {
         self.downloads.last_mut().unwrap()
     }
 
+    pub fn clear_completed_downloads(&mut self) {
+        self.downloads
+            .retain(|d| !matches!(d.finished, Some(Ok(()))));
+    }
+
     fn prune_downloads(&mut self) {
-        while self.downloads.len() > MAX_DOWNLOAD_ROWS {
+        while self
+            .downloads
+            .iter()
+            .filter(|d| matches!(d.finished, Some(Ok(()))))
+            .count()
+            > MAX_DOWNLOAD_ROWS
+        {
             let drop_at = self
                 .downloads
                 .iter()
-                .position(|d| d.finished.is_some())
-                .unwrap_or(0);
+                .position(|d| matches!(d.finished, Some(Ok(()))));
+            let Some(drop_at) = drop_at else {
+                break;
+            };
             self.downloads.remove(drop_at);
         }
     }
 }
 
 /// Commands the window sends to the controller.
-#[derive(Debug)]
 pub enum Command {
+    SetupRetroBat {
+        installation: PathBuf,
+        managed_root: PathBuf,
+    },
+    SetIntegration {
+        mode: IntegrationMode,
+        retrobat_root: Option<PathBuf>,
+    },
+    RestoreConnection,
+    BeginPairing {
+        url: String,
+    },
+    CancelPairing,
+    Logout,
     Connect {
         url: String,
         username: String,
@@ -486,6 +649,7 @@ pub enum Command {
         path: String,
     },
     StopMount,
+    RefreshCatalogue,
     RefreshSaveSync,
     SelectSaveSyncInstallation {
         path: PathBuf,
@@ -507,12 +671,19 @@ pub enum Command {
 struct CommandEnvelope {
     command: Command,
     save_sync_epoch: u64,
+    connection_epoch: u64,
 }
 
 fn invalidates_save_sync_scope(command: &Command) -> bool {
     matches!(
         command,
-        Command::Connect { .. }
+        Command::SetIntegration { .. }
+            | Command::SetupRetroBat { .. }
+            | Command::BeginPairing { .. }
+            | Command::CancelPairing
+            | Command::Logout
+            | Command::RestoreConnection
+            | Command::Connect { .. }
             | Command::StartMount { .. }
             | Command::RefreshSaveSync
             | Command::SelectSaveSyncInstallation { .. }
@@ -529,24 +700,42 @@ pub struct Controller {
     // worker thread handle held for shutdown joining
     worker: Option<JoinHandle<()>>,
     save_sync_gate: SaveSyncCommandGate,
+    connection_gate: SaveSyncCommandGate,
 }
 
 impl Controller {
     /// Spawn the controller + worker loop. Returns (controller, event rx).
     pub fn spawn() -> (Self, mpsc::Receiver<AppEvent>) {
         let (sink, event_rx) = rommfs_core::events::channel();
+        let sink = match diagnostic_log_directory() {
+            Some(directory) => match sink.clone().with_log_directory(&directory) {
+                Ok(durable) => durable,
+                Err(error) => {
+                    sink.emit(AppEvent::log(
+                        Level::Error,
+                        "diagnostics",
+                        format!("Diagnostic log unavailable: {error}"),
+                    ));
+                    sink
+                }
+            },
+            None => sink,
+        };
         let (cmd_tx, cmd_rx) = mpsc::channel::<CommandEnvelope>();
         let worker_sink = sink.clone();
         let save_sync_gate = SaveSyncCommandGate::new();
         let worker_gate = save_sync_gate.clone();
+        let connection_gate = SaveSyncCommandGate::new();
+        let worker_connection_gate = connection_gate.clone();
         let worker = std::thread::Builder::new()
             .name("rommfs-worker".to_string())
-            .spawn(move || worker_loop(cmd_rx, worker_sink, worker_gate))
+            .spawn(move || worker_loop(cmd_rx, worker_sink, worker_gate, worker_connection_gate))
             .expect("spawn worker thread");
         let initial_epoch = save_sync_gate.invalidate();
         let _ = cmd_tx.send(CommandEnvelope {
-            command: Command::RefreshSaveSync,
+            command: Command::RestoreConnection,
             save_sync_epoch: initial_epoch,
+            connection_epoch: connection_gate.current_epoch(),
         });
         (
             Self {
@@ -554,6 +743,7 @@ impl Controller {
                 cmd_tx,
                 worker: Some(worker),
                 save_sync_gate,
+                connection_gate,
             },
             event_rx,
         )
@@ -565,9 +755,23 @@ impl Controller {
         } else {
             self.save_sync_gate.current_epoch()
         };
+        let connection_epoch = if matches!(
+            cmd,
+            Command::BeginPairing { .. }
+                | Command::CancelPairing
+                | Command::Logout
+                | Command::RestoreConnection
+                | Command::Connect { .. }
+                | Command::Shutdown
+        ) {
+            self.connection_gate.invalidate()
+        } else {
+            self.connection_gate.current_epoch()
+        };
         let _ = self.cmd_tx.send(CommandEnvelope {
             command: cmd,
             save_sync_epoch,
+            connection_epoch,
         });
     }
 
@@ -593,11 +797,38 @@ impl Drop for Controller {
 
 /// What the worker holds about the active server session. One server, one
 /// mount — rebuilt on Connect/StartMount, never shared across servers.
+struct PendingPairing {
+    client: Arc<RommClient>,
+    url: String,
+    identifier: String,
+    request: PairingRequest,
+    expires: Instant,
+    next_poll: Instant,
+    interval: Duration,
+    epoch: u64,
+}
+
 struct Worker {
+    metadata_job: Option<mpsc::Receiver<Result<rommfs_core::retrobat::ArtworkBatch>>>,
+    metadata_active: Option<Arc<std::sync::atomic::AtomicBool>>,
+    metadata_source: Option<(Catalogue, CatalogueSnapshot)>,
+    metadata_ready: Option<rommfs_core::retrobat::ArtworkBatch>,
+    metadata_wait_reported: bool,
+    #[cfg(test)]
+    rom_cache_directory: Option<PathBuf>,
     sink: EventSink,
     client: Option<Arc<RommClient>>,
     server_id: Option<String>,
-    /// Latest built catalogue; consumed into `RommTree` on mount.
+    connection_settings: Option<ConnectionSettings>,
+    preferences: Option<ConnectionPreferences>,
+    pairing: Option<PendingPairing>,
+    catalogue_store: Option<CatalogueStore>,
+    catalogue_account: Option<String>,
+    source_snapshot: Option<CatalogueSnapshot>,
+    refresh_result: Option<mpsc::Receiver<Result<CatalogueSnapshot>>>,
+    refresh_active: Option<Arc<std::sync::atomic::AtomicBool>>,
+    catalogue_operation_id: u64,
+    /// Latest complete projection, retained for warm remounts.
     catalogue: Option<Catalogue>,
     /// ROM file names by key (content URL + log/evict context).
     names: HashMap<RomKey, String>,
@@ -616,6 +847,8 @@ struct Worker {
     save_sync_catalogue: Option<Catalogue>,
     save_sync_agent: Option<SaveSyncAgent>,
     save_sync_gate: SaveSyncCommandGate,
+    connection_gate: SaveSyncCommandGate,
+    current_connection_epoch: u64,
     current_save_sync_epoch: u64,
     save_sync_runtime_problem: Option<String>,
     save_sync_session_id: u64,
@@ -630,10 +863,26 @@ impl Worker {
     fn new_with_gate(sink: EventSink, save_sync_gate: SaveSyncCommandGate) -> Self {
         let current_save_sync_epoch = save_sync_gate.current_epoch();
         Self {
+            metadata_job: None,
+            metadata_active: None,
+            metadata_source: None,
+            metadata_ready: None,
+            metadata_wait_reported: false,
+            #[cfg(test)]
+            rom_cache_directory: None,
             sink,
             client: None,
             server_id: None,
             catalogue: None,
+            connection_settings: None,
+            preferences: None,
+            pairing: None,
+            catalogue_store: None,
+            catalogue_account: None,
+            source_snapshot: None,
+            refresh_result: None,
+            refresh_active: None,
+            catalogue_operation_id: 0,
             names: HashMap::new(),
             fs: None,
             mount: None,
@@ -650,6 +899,8 @@ impl Worker {
             save_sync_catalogue: None,
             save_sync_agent: None,
             save_sync_gate,
+            connection_gate: SaveSyncCommandGate::new(),
+            current_connection_epoch: 0,
             current_save_sync_epoch,
             save_sync_runtime_problem: None,
             save_sync_session_id: 0,
@@ -675,6 +926,20 @@ impl Worker {
             .as_ref()
             .and_then(|settings| settings.selected_installation().ok().flatten());
         let mut worker = Self::new_with_gate(sink, save_sync_gate);
+        if let Some(parent) = settings_path.as_ref().and_then(|p| p.parent()) {
+            match ConnectionSettings::open(&parent.join("connection.db")) {
+                Ok(store) => worker.connection_settings = Some(store),
+                Err(error) => worker.log(Level::Warn, "settings", error.to_string()),
+            }
+            match CatalogueStore::open(&parent.join("catalogue.db")) {
+                Ok(store) => worker.catalogue_store = Some(store),
+                Err(error) => worker.log(
+                    Level::Warn,
+                    "catalogue",
+                    format!("Catalogue persistence unavailable: {error}"),
+                ),
+            }
+        }
         worker.save_sync_settings = save_sync_settings;
         worker.save_sync_storage_dir =
             settings_path.and_then(|path| path.parent().map(Path::to_path_buf));
@@ -1040,7 +1305,7 @@ impl Worker {
         if session_id != self.save_sync_session_id {
             return;
         }
-        let result = (|| {
+        let result: Result<()> = (|| {
             if let Some(agent) = self.save_sync_agent.as_ref() {
                 return agent.export_incoming(incoming_id, destination.to_path_buf());
             }
@@ -1206,17 +1471,18 @@ impl Worker {
         self.advance_save_sync_session();
         self.sink.emit(AppEvent::Connecting);
         self.stop_save_sync_agent();
+        self.cancel_pairing();
         if self.mount.is_some() {
-            self.fail_connect(&Error::Unsupported(
-                "stop the mount before connecting elsewhere".into(),
-            ));
-            self.refresh_save_sync();
-            return;
+            self.stop_mount();
         }
 
         // Starting a new connection replaces the previous session, even when
         // URL validation or authentication fails. Keep the mounted-session
         // rejection above intact because that mount still owns its client.
+        // Dropping the old result receiver prevents stale refreshes from publishing.
+        self.cancel_catalogue_refresh();
+        self.source_snapshot = None;
+        self.catalogue_account = None;
         self.client = None;
         self.server_id = None;
         self.catalogue = None;
@@ -1247,61 +1513,811 @@ impl Worker {
                 }
             };
 
+        self.accept_connection(client, url, save_sync_identity);
+    }
+
+    fn forget_other_account(&mut self, url: &str, account_id: Option<i64>) {
+        if self.preferences.as_ref().is_some_and(|p| {
+            server_id_of(&p.server) != server_id_of(url) || account_id != Some(p.account_id)
+        }) {
+            if let Some(p) = self.preferences.take() {
+                if let Err(error) =
+                    rommfs_core::credential_store::delete(&server_id_of(&p.server), p.account_id)
+                {
+                    self.log(
+                        Level::Error,
+                        "credentials",
+                        format!("Previous remembered account could not be removed: {error}"),
+                    );
+                }
+            }
+            if let Some(settings) = &self.connection_settings {
+                if let Err(error) = settings.clear() {
+                    self.log(Level::Error, "settings", error.to_string());
+                }
+            }
+        }
+    }
+
+    fn accept_connection(
+        &mut self,
+        client: Arc<RommClient>,
+        url: &str,
+        identity: Option<rommfs_core::romm::SaveSyncIdentity>,
+    ) {
+        self.forget_other_account(url, identity.as_ref().map(|i| i.account_id));
+        if self.preferences.is_none() {
+            if let Some(identity) = &identity {
+                self.preferences = Some(ConnectionPreferences {
+                    server: url.into(),
+                    account_id: identity.account_id,
+                    device_identifier: uuid::Uuid::new_v4().to_string(),
+                    mount_root: None,
+                    integration: IntegrationMode::Generic,
+                    retrobat_root: None,
+                    start_at_login: false,
+                });
+            }
+        }
+        self.emit_integration(None);
         self.client = Some(Arc::clone(&client));
         self.server_id = Some(server_id_of(url));
-        self.save_sync_identity = save_sync_identity;
+        self.catalogue_account = identity
+            .as_ref()
+            .map(|identity| identity.account_id.to_string());
+        self.save_sync_identity = identity;
         self.sink.emit(AppEvent::Connected);
-        self.log(Level::Info, "connect", format!("connected as {username}"));
-
-        // The catalogue primes the UI (counts) but a failure here must not
-        // fake an empty library — it surfaces as CatalogueFailed (R1).
+        self.log(
+            Level::Info,
+            "connect",
+            "Authenticated connection established",
+        );
+        if self.restore_catalogue() {
+            self.refresh_save_sync();
+            self.refresh_catalogue();
+            return;
+        }
         match self.load_catalogue(&client) {
             Ok(cat) => {
                 self.store_catalogue(cat);
                 self.refresh_save_sync();
             }
-            Err(e) => {
-                if e.needs_sign_in() {
+            Err(error) => {
+                if error.needs_sign_in() {
                     self.sink.emit(AppEvent::SignInRequired);
                 } else {
                     self.sink.emit(AppEvent::CatalogueFailed {
-                        reason: e.to_string(),
+                        reason: error.to_string(),
                     });
                 }
-                self.log(Level::Error, "catalogue", e.to_string());
+                self.log(Level::Error, "catalogue", error.to_string());
                 self.refresh_save_sync();
             }
         }
     }
 
-    /// Fetch platforms + all ROM pages and build the catalogue.
-    /// `stop/start reloads it` (R1) — called on Connect and on every
-    /// StartMount so the mounted snapshot is fresh.
-    fn load_catalogue(&mut self, client: &RommClient) -> Result<Catalogue> {
-        self.sink.emit(AppEvent::CatalogueLoading);
-        let platforms = client.platforms()?;
-        let roms = client.all_roms()?;
-        let server_id = self.server_id.clone().unwrap_or_default();
-        let sink = self.sink.clone();
-        let cat = build_catalogue(&server_id, &platforms, &roms, move |warning| {
-            sink.emit(AppEvent::log(Level::Warn, "catalogue", warning));
+    fn begin_pairing(&mut self, url: &str) {
+        self.clear_active_connection();
+        self.sink.emit(AppEvent::Connecting);
+        let result: Result<()> = (|| {
+            let client = Arc::new(RommClient::new(url)?);
+            let identifier = self
+                .preferences
+                .as_ref()
+                .map(|p| p.device_identifier.clone())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let request = client.begin_pairing(&identifier)?;
+            let browser_url = client.pairing_url(&request)?;
+            let interval = Duration::from_secs(request.interval.max(1));
+            self.sink.emit(AppEvent::PairingReady {
+                user_code: request.user_code.clone(),
+                url: browser_url,
+            });
+            self.pairing = Some(PendingPairing {
+                client,
+                url: url.into(),
+                identifier,
+                expires: Instant::now() + Duration::from_secs(request.expires_in.min(600)),
+                next_poll: Instant::now() + interval,
+                interval,
+                request,
+                epoch: self.current_connection_epoch,
+            });
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.fail_connect(&error);
+        }
+    }
+
+    fn cancel_pairing(&mut self) {
+        if self.pairing.take().is_some() {
+            self.sink.emit(AppEvent::PairingEnded {
+                reason: Some("Browser sign-in cancelled".into()),
+            });
+        }
+    }
+
+    fn poll_pairing(&mut self) {
+        let Some(mut pairing) = self.pairing.take() else {
+            return;
+        };
+        if pairing.epoch != self.connection_gate.current_epoch() {
+            self.pairing = Some(pairing);
+            return;
+        }
+        if Instant::now() >= pairing.expires {
+            self.sink.emit(AppEvent::PairingEnded {
+                reason: Some("Pairing expired; sign in again".into()),
+            });
+            return;
+        }
+        if Instant::now() < pairing.next_poll {
+            self.pairing = Some(pairing);
+            return;
+        }
+        let result = pairing.client.poll_pairing(&pairing.request.device_code);
+        if pairing.epoch != self.connection_gate.current_epoch() {
+            self.pairing = Some(pairing);
+            return;
+        }
+        match result {
+            Ok(PairingPoll::Pending | PairingPoll::SlowDown) => {
+                if matches!(result, Ok(PairingPoll::SlowDown)) {
+                    pairing.interval += Duration::from_secs(5);
+                }
+                pairing.next_poll = Instant::now() + pairing.interval;
+                self.pairing = Some(pairing);
+            }
+            Ok(PairingPoll::Denied | PairingPoll::Expired) => {
+                self.sink.emit(AppEvent::PairingEnded {
+                    reason: Some("Browser sign-in denied or expired; sign in again".into()),
+                });
+            }
+            Ok(PairingPoll::Approved(secret)) => {
+                let result = self.finish_pairing(&pairing, &secret);
+                if pairing.epoch != self.connection_gate.current_epoch() {
+                    self.pairing = Some(pairing);
+                    return;
+                }
+                self.sink.emit(AppEvent::PairingEnded {
+                    reason: result.as_ref().err().map(ToString::to_string),
+                });
+                if let Err(error) = result {
+                    self.fail_connect(&error);
+                }
+            }
+            Err(error) => {
+                self.sink.emit(AppEvent::PairingEnded {
+                    reason: Some(error.to_string()),
+                });
+                self.fail_connect(&error);
+            }
+        }
+    }
+
+    fn finish_pairing(&mut self, pairing: &PendingPairing, secret: &PairedSession) -> Result<()> {
+        pairing.client.restore_paired_session(secret)?;
+        let identity = pairing.client.save_sync_identity()?.ok_or_else(|| {
+            Error::Auth("pairing did not return a verified account; approve me.read".into())
         })?;
+        if pairing.epoch != self.connection_gate.current_epoch() {
+            return Err(Error::Cancelled);
+        }
+        self.forget_other_account(&pairing.url, Some(identity.account_id));
+        let server = server_id_of(&pairing.url);
+        let mut preferences = self
+            .preferences
+            .clone()
+            .unwrap_or_else(|| ConnectionPreferences {
+                server: pairing.url.clone(),
+                account_id: identity.account_id,
+                device_identifier: pairing.identifier.clone(),
+                mount_root: None,
+                integration: IntegrationMode::Generic,
+                retrobat_root: None,
+                start_at_login: false,
+            });
+        preferences.device_identifier = pairing.identifier.clone();
+        // A credential-store failure leaves the authenticated in-memory session
+        // usable, but is explicitly not represented as remembered sign-in.
+        match rommfs_core::credential_store::save(&server, identity.account_id, secret) {
+            Ok(()) => {
+                if let Some(settings) = &self.connection_settings {
+                    settings.save(&preferences)?;
+                }
+            }
+            Err(error) => self.log(
+                Level::Warn,
+                "credentials",
+                format!("Sign-in will not be remembered: {error}"),
+            ),
+        }
+        self.preferences = Some(preferences);
+        self.accept_connection(pairing.client.clone(), &pairing.url, Some(identity));
+        Ok(())
+    }
+
+    fn restore_connection(&mut self) {
+        let result: Result<()> = (|| {
+            let Some(settings) = &self.connection_settings else {
+                return Ok(());
+            };
+            let Some(preferences) = settings.load()? else {
+                return Ok(());
+            };
+            self.sink.emit(AppEvent::ConnectionRestored {
+                server: preferences.server.clone(),
+                mount_root: preferences
+                    .mount_root
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+            });
+            self.preferences = Some(preferences.clone());
+            let Some(secret) = rommfs_core::credential_store::load(
+                &server_id_of(&preferences.server),
+                preferences.account_id,
+            )?
+            else {
+                return Err(Error::Auth(
+                    "remembered account needs browser sign-in".into(),
+                ));
+            };
+            let client = Arc::new(RommClient::new(&preferences.server)?);
+            client.restore_paired_session(&secret)?;
+            // Authentication rejection is never hidden by a warm cache.
+            let identity = client
+                .save_sync_identity()?
+                .ok_or_else(|| Error::Auth("stored session account unavailable".into()))?;
+            if identity.account_id != preferences.account_id {
+                return Err(Error::Auth(
+                    "stored session belongs to another account".into(),
+                ));
+            }
+            self.sink.emit(AppEvent::Connecting);
+            self.accept_connection(client, &preferences.server, Some(identity));
+            if std::env::args().any(|arg| arg == "--startup") && preferences.start_at_login {
+                if let Some(root) = &preferences.mount_root {
+                    self.start_mount(&root.display().to_string());
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.fail_connect(&error);
+        }
+        if self.client.is_none() {
+            self.refresh_save_sync();
+        }
+    }
+
+    fn clear_active_connection(&mut self) {
+        self.cancel_pairing();
+        self.stop_save_sync_agent();
+        self.stop_mount();
+        self.advance_save_sync_session();
+        self.cancel_catalogue_refresh();
+        self.client = None;
+        self.server_id = None;
+        self.catalogue = None;
+        self.source_snapshot = None;
+        self.catalogue_account = None;
+        self.names.clear();
+        self.save_sync_catalogue = None;
+        self.save_sync_identity = None;
+        self.save_sync_scope = None;
+        self.save_sync_enabled = false;
+    }
+
+    fn logout(&mut self) {
+        self.clear_active_connection();
+        let result: Result<()> = (|| {
+            if let Some(preferences) = &self.preferences {
+                rommfs_core::credential_store::delete(
+                    &server_id_of(&preferences.server),
+                    preferences.account_id,
+                )?;
+            }
+            if let Some(settings) = &self.connection_settings {
+                settings.clear()?;
+            }
+            Ok(())
+        })();
+        self.preferences = None;
+        if let Err(error) = result {
+            self.log(
+                Level::Error,
+                "logout",
+                format!("Could not remove remembered sign-in: {error}"),
+            );
+        }
+        self.sink.emit(AppEvent::SignedOut);
+        self.refresh_save_sync();
+    }
+
+    fn emit_integration(&self, error: Option<String>) {
+        let preferences = self.preferences.as_ref();
+        self.sink.emit(AppEvent::IntegrationUpdated {
+            mode: preferences.map(|p| p.integration).unwrap_or_default(),
+            retrobat_root: preferences
+                .and_then(|p| p.retrobat_root.as_ref())
+                .map(|p| p.display().to_string()),
+            error,
+        });
+    }
+
+    fn metadata_status(&self, pending: bool, detail: impl Into<String>, error: Option<String>) {
+        self.sink.emit(AppEvent::FrontendMetadata {
+            pending,
+            detail: detail.into(),
+            error,
+        });
+    }
+
+    fn cancel_metadata(&mut self) {
+        if let Some(active) = self.metadata_active.take() {
+            active.store(false, std::sync::atomic::Ordering::Release);
+        }
+        self.metadata_job = None;
+        self.metadata_ready = None;
+        self.metadata_source = None;
+        self.metadata_wait_reported = false;
+    }
+
+    fn queue_metadata(&mut self) {
+        self.cancel_metadata();
+        let Some(preferences) = self
+            .preferences
+            .as_ref()
+            .filter(|p| p.integration == IntegrationMode::RetroBat)
+        else {
+            return;
+        };
+        let (Some(fs), Some(snapshot), Some(client)) =
+            (&self.fs, &self.source_snapshot, &self.client)
+        else {
+            return;
+        };
+        let catalogue = fs.catalogue().clone();
+        // A refreshed structure is staged for the next mount. Never generate
+        // launch paths for files that are absent from this immutable native tree.
+        if self.catalogue.as_ref().is_some_and(|next| {
+            next.entries.len() != catalogue.entries.len()
+                || next.entries.iter().zip(&catalogue.entries).any(|(a, b)| {
+                    a.key != b.key
+                        || a.platform_dir != b.platform_dir
+                        || a.file_name != b.file_name
+                        || next.is_launchable(&a.key) != catalogue.is_launchable(&b.key)
+                })
+        }) {
+            self.metadata_status(
+                true,
+                "Frontend metadata retained; library changes apply on the next remount",
+                None,
+            );
+            return;
+        }
+        let snapshot = snapshot.clone();
+        let roms = snapshot.roms.clone();
+        let client = client.clone();
+        let cache = cache_dir_for(self.server_id.as_deref().unwrap_or_default())
+            .join("artwork")
+            .join(preferences.account_id.to_string());
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        self.metadata_active = Some(active.clone());
+        self.metadata_source = Some((catalogue.clone(), snapshot));
+        let (tx, rx) = mpsc::channel();
+        self.metadata_job = Some(rx);
+        self.metadata_status(
+            true,
+            "Caching frontend artwork without downloading ROMs",
+            None,
+        );
+        std::thread::spawn(move || {
+            let _ = tx.send(rommfs_core::retrobat::cache_artwork_cancellable(
+                &client, &catalogue, &roms, &cache, &active,
+            ));
+        });
+    }
+
+    fn poll_metadata(&mut self) {
+        if let Some(rx) = &self.metadata_job {
+            let result = match rx.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err(Error::Transport("artwork worker stopped".into()))
+                }
+            };
+            self.metadata_job = None;
+            match result {
+                Ok(artwork) => self.metadata_ready = Some(artwork),
+                Err(error) => {
+                    self.cancel_metadata();
+                    if error.needs_sign_in() {
+                        self.stop_save_sync_agent();
+                        self.stop_mount();
+                        self.sink.emit(AppEvent::SignInRequired);
+                    }
+                    self.log(Level::Error, "metadata", error.to_string());
+                    self.metadata_status(
+                        false,
+                        "Frontend metadata was not published",
+                        Some(error.to_string()),
+                    );
+                    return;
+                }
+            }
+        }
+        if self.metadata_ready.is_none() {
+            return;
+        }
+        let Some(installation) = self
+            .preferences
+            .as_ref()
+            .and_then(|p| p.retrobat_root.as_deref())
+        else {
+            self.cancel_metadata();
+            return;
+        };
+        let guard = match stopped_retrobat_guard(installation) {
+            Ok(guard) => guard,
+            Err(error)
+                if !error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| matches!(io.raw_os_error(), Some(5 | 32 | 33))) =>
+            {
+                self.cancel_metadata();
+                self.log(Level::Error, "metadata", format!("{error:#}"));
+                self.metadata_status(
+                    false,
+                    "Frontend metadata cannot be published safely",
+                    Some(format!("{error:#}")),
+                );
+                return;
+            }
+            Err(error) => {
+                if !self.metadata_wait_reported {
+                    self.metadata_status(true, "Frontend metadata is ready; waiting for exclusive frontend/emulator access. Stop RetroBat and check the reported access error", Some(format!("{error:#}")));
+                    self.metadata_wait_reported = true;
+                }
+                return;
+            }
+        };
+        let result = (|| -> anyhow::Result<()> {
+            let root = &self
+                .mount
+                .as_ref()
+                .context("mount stopped before metadata publication")?
+                .root;
+            let server = self.server_id.as_deref().context("connection ended")?;
+            let account = self
+                .preferences
+                .as_ref()
+                .context("account changed")?
+                .account_id;
+            let (catalogue, snapshot) = self
+                .metadata_source
+                .as_ref()
+                .context("metadata source unavailable")?;
+            let artwork = self
+                .metadata_ready
+                .as_ref()
+                .context("artwork unavailable")?;
+            for warning in artwork.warnings() {
+                self.log(Level::Warn, "artwork", warning.clone());
+            }
+            let (index, existing) = rommfs_cfapi::read_frontend_metadata(root, server)?;
+            let publication = rommfs_core::retrobat::generate_gamelists(
+                catalogue,
+                &snapshot.roms,
+                server,
+                account,
+                &index,
+                &existing,
+                artwork.references(),
+            )?;
+            rommfs_cfapi::publish_frontend_metadata(root, server, &publication, artwork.files())?;
+            self.log(
+                Level::Info,
+                "metadata",
+                format!(
+                    "Published {} gamelists; frontend favourites and history preserved",
+                    publication.gamelists().len()
+                ),
+            );
+            Ok(())
+        })();
+        drop(guard);
+        self.cancel_metadata();
+        match result {
+            Ok(()) => self.metadata_status(false, "Frontend metadata is up to date", None),
+            Err(error) => {
+                self.log(Level::Error, "metadata", format!("{error:#}"));
+                self.metadata_status(
+                    false,
+                    "Frontend metadata was not fully published; existing state was retained",
+                    Some(format!("{error:#}")),
+                );
+            }
+        }
+    }
+
+    fn setup_retrobat(&mut self, installation: &Path, managed_root: &Path) {
+        self.sink.emit(AppEvent::RetroBatSetup {
+            running: true,
+            detail: "Checking installation and ROM ownership".into(),
+            error: None,
+        });
+        let result = (|| -> anyhow::Result<Vec<String>> {
+            anyhow::ensure!(self.mount.is_none(), "stop the mount before RetroBat setup");
+            anyhow::ensure!(
+                installation.is_absolute() && managed_root.is_absolute(),
+                "choose absolute RetroBat and managed ROM folder paths"
+            );
+            let server = self
+                .server_id
+                .as_deref()
+                .context("connect before setting up RetroBat")?;
+            let _stopped = stopped_retrobat_guard(installation)?;
+            check_mount_root(managed_root, server)?;
+            claim_mount_root(managed_root, server)?;
+            // Validate the proposed settings before linking so an override error
+            // never leaves an unexpectedly reconfigured ROM directory.
+            let (home, _) = rommfs_core::retrobat::launcher_paths(installation)?;
+            rommfs_core::retrobat::switch_save_setting(&std::fs::read_to_string(
+                home.join("es_settings.cfg"),
+            )?)?;
+            rommfs_core::retrobat::setup_roms_link(installation, managed_root, server)?;
+            rommfs_core::retrobat::configure_switch_saves(installation)
+        })();
+        match result {
+            Ok(messages) => {
+                let detail = format!(
+                    "RetroBat ROM directory linked to {}. {}",
+                    managed_root.display(),
+                    messages.join(". ")
+                );
+                self.log(Level::Info, "retrobat-setup", detail.clone());
+                self.set_integration(IntegrationMode::RetroBat, Some(installation.to_path_buf()));
+                self.sink.emit(AppEvent::RetroBatSetup {
+                    running: false,
+                    detail,
+                    error: None,
+                });
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                self.log(Level::Error, "retrobat-setup", error.clone());
+                self.sink.emit(AppEvent::RetroBatSetup {
+                    running: false,
+                    detail: "RetroBat setup did not complete".into(),
+                    error: Some(error),
+                });
+            }
+        }
+    }
+
+    fn set_integration(&mut self, mode: IntegrationMode, root: Option<PathBuf>) {
+        let previous = self.preferences.clone();
+        let result: Result<()> = (|| {
+            if self.mount.is_some() {
+                return Err(Error::Unsupported(
+                    "stop the mount before changing its layout".into(),
+                ));
+            }
+            let preferences = self.preferences.as_mut().ok_or_else(|| {
+                Error::Auth("connect and verify an account before choosing the layout".into())
+            })?;
+            if mode == IntegrationMode::RetroBat {
+                let root = root
+                    .as_deref()
+                    .ok_or_else(|| Error::Unsupported("select a RetroBat installation".into()))?;
+                rommfs_core::layout::RetroBatSystems::from_installation(root)?;
+            }
+            preferences.integration = mode;
+            preferences.retrobat_root = root;
+            let catalogue = self
+                .source_snapshot
+                .as_ref()
+                .map(|s| self.project_snapshot(s))
+                .transpose()?;
+            if let (Some(settings), Some(preferences)) =
+                (&self.connection_settings, &self.preferences)
+            {
+                settings.save(preferences)?;
+            }
+            self.stop_save_sync_agent();
+            self.advance_save_sync_session();
+            if let Some(catalogue) = catalogue {
+                self.sink.emit(AppEvent::CatalogueLoaded {
+                    platforms: catalogue.platforms.len(),
+                    roms: catalogue.entries.len(),
+                    skipped_unsupported: catalogue.skipped_unsupported,
+                });
+                self.store_catalogue(catalogue);
+            }
+            self.refresh_save_sync();
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.preferences = previous;
+            self.log(Level::Error, "integration", error.to_string());
+            self.emit_integration(Some(error.to_string()));
+        } else {
+            self.emit_integration(None);
+        }
+    }
+
+    fn project_snapshot(&self, snapshot: &CatalogueSnapshot) -> Result<Catalogue> {
+        let systems = match self.preferences.as_ref() {
+            Some(preferences) if preferences.integration == IntegrationMode::RetroBat => {
+                let root = preferences
+                    .retrobat_root
+                    .as_deref()
+                    .ok_or_else(|| Error::Unsupported("select a RetroBat installation".into()))?;
+                Some(rommfs_core::layout::RetroBatSystems::from_installation(
+                    root,
+                )?)
+            }
+            _ => None,
+        };
+        let sink = self.sink.clone();
+        rommfs_core::catalog::build_catalogue_for_layout(
+            self.server_id.as_deref().unwrap_or_default(),
+            &snapshot.platforms,
+            &snapshot.roms,
+            systems.as_ref(),
+            move |warning| sink.emit(AppEvent::log(Level::Warn, "catalogue", warning)),
+        )
+    }
+
+    fn publish_snapshot(&mut self, snapshot: CatalogueSnapshot, cached: bool) -> Result<Catalogue> {
+        let cat = self.project_snapshot(&snapshot)?;
         self.sink.emit(AppEvent::CatalogueLoaded {
             platforms: cat.platforms.len(),
             roms: cat.entries.len(),
             skipped_unsupported: cat.skipped_unsupported,
         });
-        self.log(
-            Level::Info,
-            "catalogue",
-            format!(
-                "catalogue loaded: {} platforms, {} roms, {} skipped",
-                cat.platforms.len(),
-                cat.entries.len(),
-                cat.skipped_unsupported
-            ),
-        );
+        self.sink.emit(AppEvent::CatalogueSnapshot {
+            refreshed_at: snapshot.refreshed_at,
+            cached,
+            pending_remount: self.mount.is_some(),
+        });
+        self.source_snapshot = Some(snapshot);
         Ok(cat)
+    }
+
+    fn persist_snapshot(&self, snapshot: &CatalogueSnapshot) {
+        if let (Some(store), Some(server), Some(account)) = (
+            &self.catalogue_store,
+            &self.server_id,
+            &self.catalogue_account,
+        ) {
+            if let Err(error) = store.save(server, account, snapshot) {
+                self.log(
+                    Level::Warn,
+                    "catalogue",
+                    format!("Catalogue could not be persisted: {error}"),
+                );
+            }
+        }
+    }
+
+    fn restore_catalogue(&mut self) -> bool {
+        let snapshot = match (
+            &self.catalogue_store,
+            &self.server_id,
+            &self.catalogue_account,
+        ) {
+            (Some(store), Some(server), Some(account)) => store.load(server, account),
+            _ => return false,
+        };
+        match snapshot {
+            Ok(Some(snapshot)) => match self.publish_snapshot(snapshot, true) {
+                Ok(cat) => {
+                    self.store_catalogue(cat);
+                    true
+                }
+                Err(error) => {
+                    self.log(Level::Warn, "catalogue", error.to_string());
+                    false
+                }
+            },
+            Err(error) => {
+                self.log(Level::Warn, "catalogue", error.to_string());
+                false
+            }
+            Ok(None) => false,
+        }
+    }
+
+    fn load_catalogue(&mut self, client: &RommClient) -> Result<Catalogue> {
+        self.sink.emit(AppEvent::CatalogueLoading);
+        self.catalogue_operation_id += 1;
+        let snapshot = fetch_catalogue(client, &self.sink, self.catalogue_operation_id)?;
+        let cat = self.publish_snapshot(snapshot.clone(), false)?;
+        self.persist_snapshot(&snapshot);
+        Ok(cat)
+    }
+
+    /// At most one refresh in flight. The mounted tree remains immutable; the
+    /// complete replacement projection is used only by the next mount.
+    fn refresh_catalogue(&mut self) {
+        if self.refresh_result.is_some() {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.catalogue_operation_id += 1;
+        let operation_id = self.catalogue_operation_id;
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sink = self.sink.clone().scoped(active.clone());
+        self.refresh_active = Some(active);
+        let (tx, rx) = mpsc::channel();
+        self.refresh_result = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(fetch_catalogue(&client, &sink, operation_id));
+        });
+    }
+
+    fn poll_catalogue_refresh(&mut self) {
+        let Some(rx) = &self.refresh_result else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(Error::Transport("catalogue refresh worker stopped".into()))
+            }
+        };
+        self.refresh_result = None;
+        self.refresh_active = None;
+        self.finish_catalogue_refresh(result);
+    }
+
+    fn cancel_catalogue_refresh(&mut self) {
+        if let Some(active) = self.refresh_active.take() {
+            active.store(false, std::sync::atomic::Ordering::Release);
+        }
+        self.refresh_result = None;
+    }
+
+    fn finish_catalogue_refresh(&mut self, result: Result<CatalogueSnapshot>) {
+        match result {
+            Ok(snapshot) => match self.publish_snapshot(snapshot.clone(), false) {
+                Ok(cat) => {
+                    self.persist_snapshot(&snapshot);
+                    self.store_catalogue(cat);
+                    if self.mount.is_none() {
+                        self.refresh_save_sync();
+                    } else {
+                        self.queue_metadata();
+                    }
+                }
+                Err(error) => self.catalogue_refresh_failed(error),
+            },
+            Err(error) => self.catalogue_refresh_failed(error),
+        }
+    }
+
+    fn catalogue_refresh_failed(&mut self, error: Error) {
+        // Never replace the last successful catalogue with an empty library.
+        if error.needs_sign_in() {
+            self.stop_save_sync_agent();
+            self.stop_mount();
+            self.sink.emit(AppEvent::SignInRequired);
+        }
+        self.sink.emit(AppEvent::CatalogueFailed {
+            reason: error.to_string(),
+        });
+        self.log(
+            Level::Error,
+            "catalogue",
+            format!("Refresh failed; retaining last complete snapshot: {error}"),
+        );
     }
 
     fn store_catalogue(&mut self, cat: Catalogue) {
@@ -1356,6 +2372,15 @@ impl Worker {
             self.refresh_save_sync();
             return;
         };
+        if !client.has_token() && self.catalogue.is_some() {
+            self.sink.emit(AppEvent::SignInRequired);
+            self.fail_mount(
+                "check authentication",
+                path,
+                &Error::Auth("sign in before mounting cached metadata".into()),
+            );
+            return;
+        }
         let Some(server_id) = self.server_id.clone() else {
             self.fail_mount(
                 "check connection",
@@ -1370,6 +2395,27 @@ impl Worker {
             path: path.to_string(),
         });
         let root = PathBuf::from(path);
+        if let Some(preferences) = self
+            .preferences
+            .as_ref()
+            .filter(|p| p.integration == IntegrationMode::RetroBat)
+        {
+            let verified = preferences
+                .retrobat_root
+                .as_deref()
+                .context("select a RetroBat installation")
+                .and_then(|install| {
+                    rommfs_core::retrobat::verify_setup_link(install, &root, &server_id)
+                });
+            if let Err(error) = verified {
+                self.fail_mount(
+                    "verify RetroBat setup",
+                    path,
+                    &Error::Unsupported(format!("{error:#}")),
+                );
+                return;
+            }
+        }
         let started = Instant::now();
         self.log(
             Level::Info,
@@ -1386,33 +2432,34 @@ impl Worker {
             return;
         }
 
-        // Mounts re-read the catalogue so stop/start never serves stale data.
-        self.log(
-            Level::Info,
-            "mount",
-            format!("loading catalogue for {path:?}"),
-        );
-        match self.load_catalogue(&client) {
-            Ok(cat) => {
-                self.store_catalogue(cat);
-                self.refresh_save_sync();
-            }
-            Err(e) if e.needs_sign_in() => {
-                self.sink.emit(AppEvent::SignInRequired);
-                self.fail_mount("load catalogue", path, &e);
-                self.refresh_save_sync();
-                return;
-            }
-            Err(e) => {
-                self.sink.emit(AppEvent::CatalogueFailed {
-                    reason: e.to_string(),
-                });
-                self.fail_mount("load catalogue", path, &e);
-                self.refresh_save_sync();
-                return;
+        if self.catalogue.is_none() {
+            // Reuse Connect's stable snapshot; failed cold loads may be retried.
+            self.log(
+                Level::Info,
+                "mount",
+                format!("loading catalogue for {path:?}"),
+            );
+            match self.load_catalogue(&client) {
+                Ok(cat) => {
+                    self.store_catalogue(cat);
+                    self.refresh_save_sync();
+                }
+                Err(e) if e.needs_sign_in() => {
+                    self.sink.emit(AppEvent::SignInRequired);
+                    self.fail_mount("load catalogue", path, &e);
+                    self.refresh_save_sync();
+                    return;
+                }
+                Err(e) => {
+                    self.sink.emit(AppEvent::CatalogueFailed {
+                        reason: e.to_string(),
+                    });
+                    self.fail_mount("load catalogue", path, &e);
+                    self.refresh_save_sync();
+                    return;
+                }
             }
         }
-
         self.log(
             Level::Info,
             "mount",
@@ -1450,8 +2497,17 @@ impl Worker {
                 let mounted_path = mount.root.display().to_string();
                 self.mount = Some(mount);
                 self.fs = Some(fs);
+                if let Some(preferences) = &mut self.preferences {
+                    preferences.mount_root = Some(root.clone());
+                    if let Some(settings) = &self.connection_settings {
+                        if let Err(error) = settings.save(preferences) {
+                            self.log(Level::Warn, "settings", error.to_string());
+                        }
+                    }
+                }
                 self.sink
                     .emit(AppEvent::MountStarted { path: mounted_path });
+                self.queue_metadata();
                 self.log(
                     Level::Info,
                     "mount",
@@ -1477,13 +2533,16 @@ impl Worker {
         remover: Arc<dyn HydratedRemover>,
     ) -> Result<Arc<RommFs>> {
         let server_id = self.server_id.clone().unwrap_or_default();
-        let index = CacheIndex::open(cache_dir_for(&server_id))?;
+        let cache_directory = cache_dir_for(&server_id);
+        #[cfg(test)]
+        let cache_directory = self.rom_cache_directory.clone().unwrap_or(cache_directory);
+        let index = CacheIndex::open(cache_directory)?;
         let live = Arc::new(LiveState::default());
         let source = Arc::new(ClientSource {
             client: Arc::clone(client),
             names: self.names.clone(),
         });
-        let cat = self.catalogue.take();
+        let cat = self.catalogue.clone();
         let cat = match cat {
             Some(c) => c,
             None => return Err(Error::InvalidCatalogue("no catalogue loaded".into())),
@@ -1556,7 +2615,23 @@ impl Worker {
     }
 
     fn stop_mount(&mut self) {
+        let had_metadata = self.metadata_active.is_some()
+            || self
+                .preferences
+                .as_ref()
+                .is_some_and(|p| p.integration == IntegrationMode::RetroBat);
+        self.cancel_metadata();
+        if had_metadata {
+            self.metadata_status(
+                false,
+                "Frontend files are retained while the mount is stopped",
+                None,
+            );
+        }
         self.sink.emit(AppEvent::MountStopping);
+        if let Some(fs) = &self.fs {
+            fs.cancel_transfers();
+        }
         if let Some(mount) = self.mount.take() {
             mount.stop();
             self.log(Level::Info, "mount", "mount stopped".to_string());
@@ -1570,12 +2645,11 @@ fn worker_loop(
     rx: mpsc::Receiver<CommandEnvelope>,
     sink: EventSink,
     save_sync_gate: SaveSyncCommandGate,
+    connection_gate: SaveSyncCommandGate,
 ) {
-    worker_loop_with_interval_from(
-        rx,
-        Worker::with_persistent_save_sync_settings(sink, save_sync_gate),
-        EVICTION_INTERVAL,
-    );
+    let mut worker = Worker::with_persistent_save_sync_settings(sink, save_sync_gate);
+    worker.connection_gate = connection_gate;
+    worker_loop_with_interval_from(rx, worker, EVICTION_INTERVAL);
 }
 
 fn worker_loop_with_interval_from(
@@ -1585,7 +2659,16 @@ fn worker_loop_with_interval_from(
 ) {
     let mut next_eviction = None;
     loop {
-        let received = if worker.mount.is_some() {
+        worker.poll_pairing();
+        worker.poll_catalogue_refresh();
+        worker.poll_metadata();
+        let received = if worker.refresh_result.is_some()
+            || worker.pairing.is_some()
+            || worker.metadata_job.is_some()
+            || worker.metadata_ready.is_some()
+        {
+            rx.recv_timeout(Duration::from_millis(100))
+        } else if worker.mount.is_some() {
             let deadline = *next_eviction.get_or_insert_with(|| Instant::now() + eviction_interval);
             if Instant::now() >= deadline {
                 worker.evict_once();
@@ -1599,6 +2682,14 @@ fn worker_loop_with_interval_from(
         };
         let envelope = match received {
             Ok(envelope) => envelope,
+            Err(mpsc::RecvTimeoutError::Timeout)
+                if worker.refresh_result.is_some()
+                    || worker.pairing.is_some()
+                    || worker.metadata_job.is_some()
+                    || worker.metadata_ready.is_some() =>
+            {
+                continue
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 worker.evict_once();
                 next_eviction = Some(Instant::now() + eviction_interval);
@@ -1609,12 +2700,26 @@ fn worker_loop_with_interval_from(
         let CommandEnvelope {
             command: cmd,
             save_sync_epoch,
+            connection_epoch,
         } = envelope;
         worker.current_save_sync_epoch = save_sync_epoch;
+        worker.current_connection_epoch = connection_epoch;
         let shutdown = matches!(cmd, Command::Shutdown);
         // Commands run one at a time on the worker thread; UI stays
         // responsive while network/filesystem work blocks here.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &cmd {
+            Command::SetupRetroBat {
+                installation,
+                managed_root,
+            } => worker.setup_retrobat(installation, managed_root),
+            Command::SetIntegration {
+                mode,
+                retrobat_root,
+            } => worker.set_integration(*mode, retrobat_root.clone()),
+            Command::RestoreConnection => worker.restore_connection(),
+            Command::BeginPairing { url } => worker.begin_pairing(url),
+            Command::CancelPairing => worker.cancel_pairing(),
+            Command::Logout => worker.logout(),
             Command::Connect {
                 url,
                 username,
@@ -1622,6 +2727,7 @@ fn worker_loop_with_interval_from(
             } => worker.connect(url, username, password),
             Command::StartMount { path } => worker.start_mount(path),
             Command::StopMount => worker.stop_mount(),
+            Command::RefreshCatalogue => worker.refresh_catalogue(),
             Command::RefreshSaveSync => worker.refresh_save_sync(),
             Command::SelectSaveSyncInstallation { path } => {
                 worker.select_save_sync_installation(path)
@@ -1634,6 +2740,8 @@ fn worker_loop_with_interval_from(
                 destination,
             } => worker.export_save_sync_incoming(*session_id, incoming_id, destination),
             Command::Shutdown => {
+                worker.cancel_pairing();
+                worker.cancel_catalogue_refresh();
                 worker.stop_save_sync_agent();
                 worker.stop_mount();
             }
@@ -1646,14 +2754,25 @@ fn worker_loop_with_interval_from(
             let msg = panic_message(&payload);
             worker.log(Level::Error, "worker", format!("operation panicked: {msg}"));
             match &cmd {
-                Command::Connect { .. } => worker.sink.emit(AppEvent::ConnectFailed {
+                Command::RestoreConnection
+                | Command::BeginPairing { .. }
+                | Command::CancelPairing
+                | Command::Logout
+                | Command::Connect { .. } => worker.sink.emit(AppEvent::ConnectFailed {
                     reason: format!("internal error: {msg}"),
                 }),
                 Command::StartMount { .. } => worker.sink.emit(AppEvent::MountFailed {
                     reason: format!("internal error: {msg}"),
                 }),
                 Command::StopMount => {}
-                Command::RefreshSaveSync
+                Command::SetupRetroBat { .. } => worker.sink.emit(AppEvent::RetroBatSetup {
+                    running: false,
+                    detail: "RetroBat setup stopped".into(),
+                    error: Some(format!("internal error: {msg}")),
+                }),
+                Command::SetIntegration { .. }
+                | Command::RefreshCatalogue
+                | Command::RefreshSaveSync
                 | Command::SelectSaveSyncInstallation { .. }
                 | Command::SetSaveSyncEnabled { .. }
                 | Command::SetSaveSyncDebounce { .. }
@@ -1665,6 +2784,84 @@ fn worker_loop_with_interval_from(
             break;
         }
     }
+}
+
+fn fetch_catalogue(
+    client: &RommClient,
+    sink: &EventSink,
+    operation_id: u64,
+) -> Result<CatalogueSnapshot> {
+    let started = Instant::now();
+    let request_started = Instant::now();
+    if !sink.is_active() {
+        return Err(Error::Cancelled);
+    }
+    let platforms = client.platforms();
+    sink.emit(AppEvent::log(
+        Level::Info,
+        "http",
+        format!(
+            "operation={operation_id} GET /api/platforms elapsed_ms={} result={}",
+            request_started.elapsed().as_millis(),
+            if platforms.is_ok() {
+                "ok".into()
+            } else {
+                platforms.as_ref().expect_err("failed result").to_string()
+            }
+        ),
+    ));
+    let platforms = platforms?;
+    let mut roms = Vec::new();
+    loop {
+        if !sink.is_active() {
+            return Err(Error::Cancelled);
+        }
+        let offset = roms.len() as u64;
+        let request_started = Instant::now();
+        let page = client.roms_page(200, offset);
+        sink.emit(AppEvent::log(Level::Info, "http", format!("operation={operation_id} GET /api/roms limit=200 offset={offset} elapsed_ms={} result={}", request_started.elapsed().as_millis(), if page.is_ok() { "ok".into() } else { page.as_ref().expect_err("failed result").to_string() })));
+        let page = page?;
+        let count = page.items.len();
+        let total = page.total;
+        if page.offset != offset {
+            return Err(Error::InvalidCatalogue(
+                "catalogue pagination offset did not advance correctly".into(),
+            ));
+        }
+        roms.extend(page.items);
+        sink.emit(AppEvent::CatalogueProgress {
+            operation_id,
+            stage: "Catalogue pages".into(),
+            completed: roms.len() as u64,
+            total,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        });
+        match total {
+            Some(total) if roms.len() as u64 >= total => break,
+            Some(_) if count == 0 => {
+                return Err(Error::InvalidCatalogue(
+                    "catalogue ended before declared total".into(),
+                ))
+            }
+            None if count < 200 => break,
+            _ => {}
+        }
+    }
+    sink.emit(AppEvent::log(
+        Level::Info,
+        "catalogue",
+        format!(
+            "operation={operation_id} fetched {} platforms and {} ROMs in {}ms",
+            platforms.len(),
+            roms.len(),
+            started.elapsed().as_millis()
+        ),
+    ));
+    Ok(CatalogueSnapshot {
+        platforms,
+        roms,
+        refreshed_at: rommfs_core::cache::now_unix_secs(),
+    })
 }
 
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -1698,13 +2895,43 @@ impl ContentSource for ClientSource {
             Error::InvalidCatalogue(format!("rom {} not in catalogue", key.rom_id))
         })?;
         self.client
-            .download_file(key.rom_id, name, writer, progress)
+            .download_original_file(key.file_id, name, writer, progress)
     }
 }
 
 // ---------------------------------------------------------------------------
 // Mount root + backend seam.
 // ---------------------------------------------------------------------------
+
+/// Deny setup/publication while Windows has a frontend or Switch emulator image
+/// open. Exclusive writable handles also prevent launch during the operation.
+fn stopped_retrobat_guard(installation: &Path) -> anyhow::Result<Vec<std::fs::File>> {
+    rommfs_core::save_sync::ensure_no_reparse_components(installation)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut guards = Vec::new();
+        for relative in [
+            "retrobat.exe",
+            "emulationstation/emulationstation.exe",
+            "emulators/eden/eden.exe",
+            "emulators/citron/citron.exe",
+        ] {
+            let path = installation.join(relative);
+            rommfs_core::save_sync::ensure_no_reparse_components(&path)?;
+            if !path.try_exists()? {
+                continue;
+            }
+            guards.push(std::fs::OpenOptions::new().read(true).write(true).share_mode(0)
+                .open(&path).with_context(|| format!("Stop RetroBat and its emulators before setup or metadata publication; exclusive access to {} is unavailable", path.display()))?);
+        }
+        Ok(guards)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Vec::new())
+    }
+}
 
 fn check_mount_root(root: &Path, server_id: &str) -> Result<()> {
     let parent = root
@@ -1854,6 +3081,10 @@ fn cache_dir_for(server_id: &str) -> PathBuf {
     } else {
         safe
     })
+}
+
+pub fn diagnostic_log_directory() -> Option<PathBuf> {
+    save_sync_settings_path().and_then(|path| path.parent()?.parent().map(|p| p.join("logs")))
 }
 
 fn save_sync_settings_path() -> Option<PathBuf> {
@@ -2041,6 +3272,29 @@ mod tests {
     }
 
     struct UnusedSource;
+
+    #[test]
+    fn stopping_cancels_artwork_and_discards_late_metadata_results() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        let active = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel();
+        worker.metadata_active = Some(active.clone());
+        worker.metadata_job = Some(rx);
+        worker.stop_mount();
+        assert!(!active.load(Ordering::Acquire));
+        assert!(tx
+            .send(Err(Error::Transport("old session failure".into())))
+            .is_err());
+        worker.poll_metadata();
+        let mut state = UiState::new(32);
+        while let Ok(event) = events.try_recv() {
+            state.apply(&event);
+        }
+        assert!(!state.frontend_metadata_pending);
+        assert!(state.frontend_metadata_error.is_none());
+    }
 
     impl ContentSource for UnusedSource {
         fn fetch(
@@ -2421,6 +3675,8 @@ mod tests {
             missing_from_fs: false,
             is_physical: false,
             updated_at: String::new(),
+            metadata: Default::default(),
+            fs_path: String::new(),
             files: vec![RomFileDto {
                 id: 70,
                 file_name: "Game.gb".into(),
@@ -2430,6 +3686,8 @@ mod tests {
                 md5_hash: None,
                 sha1_hash: None,
                 is_top_level: true,
+                file_path: String::new(),
+                category: None,
             }],
         };
         let catalogue = build_catalogue(
@@ -2619,6 +3877,7 @@ mod tests {
             cmd_tx,
             worker: Some(worker),
             save_sync_gate: gate,
+            connection_gate: SaveSyncCommandGate::new(),
         };
 
         controller.send(Command::Connect {
@@ -2719,10 +3978,25 @@ mod tests {
                 Arc::new(FakeClock::new(100)),
             ));
             let worker = Worker {
+                metadata_job: None,
+                metadata_active: None,
+                metadata_source: None,
+                metadata_ready: None,
+                metadata_wait_reported: false,
+                rom_cache_directory: None,
                 sink,
                 client: None,
                 server_id: None,
                 catalogue: None,
+                connection_settings: None,
+                preferences: None,
+                pairing: None,
+                catalogue_store: None,
+                catalogue_account: None,
+                source_snapshot: None,
+                refresh_result: None,
+                refresh_active: None,
+                catalogue_operation_id: 0,
                 names: HashMap::from([(key, "game.nes".into())]),
                 fs: Some(fs),
                 mount: Some(ActiveMount {
@@ -2742,6 +4016,8 @@ mod tests {
                 save_sync_catalogue: None,
                 save_sync_agent: None,
                 save_sync_gate: SaveSyncCommandGate::new(),
+                connection_gate: SaveSyncCommandGate::new(),
+                current_connection_epoch: 0,
                 current_save_sync_epoch: 0,
                 save_sync_runtime_problem: None,
                 save_sync_session_id: 0,
@@ -2760,8 +4036,306 @@ mod tests {
             .send(CommandEnvelope {
                 command: Command::Shutdown,
                 save_sync_epoch: 0,
+                connection_epoch: 0,
             })
             .unwrap();
         worker_thread.join().unwrap();
+    }
+    #[test]
+    fn catalogue_pages_are_fetched_once_and_warm_remounts_make_no_http_requests() {
+        use rommfs_fixture::contract;
+        let tmp = tempfile::tempdir().unwrap();
+        let fx = FixtureServer::start();
+        fx.on(
+            "POST",
+            "/api/token",
+            ResponseSpec::Json {
+                status: 200,
+                body: contract::token_ok(),
+            },
+        );
+        fx.on("GET", "/api/users/me", ResponseSpec::Json { status: 200, body: serde_json::json!({"id":7,"oauth_scopes":["me.read","assets.read","assets.write"]}).to_string() });
+        let slugs: Vec<_> = (0..25).map(|n| format!("platform{n}")).collect();
+        let platforms: Vec<_> = slugs
+            .iter()
+            .enumerate()
+            .map(|(n, slug)| (n as i64, slug.as_str(), slug.as_str(), slug.as_str()))
+            .collect();
+        fx.on(
+            "GET",
+            "/api/platforms",
+            ResponseSpec::Json {
+                status: 200,
+                body: contract::platforms(&platforms),
+            },
+        );
+        let items: Vec<_> = (0..2448)
+            .map(|n| {
+                contract::rom(
+                    n + 1,
+                    &slugs[n as usize % 25],
+                    &format!("game{n}.bin"),
+                    10,
+                    "hash",
+                )
+            })
+            .collect();
+        for offset in (0..2448).step_by(200) {
+            fx.on(
+                "GET",
+                &format!("/api/roms?limit=200&offset={offset}&"),
+                ResponseSpec::Json {
+                    status: 200,
+                    body: contract::roms_page(
+                        &items[offset..(offset + 200).min(items.len())],
+                        items.len(),
+                        200,
+                        offset,
+                    ),
+                },
+            );
+        }
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.rom_cache_directory = Some(tmp.path().join("rom-cache"));
+        worker.catalogue_store =
+            Some(CatalogueStore::open(&tmp.path().join("catalogue.db")).unwrap());
+        worker.connect(fx.url(), "user", "password");
+        assert_eq!(worker.catalogue.as_ref().unwrap().entries.len(), 2448);
+        assert_eq!(fx.count("GET", "/api/platforms"), 1);
+        for offset in (0..2448).step_by(200) {
+            assert_eq!(
+                fx.count("GET", &format!("/api/roms?limit=200&offset={offset}&")),
+                1
+            );
+        }
+        let root = tmp.path().join("roms");
+        for _ in 0..2 {
+            worker.start_mount(root.to_str().unwrap());
+            worker.stop_mount();
+        }
+        assert_eq!(fx.count("GET", "/api/platforms"), 1);
+        assert_eq!(fx.count("GET", "/api/roms/"), 0);
+        assert!(
+            worker.catalogue.is_some(),
+            "mount construction retains the reusable snapshot"
+        );
+        let snapshot = worker.source_snapshot.clone().unwrap();
+        worker.catalogue = None;
+        assert!(worker.restore_catalogue());
+        assert_eq!(
+            worker.source_snapshot.as_ref().unwrap().refreshed_at,
+            snapshot.refreshed_at
+        );
+        // A failed later page retains the whole preceding complete snapshot on
+        // disk and in memory, rather than publishing the first successful page.
+        fx.on(
+            "GET",
+            "/api/roms?limit=200&offset=200&",
+            ResponseSpec::Json {
+                status: 500,
+                body: "{}".into(),
+            },
+        );
+        worker.refresh_catalogue();
+        let result = worker
+            .refresh_result
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        worker.finish_catalogue_refresh(result);
+        assert_eq!(worker.catalogue.as_ref().unwrap().entries.len(), 2448);
+        assert_eq!(
+            worker
+                .catalogue_store
+                .as_ref()
+                .unwrap()
+                .load(worker.server_id.as_deref().unwrap(), "7")
+                .unwrap()
+                .unwrap()
+                .roms
+                .len(),
+            2448
+        );
+        assert!(events
+            .try_iter()
+            .any(|e| matches!(e,AppEvent::CatalogueFailed{reason} if reason.contains("500"))));
+    }
+
+    #[test]
+    fn browser_pairing_cancelled_during_account_verification_never_connects_or_remembers() {
+        let fixture = FixtureServer::start();
+        fixture.on("POST", "/api/auth/device/init", ResponseSpec::Json { status: 201, body: serde_json::json!({
+            "device_code":"private-code", "user_code":"ABCD", "verification_path":"/pair/device",
+            "verification_path_complete":"/pair/device?user_code=ABCD", "expires_in":600, "interval":1
+        }).to_string() });
+        fixture.on("POST", "/api/auth/device/token", ResponseSpec::Json { status: 200, body: serde_json::json!({
+            "access_token":"secret-token", "device_id":"device", "scopes":["me.read"], "expires_at":null
+        }).to_string() });
+        let barrier = FixtureBodyBarrier::new();
+        fixture.on(
+            "GET",
+            "/api/users/me",
+            ResponseSpec::HeldBytes {
+                status: 200,
+                bytes: br#"{"id":42,"oauth_scopes":["me.read"]}"#.to_vec(),
+                barrier: barrier.clone(),
+            },
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let settings_path = directory.path().join("connection.db");
+        let gate = SaveSyncCommandGate::new();
+        let worker_gate = gate.clone();
+        let worker_path = settings_path.clone();
+        let url = fixture.url().to_owned();
+        let (sink, events) = rommfs_core::events::channel();
+        let worker = std::thread::spawn(move || {
+            let mut worker = Worker::new(sink);
+            worker.connection_gate = worker_gate;
+            worker.connection_settings = Some(ConnectionSettings::open(&worker_path).unwrap());
+            worker.begin_pairing(&url);
+            worker.pairing.as_mut().unwrap().next_poll = Instant::now();
+            worker.poll_pairing();
+            assert!(worker.client.is_none());
+            assert!(worker.preferences.is_none());
+            assert!(worker
+                .connection_settings
+                .as_ref()
+                .unwrap()
+                .load()
+                .unwrap()
+                .is_none());
+            worker.cancel_pairing();
+        });
+        assert!(barrier.wait_until_blocked(Duration::from_secs(5)));
+        gate.invalidate();
+        barrier.release();
+        worker.join().unwrap();
+        let events: Vec<_> = events.try_iter().collect();
+        assert!(events.iter().any(
+            |e| matches!(e, AppEvent::PairingEnded { reason: Some(r) } if r.contains("cancelled"))
+        ));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            AppEvent::Connected | AppEvent::ConnectFailed { .. } | AppEvent::CatalogueLoaded { .. }
+        )));
+        assert_eq!(fixture.count_requests("GET", "/api/platforms"), 0);
+        assert!(!format!("{events:?}").contains("secret-token"));
+    }
+
+    #[test]
+    fn save_sync_changes_do_not_cancel_browser_pairing_and_denial_is_visible() {
+        let fixture = FixtureServer::start();
+        fixture.on("POST", "/api/auth/device/init", ResponseSpec::Json { status:201, body:serde_json::json!({
+            "device_code":"private-code", "user_code":"ABCD", "verification_path":"/pair/device",
+            "verification_path_complete":"/pair/device?user_code=ABCD", "expires_in":600, "interval":1
+        }).to_string() });
+        fixture.on(
+            "POST",
+            "/api/auth/device/token",
+            ResponseSpec::Json {
+                status: 400,
+                body: r#"{"detail":"access_denied"}"#.into(),
+            },
+        );
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.begin_pairing(fixture.url());
+        worker.save_sync_gate.invalidate();
+        worker.pairing.as_mut().unwrap().next_poll = Instant::now();
+        worker.poll_pairing();
+        assert_eq!(fixture.count_requests("POST", "/api/auth/device/token"), 1);
+        assert!(worker.client.is_none());
+        assert!(worker.pairing.is_none());
+        assert!(events.try_iter().any(
+            |e| matches!(e, AppEvent::PairingEnded { reason:Some(r) } if r.contains("denied"))
+        ));
+    }
+
+    #[test]
+    fn remembered_preferences_never_cross_accounts_or_servers() {
+        let directory = tempfile::tempdir().unwrap();
+        let (sink, _) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.connection_settings =
+            Some(ConnectionSettings::open(&directory.path().join("connection.db")).unwrap());
+        let preferences = ConnectionPreferences {
+            server: "https://romm.example".into(),
+            account_id: 42,
+            device_identifier: "id".into(),
+            mount_root: Some(directory.path().join("roms")),
+            integration: IntegrationMode::Generic,
+            retrobat_root: None,
+            start_at_login: false,
+        };
+        worker
+            .connection_settings
+            .as_ref()
+            .unwrap()
+            .save(&preferences)
+            .unwrap();
+        worker.preferences = Some(preferences.clone());
+        worker.forget_other_account("https://romm.example/", Some(42));
+        assert!(worker.preferences.is_some());
+        worker.forget_other_account("https://romm.example", Some(43));
+        assert!(worker.preferences.is_none());
+        assert!(worker
+            .connection_settings
+            .as_ref()
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_none());
+        worker.preferences = Some(preferences);
+        worker.forget_other_account("https://another.example", Some(42));
+        assert!(worker.preferences.is_none());
+    }
+
+    #[test]
+    fn invalid_layout_selection_keeps_the_previous_projection_and_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.preferences = Some(ConnectionPreferences {
+            server: "s".into(),
+            account_id: 42,
+            device_identifier: "id".into(),
+            mount_root: None,
+            integration: IntegrationMode::Generic,
+            retrobat_root: None,
+            start_at_login: false,
+        });
+        worker.set_integration(IntegrationMode::RetroBat, Some(directory.path().into()));
+        assert_eq!(
+            worker.preferences.as_ref().unwrap().integration,
+            IntegrationMode::Generic
+        );
+        assert!(events.try_iter().any(|e| matches!(
+            e,
+            AppEvent::IntegrationUpdated {
+                mode: IntegrationMode::Generic,
+                error: Some(_),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn cancelled_refresh_cannot_emit_late_events_or_replace_the_new_session() {
+        let (sink, events) = rommfs_core::events::channel();
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let scoped = sink.clone().scoped(active.clone());
+        let mut worker = Worker::new(sink);
+        worker.refresh_active = Some(active);
+        worker.cancel_catalogue_refresh();
+        scoped.emit(AppEvent::CatalogueProgress {
+            operation_id: 99,
+            stage: "old account".into(),
+            completed: 200,
+            total: Some(2448),
+            elapsed_ms: 100,
+        });
+        assert!(events.try_recv().is_err());
     }
 }

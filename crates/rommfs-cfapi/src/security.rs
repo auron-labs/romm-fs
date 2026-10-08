@@ -23,6 +23,14 @@ pub(crate) const READ_ONLY: &str =
     "D:P(D;OICI;0x10156;;;AU)(A;OICI;FRFX;;;WD)(A;OICI;0x001600a9;;;OW)(A;OICI;FA;;;SY)";
 const DELETE_OWNED: &str = "D:P(A;;FRFX;;;WD)(A;;FA;;;OW)(A;;FA;;;SY)";
 
+// Directories permit creation and metadata writes, but NEVER grant
+// FILE_DELETE_CHILD: that right would bypass a child's ROM DELETE denial.
+// The CI-only deny propagates to directories, not ordinary frontend files.
+// ROM files receive their own protected READ_ONLY descriptor below.
+pub(crate) const MIXED_DIRECTORY: &str =
+    "D:P(D;CI;0x10040;;;AU)(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FRFX;;;WD)";
+pub(crate) const LOCAL_WRITABLE: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FRFX;;;WD)";
+
 struct Descriptor(*mut std::ffi::c_void);
 impl Drop for Descriptor {
     fn drop(&mut self) {

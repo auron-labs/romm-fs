@@ -89,6 +89,12 @@ pub fn map_catalogue(catalogue: &Catalogue, effective_saves_root: &Path) -> Resu
     let mut candidates = Vec::new();
 
     for entry in &catalogue.entries {
+        if !catalogue.is_launchable(&entry.key) || entry.file_name.contains('/') {
+            report
+                .unmapped
+                .push(unmapped(entry, MappingIssue::UnsupportedRomExtension));
+            continue;
+        }
         if !entry.platform_dir.eq_ignore_ascii_case(profile.system_dir) {
             report
                 .unmapped
@@ -248,6 +254,8 @@ mod tests {
             missing_from_fs: false,
             is_physical: false,
             updated_at: String::new(),
+            metadata: Default::default(),
+            fs_path: String::new(),
             files: vec![RomFileDto {
                 id: id + 100,
                 file_name: file_name.into(),
@@ -257,6 +265,8 @@ mod tests {
                 md5_hash: None,
                 sha1_hash: None,
                 is_top_level: true,
+                file_path: String::new(),
+                category: None,
             }],
         }
     }

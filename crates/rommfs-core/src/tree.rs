@@ -35,193 +35,138 @@ pub struct DirEntry {
     pub cookie: u64,
 }
 
-/// The immutable tree built from a `Catalogue`.
+/// Immutable arbitrary-depth metadata tree. Construction performs no I/O.
 pub struct RommTree {
     catalogue: Catalogue,
-    /// lowercase platform dir name -> index into `catalogue.platforms`.
-    platform_by_lower: HashMap<String, usize>,
-    /// platform index -> rom indices into `catalogue.entries`, in order.
-    platform_files: Vec<Vec<usize>>,
+    children: HashMap<u64, Vec<DirEntry>>,
+    metadata: HashMap<u64, NodeMeta>,
+    paths: HashMap<u64, String>,
 }
-
 impl RommTree {
     pub fn new(catalogue: Catalogue) -> Self {
-        let platform_by_lower: HashMap<String, usize> = catalogue
-            .platforms
+        let directory_inodes: HashMap<_, _> = catalogue
+            .directories()
             .iter()
             .enumerate()
-            .map(|(i, p)| (p.to_lowercase(), i))
+            .map(|(i, d)| (d.to_lowercase(), 2 + i as u64))
             .collect();
-        let mut platform_files = vec![Vec::new(); catalogue.platforms.len()];
-        for (i, e) in catalogue.entries.iter().enumerate() {
-            if let Some(&p) = platform_by_lower.get(&e.platform_dir.to_lowercase()) {
-                platform_files[p].push(i);
-            }
-        }
-        Self {
+        let mut tree = Self {
             catalogue,
-            platform_by_lower,
-            platform_files,
-        }
-    }
-
-    pub fn catalogue(&self) -> &Catalogue {
-        &self.catalogue
-    }
-
-    /// `lookup(parent_inode, name) -> inode` or `None`.
-    /// Name matching is case-insensitive (Windows semantics).
-    pub fn lookup(&self, parent: u64, name: &str) -> Option<NodeMeta> {
-        match self.catalogue.inode_kind(parent)? {
-            NodeKind::Root => {
-                let &idx = self.platform_by_lower.get(&name.to_lowercase())?;
-                let inode = self.catalogue.platform_inode(idx)?;
-                Some(NodeMeta {
-                    inode,
-                    parent,
-                    size: 0,
-                    kind: EntryKind::Directory,
-                    generation: 0,
-                })
-            }
-            NodeKind::PlatformDir { index } => {
-                let lower = name.to_lowercase();
-                let rom_index = self
-                    .platform_files
-                    .get(index)?
-                    .iter()
-                    .copied()
-                    .find(|&i| self.catalogue.entries[i].file_name.to_lowercase() == lower)?;
-                let entry = &self.catalogue.entries[rom_index];
-                let inode = self.catalogue.rom_inode(rom_index)?;
-                Some(NodeMeta {
-                    inode,
-                    parent,
-                    size: entry.size,
-                    kind: EntryKind::File,
-                    generation: generation_of(entry.version.as_ref()),
-                })
-            }
-            NodeKind::Rom { .. } => None,
-        }
-    }
-
-    /// `metadata(inode)`.
-    pub fn metadata(&self, inode: u64) -> Option<NodeMeta> {
-        match self.catalogue.inode_kind(inode)? {
-            NodeKind::Root => Some(NodeMeta {
-                inode,
+            children: HashMap::new(),
+            metadata: HashMap::new(),
+            paths: HashMap::new(),
+        };
+        tree.metadata.insert(
+            ROOT_INODE,
+            NodeMeta {
+                inode: ROOT_INODE,
                 parent: 0,
                 size: 0,
                 kind: EntryKind::Directory,
                 generation: 0,
-            }),
-            NodeKind::PlatformDir { .. } => Some(NodeMeta {
+            },
+        );
+        tree.paths.insert(ROOT_INODE, String::new());
+        let nodes: Vec<_> = tree
+            .catalogue
+            .directories()
+            .iter()
+            .enumerate()
+            .map(|(i, path)| (2 + i as u64, path.clone(), 0, EntryKind::Directory, 0))
+            .chain(tree.catalogue.entries.iter().enumerate().map(|(i, e)| {
+                (
+                    tree.catalogue.rom_inode(i).expect("catalogue entry inode"),
+                    format!("{}/{}", e.platform_dir, e.file_name),
+                    e.size,
+                    EntryKind::File,
+                    generation_of(e.version.as_ref()),
+                )
+            }))
+            .collect();
+        for (inode, path, size, kind, generation) in nodes {
+            let (parent_path, name) = path.rsplit_once('/').unwrap_or(("", &path));
+            let parent = directory_inodes
+                .get(&parent_path.to_lowercase())
+                .copied()
+                .unwrap_or(ROOT_INODE);
+            tree.metadata.insert(
                 inode,
-                parent: ROOT_INODE,
-                size: 0,
-                kind: EntryKind::Directory,
-                generation: 0,
-            }),
-            NodeKind::Rom { index } => {
-                let entry = &self.catalogue.entries[index];
-                let parent = self
-                    .platform_by_lower
-                    .get(&entry.platform_dir.to_lowercase())
-                    .and_then(|&p| self.catalogue.platform_inode(p))
-                    .unwrap_or(ROOT_INODE);
-                Some(NodeMeta {
+                NodeMeta {
                     inode,
                     parent,
-                    size: entry.size,
-                    kind: EntryKind::File,
-                    generation: generation_of(entry.version.as_ref()),
-                })
+                    size,
+                    kind,
+                    generation,
+                },
+            );
+            tree.children.entry(parent).or_default().push(DirEntry {
+                name: name.into(),
+                inode,
+                kind,
+                cookie: 0,
+            });
+            if kind == EntryKind::Directory {
+                tree.children.entry(inode).or_default();
+            }
+            tree.paths.insert(inode, path);
+        }
+        tree.children.entry(ROOT_INODE).or_default();
+        for children in tree.children.values_mut() {
+            children.sort_by(|a, b| a.name.cmp(&b.name));
+            for (i, entry) in children.iter_mut().enumerate() {
+                entry.cookie = i as u64 + 1;
             }
         }
+        tree
     }
-
-    /// Page entries of `inode` starting at opaque `cookie` (0 = start),
-    /// at most `max` entries; returns `(entries, next_cookie, eof)`.
-    /// Small buffers must not lose or duplicate entries.
+    pub fn catalogue(&self) -> &Catalogue {
+        &self.catalogue
+    }
+    pub fn lookup(&self, parent: u64, name: &str) -> Option<NodeMeta> {
+        let lower = name.to_lowercase();
+        let child = self
+            .children
+            .get(&parent)?
+            .iter()
+            .find(|c| c.name.to_lowercase() == lower)?;
+        self.metadata(child.inode)
+    }
+    pub fn metadata(&self, inode: u64) -> Option<NodeMeta> {
+        self.metadata.get(&inode).copied()
+    }
     pub fn read_dir(
         &self,
         inode: u64,
         cookie: u64,
         max: usize,
     ) -> Option<(Vec<DirEntry>, u64, bool)> {
-        let children: Vec<DirEntry> = match self.catalogue.inode_kind(inode)? {
-            NodeKind::Root => self
-                .catalogue
-                .platforms
-                .iter()
-                .enumerate()
-                .map(|(i, p)| DirEntry {
-                    name: p.clone(),
-                    inode: 2 + i as u64,
-                    kind: EntryKind::Directory,
-                    cookie: 0,
-                })
-                .collect(),
-            NodeKind::PlatformDir { index } => self
-                .platform_files
-                .get(index)?
-                .iter()
-                .map(|&ri| {
-                    let e = &self.catalogue.entries[ri];
-                    DirEntry {
-                        name: e.file_name.clone(),
-                        inode: self.catalogue.rom_inode(ri).unwrap_or(0),
-                        kind: EntryKind::File,
-                        cookie: 0,
-                    }
-                })
-                .collect(),
-            NodeKind::Rom { .. } => return None,
-        };
-
-        let start = cookie as usize;
+        let children = self.children.get(&inode)?;
+        let start = usize::try_from(cookie).ok()?;
         if start >= children.len() {
             return Some((Vec::new(), cookie, true));
         }
         let end = start.saturating_add(max).min(children.len());
-        let mut page: Vec<DirEntry> = children[start..end].to_vec();
-        for (j, e) in page.iter_mut().enumerate() {
-            e.cookie = (start + j + 1) as u64;
-        }
-        let eof = end >= children.len();
-        Some((page, end as u64, eof))
+        Some((
+            children[start..end].to_vec(),
+            end as u64,
+            end == children.len(),
+        ))
     }
-
-    /// Map a relative path like `nes/Example Game.nes` to an inode.
-    /// Used by the Windows adapter to resolve callback paths.
-    /// Components match case-insensitively.
     pub fn inode_for_path(&self, components: &[&str]) -> Option<u64> {
         let mut current = ROOT_INODE;
-        for c in components {
-            current = self.lookup(current, c)?.inode;
+        for component in components {
+            current = self.lookup(current, component)?.inode;
         }
         Some(current)
     }
-
-    /// The catalogue ROM index for a file inode (download wiring).
     pub fn rom_index_of(&self, inode: u64) -> Option<usize> {
         match self.catalogue.inode_kind(inode)? {
             NodeKind::Rom { index } => Some(index),
             _ => None,
         }
     }
-
-    /// Canonical relative path of an inode; the root has an empty path.
     pub fn path_of(&self, inode: u64) -> Option<String> {
-        match self.catalogue.inode_kind(inode)? {
-            NodeKind::Root => Some(String::new()),
-            NodeKind::PlatformDir { index } => Some(self.catalogue.platforms[index].clone()),
-            NodeKind::Rom { index } => {
-                let e = &self.catalogue.entries[index];
-                Some(format!("{}/{}", e.platform_dir, e.file_name))
-            }
-        }
+        self.paths.get(&inode).cloned()
     }
 }
 

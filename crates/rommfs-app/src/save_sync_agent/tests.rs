@@ -82,6 +82,8 @@ fn case(directory: &Path, fixture: &FixtureServer, capture: bool) -> AgentCase {
         missing_from_fs: false,
         is_physical: false,
         updated_at: String::new(),
+        metadata: Default::default(),
+        fs_path: String::new(),
         files: vec![RomFileDto {
             id: FILE_ID,
             file_name: "Game.gb".into(),
@@ -91,6 +93,8 @@ fn case(directory: &Path, fixture: &FixtureServer, capture: bool) -> AgentCase {
             md5_hash: None,
             sha1_hash: None,
             is_top_level: true,
+            file_path: String::new(),
+            category: None,
         }],
     }];
     let catalogue = build_catalogue(fixture.url(), &platforms, &roms, |_| {}).unwrap();
@@ -272,6 +276,8 @@ fn second_game_mapping(case: &AgentCase) -> SaveMapping {
         missing_from_fs: false,
         is_physical: false,
         updated_at: String::new(),
+        metadata: Default::default(),
+        fs_path: String::new(),
         files: vec![RomFileDto {
             id: 80,
             file_name: "Healthy.gb".into(),
@@ -281,6 +287,8 @@ fn second_game_mapping(case: &AgentCase) -> SaveMapping {
             md5_hash: None,
             sha1_hash: None,
             is_top_level: true,
+            file_path: String::new(),
+            category: None,
         }],
     };
     let catalogue = build_catalogue(&case.scope.server_id, &[platform], &[rom], |_| {}).unwrap();
@@ -312,14 +320,17 @@ fn wait_for_log(
     predicate: impl Fn(&str) -> bool,
 ) -> Option<String> {
     let deadline = Instant::now() + timeout;
+    let mut observed = Vec::new();
     while Instant::now() < deadline {
         match events.recv_timeout(Duration::from_millis(50)) {
             Ok(AppEvent::Log(line)) if predicate(&line.message) => return Some(line.message),
+            Ok(AppEvent::Log(line)) => observed.push(line.message),
             Ok(_) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return None,
         }
     }
+    eprintln!("Timed out waiting for save-sync log; observed logs: {observed:#?}");
     None
 }
 

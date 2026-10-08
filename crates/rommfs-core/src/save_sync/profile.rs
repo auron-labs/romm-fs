@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-const VERIFIED_RETROBAT_VERSION_MARKERS: [&str; 2] = ["8.2.1", "8.2.1-stable-win64"];
 const MAX_PROFILE_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_OVERRIDE_FILES: usize = 512;
 const MAX_SYSTEM_CONFIG_FILES: usize = 128;
@@ -16,6 +15,40 @@ const MAX_SYSTEM_CONFIG_FILES: usize = 128;
 pub struct RetroBatGbProfile {
     pub version: String,
     pub effective_saves_root: PathBuf,
+}
+
+/// Resolve the launcher-owned paths independently of emulator save formats.
+pub(crate) fn resolve_retrobat_paths(installation_root: &Path) -> Result<(PathBuf, PathBuf)> {
+    super::path::ensure_no_reparse_components(installation_root)?;
+    let launcher_dir = installation_root.join("emulationstation");
+    let launcher_config = read_key_values(&launcher_dir.join("emulatorLauncher.cfg"))?;
+    let local_path = configured_install_path(&launcher_config, installation_root, &launcher_dir);
+    let root = resolve_launcher_path(
+        lookup(&launcher_config, "retrobat"),
+        &local_path,
+        installation_root,
+        true,
+    )?;
+    if windows_path_key(&root) != windows_path_key(installation_root) {
+        return Err(Error::Unsupported(
+            "RetroBat launcher root differs from the selected installation".into(),
+        ));
+    }
+    let home = resolve_launcher_path(
+        lookup(&launcher_config, "home"),
+        &local_path,
+        &local_path.join(".emulationstation"),
+        false,
+    )?;
+    let saves = resolve_launcher_path(
+        lookup(&launcher_config, "saves"),
+        &local_path,
+        &local_path.parent().unwrap_or(&local_path).join("saves"),
+        false,
+    )?;
+    super::path::ensure_no_reparse_components(&home)?;
+    super::path::ensure_no_reparse_components(&saves)?;
+    Ok((home, saves))
 }
 
 /// Resolve the source-verified RetroBat 8.2.1 Game Boy/Gambatte layout without
@@ -44,11 +77,6 @@ pub fn resolve_retrobat_gb_profile(
     }
     let version_path = retrobat_root.join("system/version.info");
     let version = read_limited_text(&version_path)?.trim().to_owned();
-    if !VERIFIED_RETROBAT_VERSION_MARKERS.contains(&version.as_str()) {
-        return Err(Error::Unsupported(format!(
-            "RetroBat {version:?} is not a verified 8.2.1 save profile"
-        )));
-    }
 
     let home_default = local_path.join(".emulationstation");
     let home = resolve_launcher_path(
@@ -712,11 +740,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_runtime_version_and_unrelated_retroarch_options_remain_supported() {
+    fn compatible_upgrades_and_unrelated_retroarch_options_remain_supported() {
         let dir = tempfile::tempdir().unwrap();
         let root = stock_fixture(dir.path());
         fs::write(root.join("system/version.info"), "8.3.0").unwrap();
-        assert!(resolve_retrobat_gb_profile(&root, &[]).is_err());
+        assert_eq!(
+            resolve_retrobat_gb_profile(&root, &[]).unwrap().version,
+            "8.3.0"
+        );
 
         fs::write(root.join("system/version.info"), "8.2.1").unwrap();
         fs::write(
@@ -728,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_verified_retrobat_version_markers() {
+    fn version_markers_are_diagnostics_not_compatibility_gates() {
         let dir = tempfile::tempdir().unwrap();
         let root = stock_fixture(dir.path());
         let version_path = root.join("system/version.info");
@@ -752,8 +783,8 @@ mod tests {
         ] {
             fs::write(&version_path, marker).unwrap();
             assert!(
-                resolve_retrobat_gb_profile(&root, &[]).is_err(),
-                "unexpectedly accepted RetroBat version marker {marker:?}"
+                resolve_retrobat_gb_profile(&root, &[]).is_ok(),
+                "compatible layout rejected solely for marker {marker:?}"
             );
         }
     }

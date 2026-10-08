@@ -69,6 +69,33 @@ pub struct SaveSyncQueueStatus {
 /// Events emitted by workers. UI renders these; tests assert on them.
 #[derive(Clone, Debug)]
 pub enum AppEvent {
+    FrontendMetadata {
+        pending: bool,
+        detail: String,
+        error: Option<String>,
+    },
+    RetroBatSetup {
+        running: bool,
+        detail: String,
+        error: Option<String>,
+    },
+    PairingReady {
+        user_code: String,
+        url: String,
+    },
+    PairingEnded {
+        reason: Option<String>,
+    },
+    ConnectionRestored {
+        server: String,
+        mount_root: Option<String>,
+    },
+    IntegrationUpdated {
+        mode: crate::connection_settings::IntegrationMode,
+        retrobat_root: Option<String>,
+        error: Option<String>,
+    },
+    SignedOut,
     Connecting,
     Connected,
     ConnectFailed {
@@ -76,6 +103,25 @@ pub enum AppEvent {
     },
     SignInRequired,
 
+    /// Actual counts and timings for one catalogue operation.
+    CatalogueProgress {
+        operation_id: u64,
+        stage: String,
+        completed: u64,
+        total: Option<u64>,
+        elapsed_ms: u64,
+    },
+    CatalogueSnapshot {
+        refreshed_at: u64,
+        cached: bool,
+        pending_remount: bool,
+    },
+    MountProgress {
+        stage: String,
+        completed: u64,
+        total: Option<u64>,
+        elapsed_ms: u64,
+    },
     CatalogueLoading,
     CatalogueLoaded {
         platforms: usize,
@@ -149,20 +195,24 @@ pub enum AppEvent {
     },
 
     DownloadStarted {
+        file_id: u64,
         rom_id: u64,
         file_name: String,
         total: Option<u64>,
     },
     DownloadProgress {
+        file_id: u64,
         rom_id: u64,
         received: u64,
         total: Option<u64>,
     },
     DownloadFinished {
+        file_id: u64,
         rom_id: u64,
         file_name: String,
     },
     DownloadFailed {
+        file_id: u64,
         rom_id: u64,
         file_name: String,
         reason: String,
@@ -197,10 +247,62 @@ impl AppEvent {
 #[derive(Clone)]
 pub struct EventSink {
     tx: mpsc::Sender<AppEvent>,
+    active: Option<Arc<std::sync::atomic::AtomicBool>>,
+    diagnostic_log: Option<Arc<Mutex<crate::diagnostics::DiagnosticLog>>>,
 }
 
 impl EventSink {
+    pub fn scoped(mut self, active: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.active = Some(active);
+        self
+    }
+    pub fn is_active(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_none_or(|active| active.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    pub fn with_log_directory(mut self, directory: &std::path::Path) -> std::io::Result<Self> {
+        self.diagnostic_log = Some(Arc::new(Mutex::new(
+            crate::diagnostics::DiagnosticLog::open(directory)?,
+        )));
+        Ok(self)
+    }
     pub fn emit(&self, event: AppEvent) {
+        if !self.is_active() {
+            return;
+        }
+        // Do not Debug arbitrary events: browser approval URLs contain pairing
+        // codes. Persist only allowlisted facts and explicit credential-free logs.
+        let diagnostic_line = match &event {
+            AppEvent::Log(line) => Some(line.clone()),
+            AppEvent::DownloadStarted { .. }
+            | AppEvent::DownloadFinished { .. }
+            | AppEvent::DownloadFailed { .. }
+            | AppEvent::MountStarted { .. }
+            | AppEvent::MountFailed { .. }
+            | AppEvent::MountStopped
+            | AppEvent::MountProgress { .. }
+            | AppEvent::Evicted { .. }
+            | AppEvent::EvictFailed { .. } => Some(LogLine {
+                unix_secs: crate::cache::now_unix_secs(),
+                level: Level::Info,
+                op: "event",
+                message: format!("{event:?}"),
+            }),
+            _ => None,
+        };
+        if let (Some(log), Some(line)) = (&self.diagnostic_log, &diagnostic_line) {
+            if let Ok(mut log) = log.lock() {
+                if let Err(error) = log.append(line) {
+                    let _ = self.tx.send(AppEvent::log(
+                        Level::Error,
+                        "diagnostics",
+                        format!("Diagnostic log write failed: {error}"),
+                    ));
+                }
+            }
+        }
         // Never block or panic a worker on UI backpressure.
         let _ = self.tx.send(event);
     }
@@ -209,7 +311,14 @@ impl EventSink {
 /// Create the (sink, receiver) pair. The app consumes `receiver`.
 pub fn channel() -> (EventSink, mpsc::Receiver<AppEvent>) {
     let (tx, rx) = mpsc::channel();
-    (EventSink { tx }, rx)
+    (
+        EventSink {
+            tx,
+            active: None,
+            diagnostic_log: None,
+        },
+        rx,
+    )
 }
 
 /// Test helper: a sink that also records every event for later assertion.

@@ -7,6 +7,7 @@ mod mapping;
 mod path;
 mod preview;
 mod profile;
+pub(crate) use profile::resolve_retrobat_paths;
 mod scheduler;
 mod settings;
 

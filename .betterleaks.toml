@@ -17,6 +17,14 @@ filter = '''
     ]) &&
     finding["secret"] in ["fixture-password", "wrong"]
 ) || (
+    finding["rule_id"] == "generic-password" &&
+    filter.matchesAny(attributes["path"], [`(?:^|/)crates/rommfs-core/tests/pairing\.rs$`]) &&
+    finding["secret"] == "private-secret"
+) || (
+    finding["rule_id"] == "generic-password" &&
+    filter.matchesAny(attributes["path"], [`(?:^|/)testing/WINDOWS-TESTING\.md$`]) &&
+    finding["secret"] == "[Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPtr)"
+) || (
     finding["rule_id"] == "generic-api-key" &&
     filter.matchesAny(attributes["path"], [`(?:^|/)SAVE-SYNC-CHECKLIST\.md$`]) &&
     finding["secret"] == "42e8043372522089a3bd724e8f4a0635aa1c6bf9"

@@ -1,4 +1,4 @@
-use crate::root::{self, Manifest, OwnedEntry};
+use crate::root::{self, Manifest, OwnedEntry, OwnedKind};
 use crate::security;
 use anyhow::Context;
 use rommfs_core::cache::HydratedRemover;
@@ -169,6 +169,16 @@ fn placeholder_info(file: &File) -> anyhow::Result<(CF_PLACEHOLDER_STANDARD_INFO
 
 fn verify_handle(file: &File, entry: &OwnedEntry) -> anyhow::Result<()> {
     let meta = file.metadata()?;
+    if entry.is_local() {
+        anyhow::ensure!(
+            !rommfs_core::save_sync::path_is_reparse_point(&meta)
+                && meta.is_dir() == entry.directory
+                && (entry.directory || meta.is_file()),
+            "ordinary frontend entry changed type or is redirected: {}",
+            entry.path
+        );
+        return Ok(());
+    }
     anyhow::ensure!(
         meta.is_dir() == entry.directory && (entry.directory || meta.len() == entry.size),
         "owned entry changed type or size: {}",
@@ -189,6 +199,41 @@ pub(crate) fn verify_owned(path: &Path, entry: &OwnedEntry) -> anyhow::Result<()
     verify_handle(&open_metadata(path, false)?, entry)
 }
 
+pub(crate) fn make_directory_writable(path: &Path) -> anyhow::Result<()> {
+    security::set(&open_metadata(path, false)?, security::MIXED_DIRECTORY)
+}
+
+pub(crate) fn make_local_writable(path: &Path) -> anyhow::Result<()> {
+    security::set(&open_metadata(path, false)?, security::LOCAL_WRITABLE)
+}
+
+/// Unlike generic save paths, the managed root may itself be a verified CFAPI
+/// sync-root reparse point. Permit that root only; pin ordinary child directories
+/// without FILE_SHARE_DELETE while local metadata is being published.
+pub(crate) fn hold_local_directory_chain(
+    root: &Path,
+    directory: &Path,
+) -> anyhow::Result<Vec<File>> {
+    check_root_directory(root)?;
+    let mut handles = vec![open_metadata(root, false)?];
+    let mut path = root.to_path_buf();
+    for part in directory.strip_prefix(root)?.components() {
+        anyhow::ensure!(
+            matches!(part, std::path::Component::Normal(_)),
+            "invalid metadata directory path"
+        );
+        path.push(part);
+        let file = open_metadata(&path, false)?;
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.is_dir() && !rommfs_core::save_sync::path_is_reparse_point(&metadata),
+            "redirected metadata directory was preserved"
+        );
+        handles.push(file);
+    }
+    Ok(handles)
+}
+
 /// Exclusive share-nothing handles prevent dehydration while readers are open.
 /// Native dehydration failures retain the private cache for a later sweep.
 pub struct WindowsHydratedRemover {
@@ -205,7 +250,7 @@ impl HydratedRemover for WindowsHydratedRemover {
     fn remove_hydrated(&self, relative: &str) -> std::io::Result<()> {
         let result = (|| -> anyhow::Result<()> {
             let parts: Vec<_> = relative.split('/').collect();
-            anyhow::ensure!(parts.len() == 2, "invalid cache path");
+            anyhow::ensure!(parts.len() >= 2, "invalid cache path");
             for part in parts {
                 rommfs_core::save_sync::validate_windows_path_component(part)
                     .map_err(anyhow::Error::msg)?;
@@ -214,7 +259,7 @@ impl HydratedRemover for WindowsHydratedRemover {
             let entry = manifest
                 .entries
                 .iter()
-                .find(|e| e.path == relative && !e.directory);
+                .find(|e| e.path == relative && !e.directory && !e.is_local());
             let path = self.root.join(relative);
             // A missing placeholder already has no hydrated bytes to reclaim.
             let file = match OpenOptions::new()
@@ -291,6 +336,14 @@ pub struct WindowsMount {
 
 impl WindowsMount {
     pub fn mount(core: Arc<RommFs>, root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let started = std::time::Instant::now();
+        core.events()
+            .emit(rommfs_core::events::AppEvent::MountProgress {
+                stage: "Root preparation".into(),
+                completed: 0,
+                total: None,
+                elapsed_ms: 0,
+            });
         root::check_directory(root.as_ref())?;
         let root = std::fs::canonicalize(root.as_ref())?;
         check_prerequisites(&root)?;
@@ -314,7 +367,7 @@ impl WindowsMount {
         )?;
         let previous = root::read_manifest(&root).context("claim the root before mounting")?;
         root::check_tree(&root, &previous, verify_owned)?;
-        let mut manifest = manifest_for(&core, &previous.server_id)?;
+        let mut manifest = manifest_for(&core, &previous)?;
         let root_handle = open_metadata(&root, false)?;
         manifest.root_security = if previous.root_security.is_empty() {
             security::snapshot(&root_handle)
@@ -329,6 +382,7 @@ impl WindowsMount {
         let inodes = manifest
             .entries
             .iter()
+            .filter(|entry| !entry.is_local() && !entry.directory)
             .map(|entry| {
                 let parts: Vec<_> = entry.path.split('/').collect();
                 let inode = core
@@ -355,8 +409,12 @@ impl WindowsMount {
         };
         register_root(&mount.root, &manifest.server_id)?;
         mount.registered = true;
-        security::set(&root_handle, security::READ_ONLY)
-            .with_context(|| format!("apply read-only ACL to {}", mount.root.display()))?;
+        security::set(&root_handle, security::MIXED_DIRECTORY).with_context(|| {
+            format!(
+                "apply protected mixed-content directory ACL to {}",
+                mount.root.display()
+            )
+        })?;
         root::check_tree(&mount.root, &mount.manifest, verify_owned)?;
         // ponytail: rebuilds owned placeholders on start; reconcile unchanged entries
         // if catalogue startup costs become significant. Private bytes survive.
@@ -402,13 +460,36 @@ impl WindowsMount {
             "connect Cloud Files sync root",
         )?;
         mount.connection = Some(connection);
-        for entry in &mount.manifest.entries {
+        let total = mount.manifest.entries.len() as u64;
+        mount
+            .context
+            .core
+            .events()
+            .emit(rommfs_core::events::AppEvent::MountProgress {
+                stage: "Placeholder creation".into(),
+                completed: 0,
+                total: Some(total),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            });
+        for (index, entry) in mount.manifest.entries.iter().enumerate() {
             create_placeholder(&mount.root, entry).with_context(|| {
                 format!(
                     "create placeholder {}",
                     mount.root.join(&entry.path).display()
                 )
             })?;
+            if (index + 1) % 64 == 0 || index + 1 == total as usize {
+                mount
+                    .context
+                    .core
+                    .events()
+                    .emit(rommfs_core::events::AppEvent::MountProgress {
+                        stage: "Placeholder creation".into(),
+                        completed: (index + 1) as u64,
+                        total: Some(total),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    });
+            }
         }
         Ok(mount)
     }
@@ -423,6 +504,7 @@ impl WindowsMount {
 impl Drop for WindowsMount {
     fn drop(&mut self) {
         self.context.stopping.store(true, Ordering::Release);
+        self.context.core.cancel_transfers();
         if let Some(connection) = self.connection.take() {
             // SAFETY: context remains allocated until callbacks have drained.
             let result = unsafe { CfDisconnectSyncRoot(connection) };
@@ -452,17 +534,23 @@ impl Drop for WindowsMount {
             return;
         }
         let cleanup = (|| -> anyhow::Result<()> {
+            let latest = root::read_manifest(&self.root)?;
+            anyhow::ensure!(
+                latest.server_id == self.manifest.server_id,
+                "root ownership changed while mounted"
+            );
+            self.manifest = latest;
             root::check_tree(&self.root, &self.manifest, verify_owned)?;
             remove_entries(&self.root, &self.manifest)?;
             anyhow::ensure!(
-                std::fs::read_dir(&self.root)?.next().is_none(),
-                "root contains unowned files; registration preserved"
+                !self.manifest.entries.iter().any(|entry| !entry.is_local() && self.root.join(&entry.path).exists()),
+                "legacy placeholders remain beside frontend files; registration preserved for remount"
             );
             let path = wide(&self.root)?;
             // SAFETY: no connection or placeholders remain; never traverse user files.
             hr(
                 unsafe { CfUnregisterSyncRoot(path.as_ptr()) },
-                "unregister empty sync root",
+                "unregister sync root without ROM placeholders",
             )?;
             security::restore(
                 &open_metadata(&self.root, false)?,
@@ -472,29 +560,69 @@ impl Drop for WindowsMount {
                 &self.root,
                 &Manifest {
                     server_id: self.manifest.server_id.clone(),
+                    entries: self
+                        .manifest
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.is_local())
+                        .cloned()
+                        .collect(),
                     ..Manifest::default()
                 },
             )
         })();
         if let Err(error) = cleanup {
+            self.context
+                .core
+                .events()
+                .emit(rommfs_core::events::AppEvent::log(
+                    rommfs_core::events::Level::Warn,
+                    "native-stop",
+                    format!(
+                        "Cloud Files cleanup deferred at {}: {error:#}",
+                        self.root.display()
+                    ),
+                ));
             tracing::warn!(error = %error, root = %self.root.display(), "Cloud Files cleanup deferred; owned placeholders preserved for restart");
         }
     }
 }
 
-fn manifest_for(core: &RommFs, server: &str) -> anyhow::Result<Manifest> {
+fn manifest_for(core: &RommFs, previous: &Manifest) -> anyhow::Result<Manifest> {
+    let server = &previous.server_id;
     let catalogue = core.catalogue();
     anyhow::ensure!(
-        catalogue.entries.iter().all(|e| e.key.server_id == server),
+        catalogue.entries.iter().all(|e| e.key.server_id == *server),
         "catalogue belongs to a different server"
     );
-    let mut entries = Vec::new();
-    for directory in &catalogue.platforms {
+    // Ordinary frontend content survives projection changes and remounts.
+    // Retain its ancestor directories, including removed platforms, so history
+    // is not lost when a game disappears from the server.
+    let mut entries: Vec<_> = previous
+        .entries
+        .iter()
+        .filter(|e| e.is_local() || e.directory)
+        .cloned()
+        .map(|mut entry| {
+            if entry.directory {
+                entry.kind = OwnedKind::ManagedDirectory;
+            }
+            entry
+        })
+        .collect();
+    for directory in catalogue.directories() {
+        if entries
+            .iter()
+            .any(|entry| entry.path.eq_ignore_ascii_case(directory))
+        {
+            continue;
+        }
         entries.push(OwnedEntry {
             path: directory.clone(),
             identity: Sha256::digest(format!("RomMFS-dir:{server}:{directory}")).to_vec(),
             directory: true,
             size: 0,
+            kind: OwnedKind::ManagedDirectory,
         });
     }
     for entry in &catalogue.entries {
@@ -503,6 +631,10 @@ fn manifest_for(core: &RommFs, server: &str) -> anyhow::Result<Manifest> {
             "ROM size exceeds Cloud Files limit"
         );
         let path = format!("{}/{}", entry.platform_dir, entry.file_name);
+        anyhow::ensure!(
+            !entries.iter().any(|e| e.path.eq_ignore_ascii_case(&path)),
+            "ROM projection collides with persistent frontend content: {path}"
+        );
         let identity = Sha256::digest(serde_json::to_vec(&(
             server,
             entry.key.rom_id,
@@ -517,10 +649,11 @@ fn manifest_for(core: &RommFs, server: &str) -> anyhow::Result<Manifest> {
             identity,
             directory: false,
             size: entry.size,
+            kind: OwnedKind::Placeholder,
         });
     }
     Ok(Manifest {
-        server_id: server.into(),
+        server_id: server.clone(),
         entries,
         ..Manifest::default()
     })
@@ -629,6 +762,20 @@ fn register_root(root: &Path, server: &str) -> anyhow::Result<()> {
 
 fn create_placeholder(root: &Path, entry: &OwnedEntry) -> anyhow::Result<()> {
     let target = root.join(&entry.path);
+    if entry.directory && entry.kind == OwnedKind::ManagedDirectory {
+        if !target.try_exists()? {
+            std::fs::create_dir(&target)?;
+        }
+        verify_owned(&target, entry)?;
+        return make_directory_writable(&target);
+    }
+    if entry.is_local() {
+        return Ok(());
+    }
+    if entry.directory && target.try_exists()? {
+        verify_owned(&target, entry)?;
+        return make_directory_writable(&target);
+    }
     let parent = wide(target.parent().context("missing parent")?)?;
     let name = wide(Path::new(target.file_name().context("missing filename")?))?;
     let mut info = CF_PLACEHOLDER_CREATE_INFO {
@@ -671,11 +818,21 @@ fn create_placeholder(root: &Path, entry: &OwnedEntry) -> anyhow::Result<()> {
     anyhow::ensure!(processed == 1, "placeholder was not processed");
     hr(info.Result, "create placeholder entry")?;
     // Apply explicitly as well as inheriting from the protected root.
-    security::set(&open_metadata(&target, false)?, security::READ_ONLY)
+    security::set(
+        &open_metadata(&target, false)?,
+        if entry.directory {
+            security::MIXED_DIRECTORY
+        } else {
+            security::READ_ONLY
+        },
+    )
 }
 
 fn remove_entries(root: &Path, manifest: &Manifest) -> anyhow::Result<()> {
     for entry in manifest.entries.iter().rev() {
+        if entry.is_local() && !entry.directory {
+            continue;
+        }
         let path = root.join(&entry.path);
         let file = match OpenOptions::new()
             .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC)
@@ -688,6 +845,9 @@ fn remove_entries(root: &Path, manifest: &Manifest) -> anyhow::Result<()> {
             Err(e) => return Err(e.into()),
         };
         verify_handle(&file, entry)?;
+        if entry.directory && std::fs::read_dir(&path)?.next().is_some() {
+            continue;
+        }
         security::allow_delete(&file)?;
         let result = (|| -> anyhow::Result<()> {
             let deleting = OpenOptions::new()
@@ -712,7 +872,14 @@ fn remove_entries(root: &Path, manifest: &Manifest) -> anyhow::Result<()> {
             Ok(())
         })();
         // Keep the first handle until permissions are restored on any failed delete.
-        let restored = security::set(&file, security::READ_ONLY);
+        let restored = security::set(
+            &file,
+            if entry.directory {
+                security::MIXED_DIRECTORY
+            } else {
+                security::READ_ONLY
+            },
+        );
         if let Err(error) = result {
             restored.context("restore ROM permissions after failed cleanup")?;
             return Err(error);
@@ -902,7 +1069,14 @@ unsafe extern "system" fn deny_delete(
         Anonymous: CF_OPERATION_PARAMETERS_0 {
             AckDelete: CF_OPERATION_PARAMETERS_0_7 {
                 Flags: CF_OPERATION_ACK_DELETE_FLAG_NONE,
-                CompletionStatus: STATUS_CLOUD_FILE_ACCESS_DENIED,
+                // Ordinary frontend files carry no placeholder identity and
+                // may be atomically replaced. ROMs remain denied; directory
+                // namespace protection also comes from their DACL.
+                CompletionStatus: if info.FileIdentityLength == 0 {
+                    0
+                } else {
+                    STATUS_CLOUD_FILE_ACCESS_DENIED
+                },
             },
         },
     };
@@ -927,7 +1101,11 @@ unsafe extern "system" fn deny_rename(
         Anonymous: CF_OPERATION_PARAMETERS_0 {
             AckRename: CF_OPERATION_PARAMETERS_0_6 {
                 Flags: CF_OPERATION_ACK_RENAME_FLAG_NONE,
-                CompletionStatus: STATUS_CLOUD_FILE_ACCESS_DENIED,
+                CompletionStatus: if info.FileIdentityLength == 0 {
+                    0
+                } else {
+                    STATUS_CLOUD_FILE_ACCESS_DENIED
+                },
             },
         },
     };
