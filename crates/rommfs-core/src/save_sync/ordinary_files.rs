@@ -21,9 +21,29 @@ struct GameRule {
     stems: HashSet<String>,
     target: Option<(String, String)>,
 }
+/// One file the save scan could not associate, with the reason kept separate
+/// so callers can group, filter, or bulk-remap without reparsing text.
+#[derive(Clone, Debug)]
+pub struct UnmatchedFile {
+    /// Save-root-relative path.
+    pub path: PathBuf,
+    pub reason: String,
+    /// Whether an explicit game association can resolve this entry; false for
+    /// structural exclusions (unsafe paths, shared saves/cards) that must stay
+    /// unmatched no matter which game is chosen.
+    pub mappable: bool,
+}
+
+impl UnmatchedFile {
+    /// The "path: reason" rendering used by the activity log.
+    pub fn display(&self) -> String {
+        format!("{}: {}", self.path.display(), self.reason)
+    }
+}
+
 pub struct SaveFilePlan {
     pub report: MappingReport,
-    pub unmatched: Vec<String>,
+    pub unmatched: Vec<UnmatchedFile>,
 }
 impl GameRule {
     fn legacy_path(&self) -> Option<PathBuf> {
@@ -187,8 +207,10 @@ impl SaveFileRules {
                 .explicit
                 .iter()
                 .filter(|(_, id)| !self.games.contains_key(id))
-                .map(|(path, id)| {
-                    format!("{path}: associated game {id} is unavailable; select another game")
+                .map(|(path, id)| UnmatchedFile {
+                    path: PathBuf::from(path),
+                    reason: format!("associated game {id} is unavailable; select another game"),
+                    mappable: true,
                 })
                 .collect(),
         };
@@ -216,13 +238,19 @@ impl SaveFileRules {
                 let display = relative.to_string_lossy().into_owned();
                 if super::path_is_reparse_point(&metadata) || portable_save_path(relative).is_err()
                 {
-                    plan.unmatched
-                        .push(format!("{display}: redirected or unsafe path"));
+                    plan.unmatched.push(UnmatchedFile {
+                        path: relative.to_path_buf(),
+                        reason: "redirected or unsafe path".into(),
+                        mappable: false,
+                    });
                     continue;
                 }
                 if shared_path(&display) {
-                    plan.unmatched
-                        .push(format!("{display}: shared saves/cards are not supported"));
+                    plan.unmatched.push(UnmatchedFile {
+                        path: relative.to_path_buf(),
+                        reason: "shared saves/cards are not supported".into(),
+                        mappable: false,
+                    });
                     continue;
                 }
                 if metadata.is_dir() {
@@ -237,10 +265,16 @@ impl SaveFileRules {
                     }
                     match self.associate(relative, root) {
                         Ok(Some(mapping)) => plan.report.mappings.push(mapping),
-                        Ok(None) => plan
-                            .unmatched
-                            .push(format!("{display}: select the owning game")),
-                        Err(error) => plan.unmatched.push(format!("{display}: {error}")),
+                        Ok(None) => plan.unmatched.push(UnmatchedFile {
+                            path: relative.to_path_buf(),
+                            reason: "select the owning game".into(),
+                            mappable: true,
+                        }),
+                        Err(error) => plan.unmatched.push(UnmatchedFile {
+                            path: relative.to_path_buf(),
+                            reason: error.to_string(),
+                            mappable: false,
+                        }),
                     }
                 }
             }

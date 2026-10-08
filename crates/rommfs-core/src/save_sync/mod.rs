@@ -3,9 +3,11 @@
 
 mod installation;
 mod journal;
+mod links;
+pub use links::{path_is_symbolic_link, remove_symbolic_link};
 mod mapping;
 mod ordinary_files;
-pub use ordinary_files::{ensure_distinct, SaveFilePlan, SaveFileRules};
+pub use ordinary_files::{ensure_distinct, SaveFilePlan, SaveFileRules, UnmatchedFile};
 mod path;
 mod preview;
 mod profile;

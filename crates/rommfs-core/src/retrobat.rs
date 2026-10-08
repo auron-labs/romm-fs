@@ -22,7 +22,7 @@ pub use artwork::{cache_artwork, cache_artwork_cancellable, ArtworkBatch};
 pub use config::{configure_switch_saves, switch_save_setting};
 pub use installer::{discover_installer, download_installer, launch_installer, InstallerRelease};
 pub use metadata::{generate_gamelists, MetadataIndex, MetadataPublication};
-pub use setup::{setup_roms_link, verify_setup_link, SetupRecord};
+pub use setup::{setup_roms_link, verify_setup_link, RomsConflicts, SetupRecord};
 
 /// Resolve effective frontend home/save directories through launcher settings.
 pub fn launcher_paths(

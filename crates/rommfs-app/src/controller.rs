@@ -18,7 +18,8 @@ use rommfs_core::connection_settings::{
 use rommfs_core::download::{ContentSource, DownloadManager};
 use rommfs_core::error::{Error, Result};
 use rommfs_core::events::{
-    AppEvent, EventSink, Level, LogBuffer, SaveSyncGameStatus, SaveSyncQueueStatus,
+    AppEvent, EventSink, ForeignEntry, ForeignKind, Level, LogBuffer, SaveSyncGameStatus,
+    SaveSyncQueueStatus,
 };
 use rommfs_core::fscore::RommFs;
 use rommfs_core::romm::{Credentials, PairedSession, PairingPoll, PairingRequest, RommClient};
@@ -26,6 +27,7 @@ use rommfs_core::save_sync::{
     discover_installations, map_catalogue, resolve_retrobat_gb_profile, validate_installation,
     ConsentSettings, DiscoveryInput, InstallationCandidate, InstallationProblem, MappingReport,
     RetroBatGbProfile, SaveSyncJournal, SaveSyncScope, SaveSyncSettingsStore, SnapshotState,
+    UnmatchedFile,
 };
 use rommfs_core::tree::RommTree;
 use std::collections::HashMap;
@@ -87,7 +89,7 @@ pub struct UiState {
     pub start_at_login: bool,
     pub startup_error: Option<String>,
     pub save_file_games: Vec<(i64, String)>,
-    pub save_file_unmatched: Vec<String>,
+    pub save_file_unmatched: Vec<UnmatchedFile>,
     pub installer_running: bool,
     pub installer_ready: bool,
     pub installer_progress: (u64, Option<u64>),
@@ -96,6 +98,8 @@ pub struct UiState {
     pub integration: IntegrationMode,
     pub retrobat_root: Option<String>,
     pub integration_error: Option<String>,
+    /// Confirmation/next-step shown after a layout change succeeds.
+    pub integration_notice: Option<String>,
     pub retrobat_setup_running: bool,
     pub retrobat_setup_detail: Option<String>,
     pub retrobat_setup_error: Option<String>,
@@ -108,6 +112,14 @@ pub struct UiState {
     pub mount: MountState,
     pub mount_path: Option<String>,
     pub mount_error: Option<String>,
+    /// Classified foreign entries blocking a mount/setup, for remediation UI.
+    pub foreign_root: Option<String>,
+    pub foreign_entries: Vec<ForeignEntry>,
+    /// Set after a "remove leftover links" pass ran.
+    pub foreign_removal: Option<std::result::Result<usize, String>>,
+    /// How many known stock/OS files and links the last RetroBat setup
+    /// refusal reported as removable with consent.
+    pub retrobat_setup_removable: usize,
     pub downloads: Vec<DownloadView>,
     pub catalogue_progress: Option<(String, u64, Option<u64>, u64)>,
     pub mount_progress: Option<(String, u64, Option<u64>, u64)>,
@@ -161,6 +173,7 @@ impl UiState {
             integration: IntegrationMode::Generic,
             retrobat_root: None,
             integration_error: None,
+            integration_notice: None,
             retrobat_setup_running: false,
             retrobat_setup_detail: None,
             retrobat_setup_error: None,
@@ -173,6 +186,10 @@ impl UiState {
             mount: MountState::NotMounted,
             mount_path: None,
             mount_error: None,
+            foreign_root: None,
+            foreign_entries: Vec::new(),
+            foreign_removal: None,
+            retrobat_setup_removable: 0,
             downloads: Vec::new(),
             catalogue_progress: None,
             mount_progress: None,
@@ -214,6 +231,17 @@ impl UiState {
     /// Apply one worker event. This is THE transition table the UI uses.
     pub fn apply(&mut self, event: &AppEvent) {
         match event {
+            AppEvent::ForeignRootEntries {
+                root,
+                entries,
+                removal,
+            } => {
+                self.foreign_root = Some(root.clone());
+                self.foreign_entries = entries.clone();
+                if removal.is_some() {
+                    self.foreign_removal = removal.clone();
+                }
+            }
             AppEvent::AuxiliaryStatus {
                 running,
                 detail,
@@ -265,19 +293,41 @@ impl UiState {
                 running,
                 detail,
                 error,
+                removable_conflicts,
             } => {
                 self.retrobat_setup_running = *running;
                 self.retrobat_setup_detail = Some(detail.clone());
                 self.retrobat_setup_error = error.clone();
+                self.retrobat_setup_removable = *removable_conflicts;
+                if *running {
+                    self.foreign_root = None;
+                    self.foreign_entries.clear();
+                    self.foreign_removal = None;
+                } else if error.is_none() {
+                    // Setup finished — the "Next: run Set up RetroBat" hint
+                    // from the layout change is done.
+                    self.integration_notice = None;
+                }
             }
             AppEvent::IntegrationUpdated {
                 mode,
                 retrobat_root,
                 error,
             } => {
+                let changed = self.integration != *mode;
                 self.integration = *mode;
                 self.retrobat_root = retrobat_root.clone();
                 self.integration_error = error.clone();
+                self.integration_notice = if error.is_none() && changed {
+                    Some(match mode {
+                        IntegrationMode::RetroBat => {
+                            "RetroBat layout is active. Next: run \"Set up RetroBat\" below.".into()
+                        }
+                        IntegrationMode::Generic => "Generic layout is active.".into(),
+                    })
+                } else {
+                    None
+                };
             }
             AppEvent::ConnectionRestored { .. } => {}
             AppEvent::SignedOut => {
@@ -400,6 +450,9 @@ impl UiState {
                 self.mount = MountState::Mounting;
                 self.mount_path = Some(path.clone());
                 self.mount_error = None;
+                self.foreign_root = None;
+                self.foreign_entries.clear();
+                self.foreign_removal = None;
             }
             AppEvent::MountStarted { path } => {
                 self.mount = MountState::Mounted;
@@ -700,12 +753,26 @@ pub enum Command {
         relative_path: PathBuf,
         rom_id: i64,
     },
+    /// Associate every eligible unmatched save file under a save-root-relative
+    /// directory group with one game (not its descendant groups).
+    AssociateSaveFolder {
+        prefix: PathBuf,
+        rom_id: i64,
+    },
     DownloadRetroBatInstaller,
     CancelRetroBatInstaller,
     LaunchRetroBatInstaller,
     SetupRetroBat {
         installation: PathBuf,
         managed_root: PathBuf,
+        /// User consented to deleting only the classified stock/OS files and
+        /// leftover links inside RetroBat's roms directory.
+        remove_known: bool,
+    },
+    /// Delete foreign symlinks/junctions (never data-bearing reparse points) under a refused
+    /// mount root, then republish the remaining foreign list.
+    RemoveForeignLinks {
+        root: PathBuf,
     },
     SetIntegration {
         mode: IntegrationMode,
@@ -757,6 +824,7 @@ fn invalidates_save_sync_scope(command: &Command) -> bool {
         Command::SetIntegration { .. }
             | Command::SelectSaveFolder { .. }
             | Command::AssociateSaveFile { .. }
+            | Command::AssociateSaveFolder { .. }
             | Command::SetupRetroBat { .. }
             | Command::BeginPairing { .. }
             | Command::CancelPairing
@@ -2212,12 +2280,13 @@ impl Worker {
         }
     }
 
-    fn setup_retrobat(&mut self, installation: &Path, managed_root: &Path) {
+    fn setup_retrobat(&mut self, installation: &Path, managed_root: &Path, remove_known: bool) {
         self.cancel_auxiliary();
         self.sink.emit(AppEvent::RetroBatSetup {
             running: true,
             detail: "Checking installation and ROM ownership".into(),
             error: None,
+            removable_conflicts: 0,
         });
         let result = (|| -> anyhow::Result<Vec<String>> {
             anyhow::ensure!(self.mount.is_none(), "stop the mount before RetroBat setup");
@@ -2230,15 +2299,26 @@ impl Worker {
                 .as_deref()
                 .context("connect before setting up RetroBat")?;
             let _stopped = stopped_retrobat_guard(installation)?;
-            check_mount_root(managed_root, server)?;
-            claim_mount_root(managed_root, server)?;
+            if let Err(e) = check_mount_root(managed_root, server) {
+                self.emit_foreign_entries(managed_root);
+                return Err(e.into());
+            }
+            if let Err(e) = claim_mount_root(managed_root, server) {
+                self.emit_foreign_entries(managed_root);
+                return Err(e.into());
+            }
             // Validate the proposed settings before linking so an override error
             // never leaves an unexpectedly reconfigured ROM directory.
             let (home, _) = rommfs_core::retrobat::launcher_paths(installation)?;
             rommfs_core::retrobat::switch_save_setting(&std::fs::read_to_string(
                 home.join("es_settings.cfg"),
             )?)?;
-            rommfs_core::retrobat::setup_roms_link(installation, managed_root, server)?;
+            rommfs_core::retrobat::setup_roms_link(
+                installation,
+                managed_root,
+                server,
+                remove_known,
+            )?;
             rommfs_core::retrobat::configure_switch_saves(installation)
         })();
         match result {
@@ -2254,15 +2334,20 @@ impl Worker {
                     running: false,
                     detail,
                     error: None,
+                    removable_conflicts: 0,
                 });
             }
             Err(error) => {
+                let removable = error
+                    .downcast_ref::<rommfs_core::retrobat::RomsConflicts>()
+                    .map_or(0, |c| c.removable.len());
                 let error = format!("{error:#}");
                 self.log(Level::Error, "retrobat-setup", error.clone());
                 self.sink.emit(AppEvent::RetroBatSetup {
                     running: false,
                     detail: "RetroBat setup did not complete".into(),
                     error: Some(error),
+                    removable_conflicts: removable,
                 });
             }
         }
@@ -2333,14 +2418,16 @@ impl Worker {
             }
             _ => None,
         };
-        let sink = self.sink.clone();
-        rommfs_core::catalog::build_catalogue_for_layout(
+        let mut warnings = Vec::new();
+        let result = rommfs_core::catalog::build_catalogue_for_layout(
             self.server_id.as_deref().unwrap_or_default(),
             &snapshot.platforms,
             &snapshot.roms,
             systems.as_ref(),
-            move |warning| sink.emit(AppEvent::log(Level::Warn, "catalogue", warning)),
-        )
+            |warning| warnings.push(warning),
+        );
+        emit_catalogue_warnings(&self.sink, warnings);
+        result
     }
 
     fn publish_snapshot(&mut self, snapshot: CatalogueSnapshot, cached: bool) -> Result<Catalogue> {
@@ -2526,6 +2613,56 @@ impl Worker {
         self.log(Level::Error, "mount", reason);
     }
 
+    /// The classified foreign entries under a directory the app does not own —
+    /// the remediation list the UI renders with per-kind actions.
+    fn foreign_entry_list(root: &Path) -> Vec<ForeignEntry> {
+        rommfs_cfapi::foreign_entries(root)
+            .into_iter()
+            .map(|e| ForeignEntry {
+                path: e.path,
+                kind: match e.kind {
+                    rommfs_cfapi::UnownedKind::File => ForeignKind::File,
+                    rommfs_cfapi::UnownedKind::Directory => ForeignKind::Directory,
+                    rommfs_cfapi::UnownedKind::Link => ForeignKind::Link,
+                },
+            })
+            .collect()
+    }
+
+    /// After a mount/setup refusal, publish what's actually in the way so the
+    /// UI can offer "remove leftover links" / "open folder" instead of a bare
+    /// path dump.
+    fn emit_foreign_entries(&self, root: &Path) {
+        let entries = Self::foreign_entry_list(root);
+        if !entries.is_empty() {
+            self.sink.emit(AppEvent::ForeignRootEntries {
+                root: root.display().to_string(),
+                entries,
+                removal: None,
+            });
+        }
+    }
+
+    /// Remove only foreign symlinks/junctions under `root` — never real
+    /// files or directories — then republish the remaining list.
+    fn remove_foreign_links(&mut self, root: &Path) {
+        let removal = rommfs_cfapi::remove_foreign_links(root).map_err(|e| format!("{e:#}"));
+        match &removal {
+            Ok(0) => self.log(Level::Info, "cleanup", "no leftover links found"),
+            Ok(n) => self.log(
+                Level::Info,
+                "cleanup",
+                format!("removed {n} leftover links under {}", root.display()),
+            ),
+            Err(e) => self.log(Level::Error, "cleanup", format!("link cleanup failed: {e}")),
+        }
+        self.sink.emit(AppEvent::ForeignRootEntries {
+            root: root.display().to_string(),
+            entries: Self::foreign_entry_list(root),
+            removal: Some(removal),
+        });
+    }
+
     fn start_mount(&mut self, path: &str) {
         let path = path.trim();
         if self.auxiliary_job.is_some() {
@@ -2624,6 +2761,7 @@ impl Worker {
         // previously marked for THIS server (PRD §5 — never over an existing
         // ROM library, never recursively cleared).
         if let Err(e) = check_mount_root(&root, &server_id) {
+            self.emit_foreign_entries(&root);
             self.fail_mount("prepare and validate directory", path, &e);
             self.refresh_save_sync();
             return;
@@ -2663,6 +2801,7 @@ impl Worker {
             format!("claiming ownership of {path:?}"),
         );
         if let Err(e) = claim_mount_root(&root, &server_id) {
+            self.emit_foreign_entries(&root);
             self.fail_mount("claim ownership", path, &e);
             return;
         }
@@ -2724,7 +2863,12 @@ impl Worker {
                 // are reclaimed (PRD R4); per-ROM outcomes become events.
                 self.evict_once();
             }
-            Err(e) => self.fail_mount("start filesystem backend", path, &e),
+            Err(e) => {
+                // Backend-start failures can carry UnownedEntries (foreign
+                // files under the mount root); publish the remediation list.
+                self.emit_foreign_entries(&root);
+                self.fail_mount("start filesystem backend", path, &e)
+            }
         }
     }
 
@@ -2926,6 +3070,9 @@ fn worker_loop_with_interval_from(
                 relative_path,
                 rom_id,
             } => worker.associate_save_file(relative_path, *rom_id),
+            Command::AssociateSaveFolder { prefix, rom_id } => {
+                worker.associate_save_folder(prefix, *rom_id)
+            }
             Command::DownloadRetroBatInstaller => {
                 let directory = worker
                     .save_sync_storage_dir
@@ -2938,7 +3085,9 @@ fn worker_loop_with_interval_from(
             Command::SetupRetroBat {
                 installation,
                 managed_root,
-            } => worker.setup_retrobat(installation, managed_root),
+                remove_known,
+            } => worker.setup_retrobat(installation, managed_root, *remove_known),
+            Command::RemoveForeignLinks { root } => worker.remove_foreign_links(root),
             Command::SetIntegration {
                 mode,
                 retrobat_root,
@@ -2998,7 +3147,9 @@ fn worker_loop_with_interval_from(
                     running: false,
                     detail: "RetroBat setup stopped".into(),
                     error: Some(format!("internal error: {msg}")),
+                    removable_conflicts: 0,
                 }),
+                Command::RemoveForeignLinks { .. } => {}
                 Command::SetIntegration { .. }
                 | Command::RefreshCatalogue
                 | Command::RefreshSaveSync
@@ -3006,7 +3157,9 @@ fn worker_loop_with_interval_from(
                 | Command::SetSaveSyncEnabled { .. }
                 | Command::SetSaveSyncDebounce { .. }
                 | Command::ExportSaveSyncIncoming { .. } => {}
-                Command::SelectSaveFolder { .. } | Command::AssociateSaveFile { .. } => {}
+                Command::SelectSaveFolder { .. }
+                | Command::AssociateSaveFile { .. }
+                | Command::AssociateSaveFolder { .. } => {}
                 Command::Shutdown => {}
                 Command::MaterializeAuxiliary => {}
                 Command::CancelAuxiliary => {}
@@ -3255,6 +3408,50 @@ fn claim_mount_root(root: &Path, server_id: &str) -> Result<()> {
     rommfs_cfapi::claim_mount_root(root, server_id).map_err(mount_root_error)
 }
 
+/// Collapse the per-file repeats a catalogue build produces ("rom 824 file
+/// 5425: …") into one Activity line per (rom, reason). The complete detail is
+/// written to the diagnostic file, where bulk output belongs.
+fn emit_catalogue_warnings(sink: &EventSink, warnings: Vec<String>) {
+    let mut grouped: std::collections::BTreeMap<String, usize> = Default::default();
+    for warning in &warnings {
+        sink.log_detail(Level::Warn, "catalogue", warning.clone());
+        *grouped.entry(summarize_warning(warning)).or_default() += 1;
+    }
+    for (message, count) in grouped {
+        sink.emit(AppEvent::log(
+            Level::Warn,
+            "catalogue",
+            if count > 1 {
+                format!("{message} (×{count})")
+            } else {
+                message
+            },
+        ));
+    }
+}
+
+/// "rom 824 file 5425: reason" → "rom 824: reason"; "file 228: invalid
+/// category" → "invalid category". Anything already aggregate passes through.
+fn summarize_warning(warning: &str) -> String {
+    if let Some(rest) = warning.strip_prefix("rom ") {
+        if let Some((rom, rest)) = rest.split_once(' ') {
+            if let Some(rest) = rest.strip_prefix("file ") {
+                if let Some((_, reason)) = rest.split_once(": ") {
+                    return format!("rom {rom}: {reason}");
+                }
+            }
+        }
+        return warning.to_string();
+    }
+    if let Some((_, reason)) = warning
+        .strip_prefix("file ")
+        .and_then(|r| r.split_once(": "))
+    {
+        return reason.to_string();
+    }
+    warning.to_string()
+}
+
 fn mount_root_error(e: anyhow::Error) -> Error {
     let mut message = format!("{e:#}");
     if let Some(io) = e.downcast_ref::<std::io::Error>() {
@@ -3464,6 +3661,73 @@ mod tests {
         std::fs::write(root.join("save.srm"), b"user data").unwrap();
         assert!(check_mount_root(&root, "server").is_err());
         assert_eq!(std::fs::read(root.join("save.srm")).unwrap(), b"user data");
+    }
+
+    #[test]
+    fn foreign_entries_populate_remediation_state_and_clear_on_retry() {
+        let mut state = UiState::new(16);
+        state.apply(&AppEvent::ForeignRootEntries {
+            root: "C:\\RomM".into(),
+            entries: vec![
+                ForeignEntry {
+                    path: "gb/gamelist.xml".into(),
+                    kind: ForeignKind::File,
+                },
+                ForeignEntry {
+                    path: "gb".into(),
+                    kind: ForeignKind::Link,
+                },
+            ],
+            removal: None,
+        });
+        assert_eq!(state.foreign_root.as_deref(), Some("C:\\RomM"));
+        assert_eq!(state.foreign_entries.len(), 2);
+        assert!(state.foreign_removal.is_none());
+        state.apply(&AppEvent::ForeignRootEntries {
+            root: "C:\\RomM".into(),
+            entries: vec![ForeignEntry {
+                path: "gb/gamelist.xml".into(),
+                kind: ForeignKind::File,
+            }],
+            removal: Some(Ok(1)),
+        });
+        assert_eq!(state.foreign_removal, Some(Ok(1)));
+        assert_eq!(state.foreign_entries.len(), 1);
+        state.apply(&AppEvent::MountStarting {
+            path: "C:\\RomM".into(),
+        });
+        assert!(state.foreign_entries.is_empty());
+        assert!(state.foreign_root.is_none());
+        assert!(state.foreign_removal.is_none());
+    }
+
+    /// The cleanup command deletes links only and republishes what remains.
+    #[cfg(unix)]
+    #[test]
+    fn remove_foreign_links_reports_and_preserves_real_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mount");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("user.srm"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("leftover")).unwrap();
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.remove_foreign_links(&root);
+        assert_eq!(std::fs::read(root.join("user.srm")).unwrap(), b"keep");
+        assert!(std::fs::symlink_metadata(root.join("leftover")).is_err());
+        let events: Vec<_> = events.try_iter().collect();
+        let report = events
+            .iter()
+            .find_map(|e| match e {
+                AppEvent::ForeignRootEntries {
+                    entries, removal, ..
+                } => Some((entries, removal)),
+                _ => None,
+            })
+            .expect("cleanup must republish the foreign entry list");
+        assert_eq!(report.1, &Some(Ok(1)));
+        assert_eq!(report.0.len(), 1);
+        assert_eq!(report.0[0].kind, ForeignKind::File);
     }
 
     #[test]

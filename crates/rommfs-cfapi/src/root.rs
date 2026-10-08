@@ -206,10 +206,12 @@ pub(crate) fn check_directory(root: &Path) -> anyhow::Result<()> {
 }
 
 /// Placeholders require native identity verification; writable frontend content
-/// is explicitly claimed by path/role. Unowned user content is always refused.
+/// is explicitly claimed by path/role. Files a frontend legitimately writes
+/// between mounts (its gamelist) are adopted; everything else foreign is
+/// reported as `UnownedEntries` for targeted cleanup, never silently claimed.
 pub fn check_mount_root(root: &Path, server_id: &str) -> anyhow::Result<RootCheck> {
     check_directory(root)?;
-    let manifest = match read_manifest(root) {
+    let mut manifest = match read_manifest(root) {
         Ok(manifest) => manifest,
         Err(e)
             if e.downcast_ref::<std::io::Error>()
@@ -227,16 +229,23 @@ pub fn check_mount_root(root: &Path, server_id: &str) -> anyhow::Result<RootChec
         manifest.server_id == server_id,
         "mount root belongs to a different server"
     );
-    #[cfg(windows)]
-    check_tree(root, &manifest, crate::imp::verify_owned)?;
-    #[cfg(not(windows))]
-    check_tree(root, &manifest, |path, entry| {
-        if entry.is_local() {
-            verify_local(path, entry)
-        } else {
-            anyhow::bail!("persistent placeholder validation requires Windows")
+    let scan = scan_tree(root, &manifest, verify_entry)?;
+    let unowned = adopt_entries(root, &mut manifest, scan.unowned)?;
+    if !unowned.is_empty() {
+        let mut error = anyhow::Error::new(UnownedEntries(unowned));
+        if !scan.failures.is_empty() {
+            error = error.context(format!(
+                "{} owned entries also failed verification",
+                scan.failures.len()
+            ));
         }
-    })?;
+        return Err(error);
+    }
+    anyhow::ensure!(
+        scan.failures.is_empty(),
+        "owned entries failed verification: {}",
+        scan.failures.join("; ")
+    );
     Ok(RootCheck::RecognizedOwned)
 }
 
@@ -252,6 +261,21 @@ pub(crate) fn verify_local(path: &Path, entry: &OwnedEntry) -> anyhow::Result<()
         path.display()
     );
     Ok(())
+}
+
+fn verify_entry(path: &Path, entry: &OwnedEntry) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::imp::verify_owned(path, entry)
+    }
+    #[cfg(not(windows))]
+    {
+        anyhow::ensure!(
+            entry.is_local(),
+            "persistent placeholder validation requires Windows"
+        );
+        verify_local(path, entry)
+    }
 }
 
 /// Read only previously claimed generated files; no filename-based acquisition
@@ -416,11 +440,27 @@ fn publish_local(
             verify_local(&target, entry)?;
         }
     } else {
-        anyhow::ensure!(
-            fs::symlink_metadata(&target).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
-            "unowned metadata file was preserved: {}",
-            target.display()
-        );
+        // A frontend-owned file the frontend created between mounts (its own
+        // gamelist.xml) is claimed and overwritten like any owned publication;
+        // anything else unowned is preserved and still refuses.
+        let adoptable = adoptable_kind(
+            manifest,
+            &UnownedEntry {
+                path: relative.to_string(),
+                kind: UnownedKind::File,
+            },
+        )
+        .is_some_and(|claimed| {
+            claimed == kind && verify_local(&target, &local_entry(relative, kind, false)).is_ok()
+        });
+        if !adoptable {
+            anyhow::ensure!(
+                fs::symlink_metadata(&target)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+                "unowned metadata file was preserved: {}",
+                target.display()
+            );
+        }
         manifest.entries.push(local_entry(relative, kind, false));
         write_manifest(root, manifest)?;
     }
@@ -507,38 +547,310 @@ fn local_entry(path: &str, kind: OwnedKind, directory: bool) -> OwnedEntry {
     }
 }
 
-pub(crate) fn check_tree(
+/// What the mount walk found on disk that the manifest does not own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnownedKind {
+    File,
+    Directory,
+    /// A symlink or junction. Cloud and other data-bearing reparse points are
+    /// files/directories, never links eligible for automatic cleanup.
+    Link,
+}
+
+/// One foreign on-disk entry under a mount root, root-relative and
+/// '/'-separated so it can be shown to the user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnownedEntry {
+    pub path: String,
+    pub kind: UnownedKind,
+}
+
+/// Every unmanaged entry under a mount root. Surfaced as the error type so a
+/// caller can offer targeted cleanup instead of a bare refusal.
+#[derive(Debug)]
+pub struct UnownedEntries(pub Vec<UnownedEntry>);
+
+impl UnownedKind {
+    fn label(self) -> &'static str {
+        match self {
+            UnownedKind::File => "file",
+            UnownedKind::Directory => "directory",
+            UnownedKind::Link => "link",
+        }
+    }
+}
+
+impl std::fmt::Display for UnownedEntries {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.0.len();
+        write!(
+            f,
+            "{n} unmanaged entr{} in the mount folder",
+            if n == 1 { "y" } else { "ies" }
+        )?;
+        const SHOWN: usize = 8;
+        for entry in self.0.iter().take(SHOWN) {
+            write!(f, "; {} ({})", entry.path, entry.kind.label())?;
+        }
+        if n > SHOWN {
+            write!(f, "; and {} more", n - SHOWN)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UnownedEntries {}
+
+/// Result of walking a mount root against its manifest.
+pub(crate) struct TreeScan {
+    /// On-disk entries the manifest does not own; foreign directories are
+    /// reported but never descended into.
+    pub unowned: Vec<UnownedEntry>,
+    /// Owned entries whose on-disk state failed verification.
+    pub failures: Vec<String>,
+}
+
+/// Walk the whole root instead of stopping at the first problem so one foreign
+/// file cannot hide the rest. Links are classified, never followed.
+pub(crate) fn scan_tree(
     root: &Path,
     manifest: &Manifest,
     verify: impl Fn(&Path, &OwnedEntry) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TreeScan> {
+    let _parent_guard = rommfs_core::save_sync::hold_save_directory_chain(
+        root.parent().context("mount root has no parent")?,
+    )?;
+    check_directory(root)?;
+    let _root_guard = hold_metadata_directories(root, root)?;
     let owned: HashMap<_, _> = manifest
         .entries
         .iter()
         .map(|e| (e.path.to_lowercase(), e))
         .collect();
+    let mut scan = TreeScan {
+        unowned: Vec::new(),
+        failures: Vec::new(),
+    };
     let mut directories = vec![root.to_path_buf()];
     while let Some(directory) = directories.pop() {
-        for entry in fs::read_dir(directory)? {
+        let _directory_guard = match hold_metadata_directories(root, &directory) {
+            Ok(guard) => guard,
+            Err(e) => {
+                scan.failures
+                    .push(format!("{}: {e:#}", directory.display()));
+                continue;
+            }
+        };
+        for entry in fs::read_dir(&directory)? {
             let path = entry?.path();
             let relative = path
                 .strip_prefix(root)?
                 .to_str()
                 .context("invalid path encoding")?
                 .replace('\\', "/");
-            let expected = owned.get(&relative.to_lowercase()).with_context(|| {
-                format!(
-                    "unowned file {}; preserve it and choose a fresh root",
-                    path.display()
-                )
-            })?;
-            verify(&path, expected)?;
-            if expected.directory {
-                directories.push(path);
+            match owned.get(&relative.to_lowercase()) {
+                Some(expected) => {
+                    if let Err(e) = verify(&path, expected) {
+                        scan.failures.push(format!("{relative}: {e:#}"));
+                        continue;
+                    }
+                    if expected.directory {
+                        directories.push(path);
+                    }
+                }
+                None => {
+                    let metadata = fs::symlink_metadata(&path)?;
+                    let kind = if rommfs_core::save_sync::path_is_symbolic_link(&path)? {
+                        UnownedKind::Link
+                    } else if metadata.is_dir() {
+                        UnownedKind::Directory
+                    } else {
+                        UnownedKind::File
+                    };
+                    scan.unowned.push(UnownedEntry {
+                        path: relative,
+                        kind,
+                    });
+                }
             }
         }
     }
-    Ok(())
+    scan.unowned.sort_by(|a, b| a.path.cmp(&b.path));
+    scan.failures.sort();
+    Ok(scan)
+}
+
+/// The frontend names a running EmulationStation legitimately creates inside a
+/// platform directory between mounts: its `gamelist.xml` plus the `gamelist.*`
+/// backups/locks ES writes while saving. Claims stay role-scoped — a link is
+/// never adopted, and only empty directories below owned directories join the
+/// manifest as managed directories.
+fn adoptable_kind(manifest: &Manifest, entry: &UnownedEntry) -> Option<OwnedKind> {
+    let (parent, name) = match entry.path.rsplit_once('/') {
+        Some((parent, name)) => (Some(parent), name),
+        None => (None, entry.path.as_str()),
+    };
+    match entry.kind {
+        UnownedKind::Link => None,
+        UnownedKind::Directory => {
+            // Only adopt directly below the root or an owned directory; the
+            // scan never descends so the caller re-checks emptiness on disk.
+            match parent {
+                Some(parent) => manifest
+                    .entries
+                    .iter()
+                    .any(|e| e.directory && e.path.eq_ignore_ascii_case(parent))
+                    .then_some(OwnedKind::ManagedDirectory),
+                None => Some(OwnedKind::ManagedDirectory),
+            }
+        }
+        UnownedKind::File => {
+            let owned = parent.is_some_and(|parent| {
+                manifest
+                    .entries
+                    .iter()
+                    .any(|e| e.directory && e.path.eq_ignore_ascii_case(parent))
+            });
+            if !owned {
+                return None;
+            }
+            let name = name.to_lowercase();
+            if name == "gamelist.xml" {
+                Some(OwnedKind::Gamelist)
+            } else {
+                name.starts_with("gamelist.xml")
+                    .then_some(OwnedKind::FrontendState)
+            }
+        }
+    }
+}
+
+/// Move the frontend-owned foreign entries of a scan into the manifest,
+/// returning the entries that must stay foreign. Adoption re-verifies the
+/// on-disk type at claim time so a file swapped for a link between the scan
+/// and the claim is never taken over.
+pub(crate) fn adopt_entries(
+    root: &Path,
+    manifest: &mut Manifest,
+    unowned: Vec<UnownedEntry>,
+) -> anyhow::Result<Vec<UnownedEntry>> {
+    let _parent_guard = rommfs_core::save_sync::hold_save_directory_chain(
+        root.parent().context("mount root has no parent")?,
+    )?;
+    let _root_guard = hold_metadata_directories(root, root)?;
+    let mut remaining = Vec::new();
+    let before = manifest.entries.len();
+    for entry in unowned {
+        let directory = entry.kind == UnownedKind::Directory;
+        let Some(kind) = adoptable_kind(manifest, &entry) else {
+            remaining.push(entry);
+            continue;
+        };
+        let target = root.join(&entry.path);
+        let _parent_guard = hold_metadata_directories(
+            root,
+            target.parent().context("foreign entry has no parent")?,
+        )?;
+        let owned = local_entry(&entry.path, kind, directory);
+        if verify_local(&target, &owned).is_err() {
+            remaining.push(entry);
+            continue;
+        }
+        let _directory_guard = if directory {
+            Some(hold_metadata_directories(root, &target)?)
+        } else {
+            None
+        };
+        // Adopt only directories provably empty; a vanished/unreadable entry
+        // stays foreign rather than aborting the remaining claims.
+        if directory
+            && fs::read_dir(&target)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(true)
+        {
+            remaining.push(entry);
+            continue;
+        }
+        manifest.entries.push(owned);
+    }
+    if manifest.entries.len() != before {
+        write_manifest(root, manifest)?;
+    }
+    Ok(remaining)
+}
+
+/// The foreign entries under a verified `root`, for remediation UI. With no
+/// manifest, report the top level; invalid manifests or roots refuse scanning.
+pub fn foreign_entries(root: &Path) -> Vec<UnownedEntry> {
+    match foreign_tree(root) {
+        Ok(scan) => scan.unowned,
+        Err(_) => Vec::new(),
+    }
+}
+
+fn foreign_tree(root: &Path) -> anyhow::Result<TreeScan> {
+    check_directory(root)?;
+    let manifest = match read_manifest(root) {
+        Ok(manifest) => manifest,
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Manifest::default()
+        }
+        Err(e) => return Err(e),
+    };
+    scan_tree(root, &manifest, verify_entry)
+}
+
+/// Delete only foreign symlinks/junctions under `root` — removing a link
+/// object never deletes its target's data. Real files and directories are
+/// never touched. Returns how many links were removed; per-link failures are
+/// aggregated so one stubborn link does not stop the rest.
+pub fn remove_foreign_links(root: &Path) -> anyhow::Result<usize> {
+    let _parent_guard = rommfs_core::save_sync::hold_save_directory_chain(
+        root.parent().context("mount root has no parent")?,
+    )?;
+    check_directory(root)?;
+    let _root_guard = hold_metadata_directories(root, root)?;
+    let scan = foreign_tree(root)?;
+    anyhow::ensure!(
+        scan.failures.is_empty(),
+        "owned entries failed verification: {}",
+        scan.failures.join("; ")
+    );
+    let mut removed = 0;
+    let mut errors = Vec::new();
+    for entry in scan.unowned {
+        if entry.kind != UnownedKind::Link {
+            continue;
+        }
+        let path = root.join(&entry.path);
+        let result = (|| -> anyhow::Result<()> {
+            let _directory_guard = hold_metadata_directories(
+                root,
+                path.parent().context("foreign link has no parent")?,
+            )?;
+            rommfs_core::save_sync::remove_symbolic_link(&path)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => removed += 1,
+            Err(e) if e.downcast_ref::<rommfs_core::Error>().is_some_and(|e| {
+                matches!(e, rommfs_core::Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
+            }) => {},
+            Err(e) => errors.push(format!("{}: {e}", entry.path)),
+        }
+    }
+    if errors.is_empty() {
+        Ok(removed)
+    } else {
+        Err(anyhow::anyhow!(
+            "removed {removed} links; failed on {}: {}",
+            errors.len(),
+            errors.join("; ")
+        ))
+    }
 }
 
 pub fn claim_mount_root(root: &Path, server_id: &str) -> anyhow::Result<()> {
@@ -566,6 +878,62 @@ pub fn claim_mount_root(root: &Path, server_id: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_refuses_replaced_owned_directories_and_preserves_external_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("roms");
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        claim_mount_root(&root, "server-a").unwrap();
+        let mut manifest = read_manifest(&root).unwrap();
+        manifest
+            .entries
+            .push(local_entry("gb", OwnedKind::ManagedDirectory, true));
+        write_manifest(&root, &manifest).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("gb")).unwrap();
+        std::os::unix::fs::symlink(tmp.path(), outside.join("keep-link")).unwrap();
+
+        assert!(check_mount_root(&root, "server-a").is_err());
+        assert!(foreign_entries(&root).is_empty());
+        assert!(remove_foreign_links(&root).is_err());
+        assert!(fs::symlink_metadata(outside.join("keep-link")).is_ok());
+        // Even a caller supplying a permissive verifier cannot traverse links.
+        let scan = scan_tree(&root, &manifest, |_, _| Ok(())).unwrap();
+        assert!(scan.unowned.is_empty());
+        assert_eq!(scan.failures.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_refuses_linked_roots_and_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let root = tmp.path().join("roms");
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(outside.join("roms")).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+        std::os::unix::fs::symlink(tmp.path(), outside.join("keep-link")).unwrap();
+        std::os::unix::fs::symlink(tmp.path(), outside.join("roms/keep-link")).unwrap();
+        for redirected in [&root, &root.join("roms")] {
+            assert!(foreign_entries(redirected).is_empty());
+            assert!(remove_foreign_links(redirected).is_err());
+        }
+        assert!(fs::symlink_metadata(outside.join("keep-link")).is_ok());
+        assert!(fs::symlink_metadata(outside.join("roms/keep-link")).is_ok());
+    }
+
+    #[test]
+    fn cleanup_refuses_invalid_manifest_instead_of_treating_owned_data_as_foreign() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("roms");
+        fs::create_dir(&root).unwrap();
+        claim_mount_root(&root, "s").unwrap();
+        fs::write(sidecar_path(&root, ".rommfs-root").unwrap(), b"{broken").unwrap();
+        assert!(remove_foreign_links(&root).is_err());
+    }
 
     #[test]
     fn ownership_never_authorizes_replacing_user_files() {
@@ -605,6 +973,90 @@ mod tests {
             };
             assert!(validate_manifest(&manifest).is_err(), "{path}");
         }
+    }
+
+    /// Files a frontend legitimately writes between mounts are adopted into the
+    /// manifest; everything else is classified and reported, never touched.
+    #[test]
+    fn frontend_files_are_adopted_and_foreign_entries_classified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("roms");
+        fs::create_dir(&root).unwrap();
+        claim_mount_root(&root, "server-a").unwrap();
+        // Seed an owned platform directory (as a mount would have left it).
+        fs::create_dir(root.join("gb")).unwrap();
+        let mut manifest = read_manifest(&root).unwrap();
+        manifest
+            .entries
+            .push(local_entry("gb", OwnedKind::ManagedDirectory, true));
+        write_manifest(&root, &manifest).unwrap();
+
+        fs::write(root.join("gb/gamelist.xml"), b"<gameList/>").unwrap();
+        fs::write(root.join("stray.srm"), b"user data").unwrap();
+        fs::create_dir(root.join("saves")).unwrap();
+        fs::write(root.join("saves/keep.srm"), b"user").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, root.join("leftover")).unwrap();
+
+        let error = check_mount_root(&root, "server-a").unwrap_err();
+        let report = error
+            .downcast_ref::<UnownedEntries>()
+            .expect("foreign entries must be classified");
+        let paths: Vec<_> = report.0.iter().map(|e| (e.path.as_str(), e.kind)).collect();
+        assert!(
+            paths.contains(&("stray.srm", UnownedKind::File)),
+            "{paths:?}"
+        );
+        assert!(
+            paths.contains(&("saves", UnownedKind::Directory)),
+            "{paths:?}"
+        );
+        #[cfg(unix)]
+        assert!(
+            paths.contains(&("leftover", UnownedKind::Link)),
+            "{paths:?}"
+        );
+        assert!(!paths.iter().any(|(path, _)| path.contains("gamelist")));
+
+        // The gamelist was adopted on disk and the manifest persisted it.
+        let manifest = read_manifest(&root).unwrap();
+        assert!(manifest
+            .entries
+            .iter()
+            .any(|e| e.path == "gb/gamelist.xml" && e.kind == OwnedKind::Gamelist));
+        assert_eq!(fs::read(root.join("stray.srm")).unwrap(), b"user data");
+        assert_eq!(fs::read(root.join("saves/keep.srm")).unwrap(), b"user");
+    }
+
+    /// Link cleanup deletes only symlinks — the foreign file and the
+    /// directory stay, and a missing manifest never blocks reporting.
+    #[cfg(unix)]
+    #[test]
+    fn remove_foreign_links_deletes_only_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("roms");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("user.txt"), b"mine").unwrap();
+        fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(tmp.path(), root.join("dead-link")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("missing"), root.join("broken")).unwrap();
+
+        let entries = foreign_entries(&root);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.kind == UnownedKind::Link)
+                .count(),
+            2
+        );
+        assert_eq!(remove_foreign_links(&root).unwrap(), 2);
+        assert!(fs::symlink_metadata(root.join("dead-link")).is_err());
+        assert!(fs::symlink_metadata(root.join("broken")).is_err());
+        assert_eq!(fs::read(root.join("user.txt")).unwrap(), b"mine");
+        assert!(root.join("real").is_dir());
+        assert!(foreign_entries(&root)
+            .iter()
+            .all(|e| e.kind != UnownedKind::Link));
     }
 
     #[cfg(unix)]

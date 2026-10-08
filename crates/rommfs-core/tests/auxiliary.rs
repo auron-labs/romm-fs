@@ -121,6 +121,131 @@ fn explicit_auxiliary_setup_materializes_verified_destinations_and_preserves_mod
 }
 
 #[test]
+fn duplicate_auxiliary_destinations_dedupe_or_skip_instead_of_failing() {
+    let fx = FixtureServer::start();
+    let platform:PlatformDto=serde_json::from_value(serde_json::json!({"id":1,"slug":"gb","fs_slug":"gb","name":"Game Boy","custom_name":null,"rom_count":0})).unwrap();
+    // The same BIOS uploaded under two library entries is one real file; a
+    // genuinely different file with the same name is a conflict that must not
+    // abort the other destinations.
+    fx.on("GET","/api/firmware",ResponseSpec::Json { status:200,body:serde_json::json!([
+        {"id":1,"platform_id":1,"file_name":"bios.bin","file_size_bytes":4,"updated_at":"v1"},
+        {"id":2,"platform_id":1,"file_name":"BIOS.BIN","file_size_bytes":4,"updated_at":"v1"},
+        {"id":3,"platform_id":1,"file_name":"conflict.bin","file_size_bytes":4,"updated_at":"v1"},
+        {"id":4,"platform_id":1,"file_name":"conflict.bin","file_size_bytes":9,"updated_at":"v2"},
+        {"id":5,"platform_id":1,"file_name":"other.bin","file_size_bytes":2,"updated_at":"v1"}
+    ]).to_string() });
+    for (id, bytes) in [
+        (1, b"keys".as_slice()),
+        (2, b"keys".as_slice()),
+        (5, b"go".as_slice()),
+    ] {
+        fx.on(
+            "GET",
+            &format!("/api/firmware/{id}/content/"),
+            ResponseSpec::Bytes {
+                status: 200,
+                bytes: bytes.to_vec(),
+                truncate_at: None,
+                stall_after_bytes: None,
+            },
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("RetroBat");
+    fs::create_dir_all(install.join("emulationstation")).unwrap();
+    fs::write(
+        install.join("emulationstation/emulatorLauncher.cfg"),
+        "home=.\\.emulationstation\nsaves=.\\..\\saves\nbios=.\\..\\bios\ncheats=.\\..\\cheats\n",
+    )
+    .unwrap();
+    let report = materialize_auxiliaries(
+        &RommClient::new(fx.url()).unwrap(),
+        "server",
+        7,
+        &install,
+        &[platform],
+        &[],
+        &AtomicBool::new(true),
+        |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(report.published, 2);
+    assert_eq!(fs::read(install.join("bios/bios.bin")).unwrap(), b"keys");
+    assert_eq!(fs::read(install.join("bios/other.bin")).unwrap(), b"go");
+    assert!(!install.join("bios/conflict.bin").exists());
+    let warnings = report.warnings.join("\n");
+    assert!(warnings.contains("conflict.bin"), "{warnings}");
+    assert!(warnings.contains("bios.bin"), "{warnings}");
+    assert_eq!(fx.count_requests("GET", "/api/firmware/3/content/"), 0);
+    assert_eq!(fx.count_requests("GET", "/api/firmware/4/content/"), 0);
+    assert_eq!(fx.count_requests("GET", "/api/firmware/2/content/"), 1);
+}
+
+#[test]
+fn duplicate_firmware_requires_equal_downloaded_content_not_size_or_timestamp() {
+    // Missing/equal timestamps do not prove equality, and differing timestamps
+    // do not make byte-identical BIOS files conflict.
+    for (second_bytes, second_version, expected_published) in [
+        (b"BBBB".as_slice(), "", 1),
+        (b"BBBB".as_slice(), "v1", 1),
+        (b"AAAA".as_slice(), "v2", 2),
+    ] {
+        let fx = FixtureServer::start();
+        let first_version = if second_version.is_empty() { "" } else { "v1" };
+        fx.on("GET", "/api/firmware", ResponseSpec::Json { status: 200, body: serde_json::json!([
+            {"id":1,"platform_id":1,"file_name":"bios.bin","file_size_bytes":4,"updated_at":first_version},
+            {"id":2,"platform_id":1,"file_name":"BIOS.BIN","file_size_bytes":4,"updated_at":second_version},
+            {"id":3,"platform_id":1,"file_name":"other.bin","file_size_bytes":2}
+        ]).to_string() });
+        for (id, bytes) in [
+            (1, b"AAAA".as_slice()),
+            (2, second_bytes),
+            (3, b"ok".as_slice()),
+        ] {
+            fx.on(
+                "GET",
+                &format!("/api/firmware/{id}/content/"),
+                ResponseSpec::Bytes {
+                    status: 200,
+                    bytes: bytes.to_vec(),
+                    truncate_at: None,
+                    stall_after_bytes: None,
+                },
+            );
+        }
+        let platform: PlatformDto = serde_json::from_value(serde_json::json!({"id":1,"slug":"gb","fs_slug":"gb","name":"Game Boy","custom_name":null,"rom_count":0})).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let install = dir.path().join("RetroBat");
+        fs::create_dir_all(install.join("emulationstation")).unwrap();
+        fs::write(install.join("emulationstation/emulatorLauncher.cfg"),
+            "home=.\\.emulationstation\nsaves=.\\..\\saves\nbios=.\\..\\bios\ncheats=.\\..\\cheats\n").unwrap();
+        let report = materialize_auxiliaries(
+            &RommClient::new(fx.url()).unwrap(),
+            "s",
+            7,
+            &install,
+            &[platform],
+            &[],
+            &AtomicBool::new(true),
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(report.published, expected_published);
+        assert_eq!(fs::read(install.join("bios/other.bin")).unwrap(), b"ok");
+        if expected_published == 2 {
+            assert_eq!(fs::read(install.join("bios/bios.bin")).unwrap(), b"AAAA");
+        } else {
+            assert!(!install.join("bios/bios.bin").exists());
+            assert!(report
+                .warnings
+                .iter()
+                .any(|w| w.contains("Conflicting auxiliary contents")));
+        }
+        assert_eq!(fx.count_requests("GET", "/api/firmware/2/content/"), 1);
+    }
+}
+
+#[test]
 fn cancelled_or_truncated_auxiliary_download_does_not_publish_partial_files() {
     let fx = FixtureServer::start();
     let barrier = FixtureBodyBarrier::new();

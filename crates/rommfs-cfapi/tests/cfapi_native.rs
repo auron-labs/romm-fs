@@ -304,6 +304,7 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     // The volume remains read-only after content is cached.
     assert_read_only(&root, &rom_path);
     assert_eq!(std::fs::read(&rom_path).unwrap(), bytes);
+    assert_foreign_cloud_file_is_preserved(&root);
 
     // A different process reads warm NTFS bytes without invoking FETCH_DATA.
     // Its open must still refresh the private cache's last-use timestamp.
@@ -426,6 +427,70 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     assert!(check_mount_root(&root, &server_id).is_err());
     assert!(WindowsMount::mount(fs, &root).is_err());
     assert_eq!(std::fs::read(local).unwrap(), b"keep local data");
+}
+
+/// A fully hydrated foreign cloud file owns real bytes despite its reparse
+/// attribute. Cleanup must neither advertise nor remove it as a leftover link.
+fn assert_foreign_cloud_file_is_preserved(root: &Path) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::CloudFilters::{
+        CfConvertToPlaceholder, CfRevertPlaceholder, CF_CONVERT_FLAG_ALWAYS_FULL,
+        CF_CONVERT_FLAG_MARK_IN_SYNC, CF_REVERT_FLAG_NONE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    let path = root.join("foreign-cloud-save.srm");
+    std::fs::write(&path, b"unowned local save data").unwrap();
+    let open = || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+            .unwrap()
+    };
+    let file = open();
+    let identity = b"foreign-cloud-save";
+    // SAFETY: live handle, live identity buffer, synchronous conversion with
+    // no dehydration; this temporary fixture retains all its local bytes.
+    let result = unsafe {
+        CfConvertToPlaceholder(
+            file.as_raw_handle(),
+            identity.as_ptr().cast(),
+            identity.len() as u32,
+            CF_CONVERT_FLAG_MARK_IN_SYNC | CF_CONVERT_FLAG_ALWAYS_FULL,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert!(result >= 0, "convert cloud fixture: HRESULT {result:#x}");
+    drop(file);
+    assert!(rommfs_core::save_sync::path_is_reparse_point(
+        &std::fs::symlink_metadata(&path).unwrap()
+    ));
+    assert!(!rommfs_core::save_sync::path_is_symbolic_link(&path).unwrap());
+    assert!(rommfs_cfapi::foreign_entries(root)
+        .iter()
+        .any(|entry| entry.path == "foreign-cloud-save.srm"
+            && entry.kind == rommfs_cfapi::UnownedKind::File));
+    assert_eq!(rommfs_cfapi::remove_foreign_links(root).unwrap(), 0);
+    assert_eq!(std::fs::read(&path).unwrap(), b"unowned local save data");
+    // Restore the test fixture to an ordinary file before cleanup; mounted
+    // ROM placeholders deliberately reject direct deletion callbacks.
+    let file = open();
+    // SAFETY: live exclusive handle to the fixture, synchronous revert.
+    let result = unsafe {
+        CfRevertPlaceholder(
+            file.as_raw_handle(),
+            CF_REVERT_FLAG_NONE,
+            std::ptr::null_mut(),
+        )
+    };
+    assert!(result >= 0, "revert cloud fixture: HRESULT {result:#x}");
+    drop(file);
+    std::fs::remove_file(path).unwrap();
 }
 
 /// Whether the test token is elevated. Elevated callers hold restore-type

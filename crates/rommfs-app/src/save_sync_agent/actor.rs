@@ -502,8 +502,8 @@ fn run_actor(
                 match rules.scan(&scope.effective_saves_root) {
                     Ok(plan) => {
                         discovered.extend(plan.report.mappings);
-                        for path in plan.unmatched.iter().take(20) {
-                            sink.emit(AppEvent::log(Level::Warn, "save-sync", path.clone()));
+                        for file in plan.unmatched.iter().take(20) {
+                            sink.emit(AppEvent::log(Level::Warn, "save-sync", file.display()));
                         }
                     }
                     Err(e) => sink.emit(AppEvent::log(

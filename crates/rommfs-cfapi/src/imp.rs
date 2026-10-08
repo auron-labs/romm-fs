@@ -214,8 +214,18 @@ pub(crate) fn hold_local_directory_chain(
     root: &Path,
     directory: &Path,
 ) -> anyhow::Result<Vec<File>> {
+    let open_directory = |path: &Path| -> anyhow::Result<File> {
+        Ok(OpenOptions::new()
+            // List access, not attributes alone, pins the namespace on
+            // Windows Server too. Omit delete sharing to prevent substitution.
+            .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?)
+    };
+    let mut handles = vec![open_directory(root)?];
+    // Validate after pinning so a root swapped between check/open is refused.
     check_root_directory(root)?;
-    let mut handles = vec![open_metadata(root, false)?];
     let mut path = root.to_path_buf();
     for part in directory.strip_prefix(root)?.components() {
         anyhow::ensure!(
@@ -223,7 +233,7 @@ pub(crate) fn hold_local_directory_chain(
             "invalid metadata directory path"
         );
         path.push(part);
-        let file = open_metadata(&path, false)?;
+        let file = open_directory(&path)?;
         let metadata = file.metadata()?;
         anyhow::ensure!(
             metadata.is_dir() && !rommfs_core::save_sync::path_is_reparse_point(&metadata),
@@ -365,8 +375,19 @@ impl WindowsMount {
         let directories = rommfs_core::save_sync::hold_save_directory_chain(
             root.parent().context("missing root parent")?,
         )?;
-        let previous = root::read_manifest(&root).context("claim the root before mounting")?;
-        root::check_tree(&root, &previous, verify_owned)?;
+        let mut previous = root::read_manifest(&root).context("claim the root before mounting")?;
+        // Adopt the files a frontend legitimately wrote between mounts; report
+        // every other foreign entry at once instead of failing on the first.
+        let scan = root::scan_tree(&root, &previous, verify_owned)?;
+        let unowned = root::adopt_entries(&root, &mut previous, scan.unowned)?;
+        if !unowned.is_empty() {
+            return Err(anyhow::Error::new(root::UnownedEntries(unowned)));
+        }
+        anyhow::ensure!(
+            scan.failures.is_empty(),
+            "owned entries failed verification: {}",
+            scan.failures.join("; ")
+        );
         let mut manifest = manifest_for(&core, &previous)?;
         let root_handle = open_metadata(&root, false)?;
         manifest.root_security = if previous.root_security.is_empty() {
@@ -415,10 +436,16 @@ impl WindowsMount {
                 mount.root.display()
             )
         })?;
-        root::check_tree(&mount.root, &mount.manifest, verify_owned)?;
+        let scan = root::scan_tree(&mount.root, &mount.manifest, verify_owned)?;
+        let unowned = root::adopt_entries(&mount.root, &mut mount.manifest, scan.unowned)?;
         // ponytail: rebuilds owned placeholders on start; reconcile unchanged entries
         // if catalogue startup costs become significant. Private bytes survive.
-        remove_entries(&mount.root, &mount.manifest)?;
+        let mut failures = scan.failures;
+        failures.extend(remove_entries(&mount.root, &mount.manifest));
+        if !unowned.is_empty() {
+            failures.push(format!("{}", root::UnownedEntries(unowned)));
+        }
+        anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
         root::write_manifest(&mount.root, &manifest)?;
         mount.manifest = manifest;
         let callbacks = [
@@ -540,11 +567,34 @@ impl Drop for WindowsMount {
                 "root ownership changed while mounted"
             );
             self.manifest = latest;
-            root::check_tree(&self.root, &self.manifest, verify_owned)?;
-            remove_entries(&self.root, &self.manifest)?;
+            let scan = root::scan_tree(&self.root, &self.manifest, verify_owned)?;
+            // A frontend may have written its own files (gamelist.xml) while
+            // mounted; claim those so everything RomMFS owns can still come
+            // down. Unknown foreign entries stay untouched and reported.
+            let unowned = root::adopt_entries(&self.root, &mut self.manifest, scan.unowned)?;
+            let mut problems = scan.failures;
+            problems.extend(remove_entries(&self.root, &self.manifest));
+            let leftovers = self
+                .manifest
+                .entries
+                .iter()
+                .filter(|entry| {
+                    !entry.is_local()
+                        && std::fs::symlink_metadata(self.root.join(&entry.path)).is_ok()
+                })
+                .count();
+            if leftovers != 0 {
+                problems.push(format!(
+                    "{leftovers} owned placeholders could not be removed"
+                ));
+            }
+            if !unowned.is_empty() {
+                problems.push(format!("{}", root::UnownedEntries(unowned)));
+            }
             anyhow::ensure!(
-                !self.manifest.entries.iter().any(|entry| !entry.is_local() && self.root.join(&entry.path).exists()),
-                "legacy placeholders remain beside frontend files; registration preserved for remount"
+                problems.is_empty(),
+                "partial cleanup; registration preserved for remount: {}",
+                problems.join("; ")
             );
             let path = wide(&self.root)?;
             // SAFETY: no connection or placeholders remain; never traverse user files.
@@ -828,12 +878,42 @@ fn create_placeholder(root: &Path, entry: &OwnedEntry) -> anyhow::Result<()> {
     )
 }
 
-fn remove_entries(root: &Path, manifest: &Manifest) -> anyhow::Result<()> {
+/// Delete each verified owned entry, collecting failures instead of aborting
+/// on the first so one blocked file cannot strand the rest of the tree. Every
+/// entry is still re-verified before deleting; foreign content is never
+/// touched, and directories holding foreign files stay because they are
+/// nonempty, not because they are trusted.
+fn remove_entries(root: &Path, manifest: &Manifest) -> Vec<String> {
+    let _parent_guard = match root
+        .parent()
+        .context("mount root has no parent")
+        .and_then(|parent| {
+            rommfs_core::save_sync::hold_save_directory_chain(parent).map_err(anyhow::Error::from)
+        }) {
+        Ok(guard) => guard,
+        Err(e) => return vec![format!("protect mount parent: {e:#}")],
+    };
+    let mut failures = Vec::new();
     for entry in manifest.entries.iter().rev() {
         if entry.is_local() && !entry.directory {
             continue;
         }
         let path = root.join(&entry.path);
+        if std::fs::symlink_metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            continue;
+        }
+        let _directory_guard = match hold_local_directory_chain(
+            root,
+            path.parent()
+                .expect("validated manifest entry has a parent"),
+        ) {
+            Ok(guard) => guard,
+            Err(e) => {
+                failures.push(format!("{}: {e:#}", entry.path));
+                continue;
+            }
+        };
         let file = match OpenOptions::new()
             .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC)
             .share_mode(FILE_SHARE_DELETE)
@@ -842,13 +922,32 @@ fn remove_entries(root: &Path, manifest: &Manifest) -> anyhow::Result<()> {
         {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                failures.push(format!("{}: {e}", entry.path));
+                continue;
+            }
         };
-        verify_handle(&file, entry)?;
-        if entry.directory && std::fs::read_dir(&path)?.next().is_some() {
+        if let Err(e) = verify_handle(&file, entry) {
+            failures.push(format!("{}: {e:#}", entry.path));
             continue;
         }
-        security::allow_delete(&file)?;
+        if entry.directory {
+            match std::fs::read_dir(&path) {
+                Ok(mut entries) => {
+                    if entries.next().is_some() {
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    failures.push(format!("{}: {e}", entry.path));
+                    continue;
+                }
+            }
+        }
+        if let Err(e) = security::allow_delete(&file) {
+            failures.push(format!("{}: {e:#}", entry.path));
+            continue;
+        }
         let result = (|| -> anyhow::Result<()> {
             let deleting = OpenOptions::new()
                 .access_mode(DELETE | FILE_READ_ATTRIBUTES | WRITE_DAC)
@@ -881,11 +980,14 @@ fn remove_entries(root: &Path, manifest: &Manifest) -> anyhow::Result<()> {
             },
         );
         if let Err(error) = result {
-            restored.context("restore ROM permissions after failed cleanup")?;
-            return Err(error);
+            let message = match restored.context("restore ROM permissions after failed cleanup") {
+                Ok(()) => format!("{}: {error:#}", entry.path),
+                Err(e) => format!("{}: {error:#}; {e:#}", entry.path),
+            };
+            failures.push(message);
         }
     }
-    Ok(())
+    failures
 }
 
 fn operation(info: &CF_CALLBACK_INFO, kind: CF_OPERATION_TYPE) -> CF_OPERATION_INFO {

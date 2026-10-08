@@ -67,9 +67,37 @@ pub struct SaveSyncQueueStatus {
     pub incoming: Vec<SaveSyncIncomingStatus>,
 }
 
+/// A classified on-disk entry inside a target directory that the app does not
+/// own, surfaced for remediation UI. `Link` means a symlink/junction whose
+/// removal leaves the target intact, not a data-bearing cloud reparse point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForeignKind {
+    File,
+    Directory,
+    Link,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignEntry {
+    /// Root-relative, '/'-separated path under the affected directory.
+    pub path: String,
+    pub kind: ForeignKind,
+}
+
 /// Events emitted by workers. UI renders these; tests assert on them.
 #[derive(Clone, Debug)]
 pub enum AppEvent {
+    /// The foreign entries currently blocking a mount/setup, plus which of
+    /// them are links the user can safely remove. Emitted alongside a failure
+    /// event and cleared by the next attempt.
+    ForeignRootEntries {
+        /// Absolute path of the directory that was scanned.
+        root: String,
+        entries: Vec<ForeignEntry>,
+        /// Set after a cleanup pass: how many links were just removed, or the
+        /// cleanup error.
+        removal: Option<Result<usize, String>>,
+    },
     AuxiliaryStatus {
         running: bool,
         detail: String,
@@ -82,7 +110,7 @@ pub enum AppEvent {
     SaveFileMappings {
         session_id: u64,
         games: Vec<(i64, String)>,
-        unmatched: Vec<String>,
+        unmatched: Vec<crate::save_sync::UnmatchedFile>,
     },
     RetroBatInstaller {
         running: bool,
@@ -101,6 +129,9 @@ pub enum AppEvent {
         running: bool,
         detail: String,
         error: Option<String>,
+        /// On a roms-conflict failure: how many entries are classified as
+        /// known stock/OS files or links the user may consent to removing.
+        removable_conflicts: usize,
     },
     PairingReady {
         user_code: String,
@@ -298,14 +329,17 @@ impl EventSink {
         // Do not Debug arbitrary events: browser approval URLs contain pairing
         // codes. Persist only allowlisted facts and explicit credential-free logs.
         let diagnostic_line = match &event {
+            // MountProgress is deliberately not persisted: it fires per small
+            // batch and dominated the diagnostic log (2MB+ per session). Mount
+            // start/finish/failure timestamps still bound every stage.
             AppEvent::Log(line) => Some(line.clone()),
             AppEvent::DownloadStarted { .. }
             | AppEvent::DownloadFinished { .. }
             | AppEvent::DownloadFailed { .. }
+            | AppEvent::ForeignRootEntries { .. }
             | AppEvent::MountStarted { .. }
             | AppEvent::MountFailed { .. }
             | AppEvent::MountStopped
-            | AppEvent::MountProgress { .. }
             | AppEvent::RetroBatSetup { .. }
             | AppEvent::AuxiliaryStatus { .. }
             | AppEvent::RetroBatInstaller { .. }
@@ -332,6 +366,23 @@ impl EventSink {
         }
         // Never block or panic a worker on UI backpressure.
         let _ = self.tx.send(event);
+    }
+
+    /// Append a line to the durable diagnostic file only — never the UI's
+    /// activity stream. For high-volume per-item detail that must remain
+    /// available for support without burying what the user sees.
+    pub fn log_detail(&self, level: Level, op: &'static str, message: impl Into<String>) {
+        let Some(log) = &self.diagnostic_log else {
+            return;
+        };
+        if let Ok(mut log) = log.lock() {
+            let _ = log.append(&LogLine {
+                unix_secs: crate::cache::now_unix_secs(),
+                level,
+                op,
+                message: message.into(),
+            });
+        }
     }
 }
 

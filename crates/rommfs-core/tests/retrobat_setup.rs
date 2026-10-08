@@ -1,5 +1,5 @@
 use rommfs_core::retrobat::{
-    configure_switch_saves, setup_roms_link, switch_save_setting, verify_setup_link,
+    configure_switch_saves, setup_roms_link, switch_save_setting, verify_setup_link, RomsConflicts,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,9 +33,12 @@ fn stock_and_unowned_files_are_reported_and_preserved_without_partial_setup() {
     let (install, managed) = installation(dir.path());
     fs::write(install.join("roms/gb/stock.txt"), b"stock").unwrap();
     fs::write(install.join("roms/game.nsp"), b"user data").unwrap();
-    let error = setup_roms_link(&install, &managed, "s")
-        .unwrap_err()
-        .to_string();
+    let error = setup_roms_link(&install, &managed, "s", false).unwrap_err();
+    let conflicts = error
+        .downcast_ref::<RomsConflicts>()
+        .expect("typed conflict report");
+    assert_eq!(conflicts.blocking.len(), 2);
+    let error = error.to_string();
     assert!(
         error.contains("stock.txt") && error.contains("game.nsp"),
         "{error}"
@@ -48,19 +51,77 @@ fn stock_and_unowned_files_are_reported_and_preserved_without_partial_setup() {
     assert!(install.join("roms/gb/empty").is_dir());
 }
 
+#[test]
+fn consented_cleanup_removes_only_stock_and_noise_never_user_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let (install, managed) = installation(dir.path());
+    fs::write(install.join("roms/gb/_info.txt"), b"stock info").unwrap();
+    fs::write(install.join("roms/gb/desktop.ini"), b"noise").unwrap();
+    fs::write(install.join("roms/Thumbs.db"), b"noise").unwrap();
+    // Without consent the removable files still refuse setup and survive.
+    let error = setup_roms_link(&install, &managed, "s", false).unwrap_err();
+    let conflicts = error
+        .downcast_ref::<RomsConflicts>()
+        .expect("cleanup UI needs the typed report");
+    assert_eq!(conflicts.removable.len(), 3);
+    assert!(conflicts.blocking.is_empty());
+    let error = error.to_string();
+    assert!(error.contains("_info.txt"), "{error}");
+    assert!(install.join("roms/gb/_info.txt").exists());
+    // With consent the classified files go and setup completes.
+    setup_roms_link(&install, &managed, "s", true).unwrap();
+    assert_eq!(fs::canonicalize(install.join("roms")).unwrap(), managed);
+    assert!(!install.join("roms").join("gb/_info.txt").exists());
+    assert!(install.join(".rommfs-setup.json").exists());
+}
+
+#[test]
+fn user_files_block_setup_even_after_consent_and_are_never_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (install, managed) = installation(dir.path());
+    fs::write(install.join("roms/gb/_info.txt"), b"stock info").unwrap();
+    fs::write(install.join("roms/gb/gamelist.xml"), b"<gameList/>").unwrap();
+    fs::write(install.join("roms/game.nsp"), b"user data").unwrap();
+    let error = setup_roms_link(&install, &managed, "s", true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("gamelist.xml") && error.contains("game.nsp"),
+        "{error}"
+    );
+    // The consented stock file was removed; user files were not, and no
+    // record or link was created.
+    assert!(!install.join("roms/gb/_info.txt").exists());
+    assert_eq!(
+        fs::read(install.join("roms/game.nsp")).unwrap(),
+        b"user data"
+    );
+    assert!(!install.join(".rommfs-setup.json").exists());
+    assert!(!path_is_link(&install.join("roms")));
+}
+
+#[cfg(unix)]
+fn path_is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).unwrap().file_type().is_symlink()
+}
+#[cfg(not(unix))]
+fn path_is_link(path: &Path) -> bool {
+    rommfs_core::save_sync::path_is_reparse_point(&fs::symlink_metadata(path).unwrap())
+}
+
 #[cfg(unix)]
 #[test]
 fn setup_accepts_compatible_versions_is_repeatable_and_rejects_wrong_ownership() {
     let dir = tempfile::tempdir().unwrap();
     let (install, managed) = installation(dir.path());
-    let record = setup_roms_link(&install, &managed, "s").unwrap();
+    let record = setup_roms_link(&install, &managed, "s", false).unwrap();
     assert_eq!(record.version.as_deref(), Some("9.0.1-compatible"));
     assert_eq!(fs::canonicalize(install.join("roms")).unwrap(), managed);
-    setup_roms_link(&install, &managed, "s").unwrap();
-    assert!(setup_roms_link(&install, &managed, "other").is_err());
+    setup_roms_link(&install, &managed, "s", false).unwrap();
+    assert!(setup_roms_link(&install, &managed, "other", false).is_err());
     let other = dir.path().join("other");
     fs::create_dir(&other).unwrap();
-    assert!(setup_roms_link(&install, &other, "s").is_err());
+    assert!(setup_roms_link(&install, &other, "s", false).is_err());
     fs::remove_file(install.join("roms")).unwrap();
     std::os::unix::fs::symlink(&other, install.join("roms")).unwrap();
     assert!(verify_setup_link(&install, &managed, "s").is_err());
@@ -73,11 +134,17 @@ fn unowned_links_and_nested_reparse_points_are_not_followed() {
     let dir = tempfile::tempdir().unwrap();
     let (install, managed) = installation(dir.path());
     std::os::unix::fs::symlink(&managed, install.join("roms/gb/link")).unwrap();
-    assert!(setup_roms_link(&install, &managed, "s").is_err());
+    // Links are classified removable: still refused without consent, deleted
+    // (link only — target intact) with consent.
+    assert!(setup_roms_link(&install, &managed, "s", false).is_err());
     assert!(fs::symlink_metadata(install.join("roms/gb/link"))
         .unwrap()
         .file_type()
         .is_symlink());
+    setup_roms_link(&install, &managed, "s", true).unwrap();
+    assert!(!install.join("roms/gb/link").exists());
+    assert!(managed.is_dir());
+    assert_eq!(fs::canonicalize(install.join("roms")).unwrap(), managed);
 }
 
 #[test]

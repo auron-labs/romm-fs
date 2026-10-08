@@ -28,11 +28,8 @@ use gpui_kit::{
     Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use rommfs_core::connection_settings::IntegrationMode;
-use rommfs_core::events::{AppEvent, Level, SaveSyncIncomingStatus};
-use rommfs_core::save_sync::{
-    ExistingSavePreview, ExistingSaveScanStatus, MAX_EXISTING_SAVE_SCAN_DEPTH,
-    MAX_EXISTING_SAVE_SCAN_ENTRIES,
-};
+use rommfs_core::events::{AppEvent, ForeignKind, Level, SaveSyncIncomingStatus};
+use rommfs_core::save_sync::{ExistingSavePreview, ExistingSaveScanStatus};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -123,6 +120,21 @@ fn field_column(label: &'static str, control: impl IntoElement, cx: &App) -> imp
         .child(control)
 }
 
+/// "refreshed 12 min ago" instead of a raw Unix timestamp.
+fn relative_time(unix_secs: u64) -> String {
+    let now = rommfs_core::cache::now_unix_secs();
+    let ago = now.saturating_sub(unix_secs);
+    if ago < 60 {
+        "just now".into()
+    } else if ago < 3600 {
+        format!("{} min ago", ago / 60)
+    } else if ago < 86_400 {
+        format!("{} h {} min ago", ago / 3600, ago % 3600 / 60)
+    } else {
+        format!("{} days ago", ago / 86_400)
+    }
+}
+
 fn fmt_count(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -138,6 +150,14 @@ fn fmt_count(n: usize) -> String {
 // ---------------------------------------------------------------------------
 // The window view: renders `UiState`, forwards clicks as `Command`s.
 // ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct UnmatchedSaveGroup {
+    count: usize,
+    extensions: Vec<String>,
+    mappable: bool,
+    reason: String,
+}
 
 struct RommfsWindow {
     controller: Rc<Controller>,
@@ -157,9 +177,12 @@ struct RommfsWindow {
     active_view: usize,
     password_sign_in: bool,
     integration_choice: usize,
-    retrobat_input: Entity<InputState>,
+    /// Settings-tab installation picker; fed by the same discovery candidates
+    /// as `install_select` but bound to the integration's RetroBat root.
+    settings_install_select: Entity<SelectState<Vec<SharedString>>>,
     completed_open: bool,
     mapping_open: bool,
+    advanced_open: bool,
     log_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -202,8 +225,8 @@ impl RommfsWindow {
                 .default_value(rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string())
         });
 
-        let retrobat_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("RetroBat installation folder"));
+        let settings_install_select =
+            cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
         let mut subscriptions = Vec::new();
 
         // Enter in a connection field is the section's default commit.
@@ -251,6 +274,31 @@ impl RommfsWindow {
             },
         ));
 
+        // Picking a discovered installation in Settings applies the RetroBat
+        // layout immediately; failures revert the radio via IntegrationUpdated.
+        subscriptions.push(cx.subscribe_in(
+            &settings_install_select,
+            window,
+            |view, _state, event, _window, cx| {
+                let SelectEvent::Confirm(value) = event;
+                let Some(value) = value else { return };
+                let value = value.to_string();
+                if view
+                    .state
+                    .retrobat_root
+                    .as_deref()
+                    .is_some_and(|root| root.eq_ignore_ascii_case(&value))
+                {
+                    return;
+                }
+                view.controller.send(Command::SetIntegration {
+                    mode: IntegrationMode::RetroBat,
+                    retrobat_root: Some(PathBuf::from(value)),
+                });
+                cx.notify();
+            },
+        ));
+
         subscriptions.push(cx.subscribe_in(
             &debounce_input,
             window,
@@ -294,9 +342,10 @@ impl RommfsWindow {
             active_view: 3,
             password_sign_in: false,
             integration_choice: 0,
-            retrobat_input,
+            settings_install_select,
             completed_open: false,
             mapping_open: false,
+            advanced_open: false,
             log_scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
         };
@@ -332,16 +381,9 @@ impl RommfsWindow {
                 _ => {}
             }
             match &event {
-                AppEvent::IntegrationUpdated {
-                    mode,
-                    retrobat_root,
-                    ..
-                } => {
+                AppEvent::IntegrationUpdated { mode, .. } => {
                     self.integration_choice = usize::from(*mode == IntegrationMode::RetroBat);
-                    if let Some(root) = retrobat_root {
-                        self.retrobat_input
-                            .update(cx, |input, cx| input.set_value(root.clone(), window, cx));
-                    }
+                    save_sync_updated = true;
                 }
                 AppEvent::PairingReady { url, .. } => cx.open_url(url),
                 AppEvent::Connected => self.active_view = 0,
@@ -383,6 +425,7 @@ impl RommfsWindow {
         }
         if save_sync_updated {
             self.sync_install_select(window, cx);
+            self.sync_settings_install_select(window, cx);
         }
         if new_logs {
             let max = self.log_scroll.max_offset();
@@ -424,6 +467,40 @@ impl RommfsWindow {
         });
     }
 
+    /// The Settings-tab picker lists the same discovered installations, plus
+    /// the configured RetroBat root when discovery did not report it (a
+    /// non-standard location). Its selection applies SetIntegration; a failed
+    /// apply leaves `state.retrobat_root` untouched so the next sync reverts
+    /// the selection back to the persisted root.
+    fn sync_settings_install_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut items: Vec<SharedString> = self
+            .state
+            .save_sync_candidates
+            .iter()
+            .map(|candidate| {
+                SharedString::from(candidate.info.install_root.to_string_lossy().into_owned())
+            })
+            .collect();
+        if let Some(root) = &self.state.retrobat_root {
+            if !items.iter().any(|item| item.eq_ignore_ascii_case(root)) {
+                items.push(SharedString::from(root.clone()));
+            }
+        }
+        let selected = self.state.retrobat_root.as_deref().and_then(|root| {
+            items
+                .iter()
+                .find(|item| item.eq_ignore_ascii_case(root))
+                .cloned()
+        });
+        self.settings_install_select.update(cx, |state, cx| {
+            state.set_items(items, window, cx);
+            match selected {
+                Some(value) => state.set_selected_value(&value, window, cx),
+                None => state.set_selected_index(None, window, cx),
+            }
+        });
+    }
+
     fn on_connect(&mut self, cx: &mut Context<Self>) {
         if self.state.conn == ConnState::Connecting {
             return;
@@ -456,6 +533,55 @@ impl RommfsWindow {
             return;
         }
         self.controller.send(Command::StopMount);
+    }
+
+    /// The RetroBat installation the Settings tab currently points at: the
+    /// picker's selection, falling back to the already-applied root.
+    fn settings_install_root(&self, cx: &App) -> Option<PathBuf> {
+        self.settings_install_select
+            .read(cx)
+            .selected_value()
+            .map(|value| PathBuf::from(value.to_string()))
+            .or_else(|| self.state.retrobat_root.as_deref().map(PathBuf::from))
+    }
+
+    /// Folder picker for a RetroBat installation discovery missed. Applies the
+    /// RetroBat layout with that root immediately — the same thing a pick in
+    /// the select does.
+    fn browse_settings_install(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Select a RetroBat installation folder".into()),
+        });
+        cx.spawn(
+            async move |this: WeakEntity<RommfsWindow>, cx| match paths.await {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        let _ = this.update(cx, |view, cx| {
+                            view.controller.send(Command::SetIntegration {
+                                mode: IntegrationMode::RetroBat,
+                                retrobat_root: Some(path),
+                            });
+                            cx.notify();
+                        });
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    let _ = this.update(cx, |view, _| {
+                        view.show_picker_error(format!("RetroBat folder picker failed: {error}"))
+                    });
+                }
+                Err(_) => {
+                    let _ = this.update(cx, |view, _| {
+                        view.show_picker_error("folder picker response was interrupted".into())
+                    });
+                }
+            },
+        )
+        .detach();
     }
 
     fn browse_save_sync(&mut self, cx: &mut Context<Self>) {
@@ -677,6 +803,7 @@ impl RommfsWindow {
         id: &'static str,
         title: &'static str,
         open: bool,
+        toggle: fn(&mut Self),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -691,12 +818,12 @@ impl RommfsWindow {
             .id(id)
             .key_context("Disclosure")
             .track_focus(&focus_handle)
-            .on_action(cx.listener(|view, _: &ActivateControl, _window, cx| {
-                view.mapping_open = !view.mapping_open;
+            .on_action(cx.listener(move |view, _: &ActivateControl, _window, cx| {
+                toggle(view);
                 cx.notify();
             }))
-            .on_click(cx.listener(|view, _, _, cx| {
-                view.mapping_open = !view.mapping_open;
+            .on_click(cx.listener(move |view, _, _, cx| {
+                toggle(view);
                 cx.notify();
             }))
             .w_full()
@@ -781,7 +908,20 @@ impl RommfsWindow {
             .child(section_heading("Library layout"))
             .child(RadioGroup::horizontal("library-layout").children(["Generic folders", "RetroBat"])
                 .selected_index(Some(self.integration_choice)).disabled(locked)
-                .on_change(cx.listener(|view,index,_,cx| { view.integration_choice = *index; cx.notify(); })))
+                .on_change(cx.listener(|view,index,_,cx| {
+                    view.integration_choice = *index;
+                    // The layout applies on selection — no separate Apply step.
+                    // Generic applies unconditionally; RetroBat applies once an
+                    // installation is known, otherwise the picker below is the
+                    // apply trigger.
+                    if *index == 0 {
+                        let retrobat_root = view.state.retrobat_root.as_deref().map(PathBuf::from);
+                        view.controller.send(Command::SetIntegration { mode: IntegrationMode::Generic, retrobat_root });
+                    } else if let Some(root) = view.settings_install_root(cx) {
+                        view.controller.send(Command::SetIntegration { mode: IntegrationMode::RetroBat, retrobat_root: Some(root) });
+                    }
+                    cx.notify();
+                })))
             .when(self.integration_choice == 1, |this| this
                 .child(h_flex().gap_2()
                     .child(Button::new("download-retrobat").label("Download official installer")
@@ -795,40 +935,135 @@ impl RommfsWindow {
                 .when_some(self.state.installer_detail.clone(), |this,detail| this.child(muted(detail,cx)))
                 .when_some(self.state.installer_error.clone(), |this,error| this.child(error_line(error,cx)))
                 .when_some(self.state.installer_progress.1, |this,total| this.child(Progress::new("installer-progress").value(if total == 0 { 0. } else { 100. * self.state.installer_progress.0 as f32 / total as f32 })))
-                .child(field_column("RetroBat installation", Input::new(&self.retrobat_input).w_full(), cx))
+                .child(h_flex().gap_3().items_center()
+                    .child(div().w_40().flex_shrink_0().child("RetroBat installation"))
+                    .child(div().flex_1().min_w_0().child(
+                        Select::new(&self.settings_install_select)
+                            .w_full()
+                            .accessibility_label("RetroBat installation")
+                            .placeholder("Select a RetroBat installation…")))
+                    .child(Button::new("settings-install-browse").label("Browse…").outline()
+                        .on_click(cx.listener(|view,_,_,cx| view.browse_settings_install(cx)))))
                 .child(muted("Requires a fresh installation configured through RomMFS setup. Its ROM directory must be empty or already managed by RomMFS.",cx))
                 .child(field_column("Managed ROM folder", Input::new(&self.mount_input).w_full(), cx))
                 .child(muted("Setup links RetroBat's ROM folder to this folder and configures Switch saves. Stop RetroBat and its emulators first. Unowned ROM files are never moved or removed.",cx))
-                .child(Button::new("setup-retrobat").label("Set up RetroBat")
-                    .disabled(locked || self.state.conn != ConnState::Connected)
-                    .on_click(cx.listener(|view,_,_,cx| {
-                        view.controller.send(Command::SetupRetroBat {
-                            installation: PathBuf::from(view.retrobat_input.read(cx).value().trim()),
-                            managed_root: PathBuf::from(view.mount_input.read(cx).value().trim()),
-                        });
-                        cx.notify();
-                    }))))
-            .child(Button::new("apply-library-layout").label("Apply layout")
+                .child(h_flex().gap_2()
+                    .child(Button::new("setup-retrobat").label("Set up RetroBat")
+                        .disabled(locked || self.state.conn != ConnState::Connected || self.settings_install_root(cx).is_none())
+                        .on_click(cx.listener(|view,_,_,cx| {
+                            if let Some(installation) = view.settings_install_root(cx) {
+                                view.controller.send(Command::SetupRetroBat {
+                                    installation,
+                                    managed_root: PathBuf::from(view.mount_input.read(cx).value().trim()),
+                                    remove_known: false,
+                                });
+                            }
+                            cx.notify();
+                        })))
+                    .when(self.state.retrobat_setup_removable > 0, |this| this
+                        .child(Button::new("setup-retrobat-remove-known")
+                            .label(format!("Remove {} known files/links and retry", self.state.retrobat_setup_removable))
+                            .outline()
+                            .disabled(locked || self.state.conn != ConnState::Connected || self.settings_install_root(cx).is_none())
+                            .on_click(cx.listener(|view,_,_,cx| {
+                                if let Some(installation) = view.settings_install_root(cx) {
+                                    view.controller.send(Command::SetupRetroBat {
+                                        installation,
+                                        managed_root: PathBuf::from(view.mount_input.read(cx).value().trim()),
+                                        remove_known: true,
+                                    });
+                                }
+                                cx.notify();
+                            }))))))
+            .child(Button::new("materialize-auxiliary").label("Install library BIOS, keys and cheats")
                 .disabled(locked || self.state.conn != ConnState::Connected)
-                .on_click(cx.listener(|view,_,_,cx| {
-                    let mode = if view.integration_choice == 1 { IntegrationMode::RetroBat } else { IntegrationMode::Generic };
-                    let root = view.retrobat_input.read(cx).value().trim().to_owned();
-                    view.controller.send(Command::SetIntegration { mode, retrobat_root: (!root.is_empty()).then(|| PathBuf::from(root)) });
-                    cx.notify();
-                    })))
-                .child(Button::new("materialize-auxiliary").label("Install library BIOS, keys and cheats")
-                    .disabled(locked || self.state.conn != ConnState::Connected)
-                    .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::MaterializeAuxiliary); cx.notify(); })))
-                .child(Button::new("cancel-auxiliary").label("Cancel auxiliary download")
-                    .disabled(!self.state.auxiliary_running)
-                    .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::CancelAuxiliary); cx.notify(); })))
-                .child(muted("Downloads user-library BIOS, individual Switch firmware/keys, and RetroArch .cht cheats. No archives are extracted, no unowned or modified file is overwritten, and these files are never save data. Stop emulators before continuing.",cx))
+                .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::MaterializeAuxiliary); cx.notify(); })))
+            .child(Button::new("cancel-auxiliary").label("Cancel auxiliary download")
+                .disabled(!self.state.auxiliary_running)
+                .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::CancelAuxiliary); cx.notify(); })))
+            .child(muted("Downloads user-library BIOS, individual Switch firmware/keys, and RetroArch .cht cheats. No archives are extracted, no unowned or modified file is overwritten, and these files are never save data. Stop emulators before continuing.",cx))
             .when(locked, |this| this.child(muted("Stop the mount before changing its layout.",cx)))
+            .when_some(self.state.integration_notice.clone(), |this,note| this.child(muted(note,cx)))
             .when_some(self.state.integration_error.clone(), |this,error| this.child(error_line(error,cx)))
+            .when_some(self.render_foreign_remediation(cx), |this, block| this.child(block))
             .when_some(self.state.retrobat_setup_detail.clone(), |this,detail| this.child(muted(detail,cx)))
             .when_some(self.state.retrobat_setup_error.clone(), |this,error| this.child(error_line(error,cx)))
             .when_some(self.state.frontend_metadata_detail.clone(), |this,detail| this.child(muted(detail,cx)))
             .when_some(self.state.frontend_metadata_error.clone(), |this,error| this.child(error_line(error,cx)))
+    }
+
+    /// Foreign entries reported under a refused mount/setup root: the classified
+    /// list plus the safe remediation (delete only symlinks/junctions — never
+    /// real user files) and an Escape hatch to open the folder for review.
+    fn render_foreign_remediation(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let root = self.state.foreign_root.clone()?;
+        if self.state.foreign_entries.is_empty() && self.state.foreign_removal.is_none() {
+            return None;
+        }
+        let links = self
+            .state
+            .foreign_entries
+            .iter()
+            .filter(|e| e.kind == ForeignKind::Link)
+            .count();
+        let mut list = v_flex()
+            .gap_1()
+            .pt_1()
+            .child(section_heading("Files RomMFS does not manage"));
+        for entry in self.state.foreign_entries.iter().take(12) {
+            let kind = match entry.kind {
+                ForeignKind::File => "file",
+                ForeignKind::Directory => "folder",
+                ForeignKind::Link => "link",
+            };
+            list = list.child(muted_xs(format!("{} ({kind})", entry.path), cx));
+        }
+        if self.state.foreign_entries.len() > 12 {
+            list = list.child(muted_xs(
+                format!("…and {} more", self.state.foreign_entries.len() - 12),
+                cx,
+            ));
+        }
+        let remove_root = root.clone();
+        let open_root = root.clone();
+        list = list.child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("remove-foreign-links")
+                        .label(format!("Remove {links} leftover links"))
+                        .outline()
+                        .small()
+                        .disabled(links == 0)
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.controller.send(Command::RemoveForeignLinks {
+                                root: PathBuf::from(remove_root.clone()),
+                            });
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("open-foreign-folder")
+                        .label("Open folder")
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.reveal_path(&PathBuf::from(open_root.clone()));
+                        })),
+                ),
+        );
+        list = list.child(muted_xs(
+            "Only leftover links are removed — real files and folders are never deleted. Remove or move them yourself, then retry.",
+            cx,
+        ));
+        if let Some(removal) = &self.state.foreign_removal {
+            list = list.child(match removal {
+                Ok(n) => muted_xs(format!("Removed {n} links. You can retry now."), cx)
+                    .into_any_element(),
+                Err(e) => error_line(format!("Link cleanup failed: {e}"), cx).into_any_element(),
+            });
+        }
+        Some(list)
     }
 
     fn render_mount(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -872,6 +1107,9 @@ impl RommfsWindow {
             .when_some(self.state.mount_error.clone(), |this, error| {
                 this.child(error_line(error, cx))
             })
+            .when_some(self.render_foreign_remediation(cx), |this, block| {
+                this.child(block)
+            })
             .when_some(self.state.catalogue, |this, (platforms, roms, skipped)| {
                 this.child(muted(
                     format!(
@@ -894,7 +1132,7 @@ impl RommfsWindow {
             )
             .when_some(self.state.catalogue_refreshed_at, |this, timestamp| {
                 this.child(muted(
-                    format!("Last complete catalogue: {timestamp} (UTC Unix time)"),
+                    format!("Last complete catalogue: {}", relative_time(timestamp)),
                     cx,
                 ))
             })
@@ -998,6 +1236,36 @@ impl RommfsWindow {
                             }))
                     }),
             )
+            // Status card: where sync points, who it syncs for, and how much
+            // of the folder is understood — before any configuration detail.
+            .child(
+                div()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .p_3()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(if enabled { "Enabled" } else { "Not enabled" }),
+                            )
+                            .child(muted_xs(format!("Folder: {saves_folder}"), cx))
+                            .child(muted_xs(scope, cx))
+                            .child(muted_xs(
+                                format!(
+                                    "{} mapped files · {} unmatched files",
+                                    fmt_count(self.state.save_sync_mapped_targets),
+                                    fmt_count(self.state.save_sync_catalogue_unmapped),
+                                ),
+                                cx,
+                            ))
+                            .child(muted_xs(profile, cx)),
+                    ),
+            )
             .child(
                 h_flex()
                     .gap_3()
@@ -1031,26 +1299,6 @@ impl RommfsWindow {
                             })),
                     ),
             )
-            .child(
-                h_flex()
-                    .gap_3()
-                    .items_center()
-                    .child(div().w_40().flex_shrink_0().child("Saves folder"))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_9()
-                            .px_3()
-                            .flex()
-                            .items_center()
-                            .rounded(cx.theme().radius)
-                            .border_1()
-                            .border_color(cx.theme().input)
-                            .bg(cx.theme().input_background())
-                            .child(div().truncate().child(saves_folder)),
-                    ),
-            )
             .child(field_column("Custom save-data folder",Input::new(&self.save_folder_input).w_full(),cx))
             .child(Button::new("choose-save-folder").label("Use save folder")
                 .disabled(self.state.conn != ConnState::Connected)
@@ -1058,19 +1306,65 @@ impl RommfsWindow {
                     view.controller.send(Command::SelectSaveFolder { path: PathBuf::from(view.save_folder_input.read(cx).value().trim()) }); cx.notify();
                 })))
             .child(muted("Select saves only, not an emulator's entire portable folder. All file formats and companions are supported. Shared saves and memory cards remain excluded.",cx))
-            .child(muted(profile, cx))
-            .child(muted(scope, cx))
-            .child(div().text_sm().child(format!(
-                "{} mapped files · {} unmatched files",
-                fmt_count(self.state.save_sync_mapped_targets),
-                fmt_count(self.state.save_sync_catalogue_unmapped),
-            )))
             .child(self.render_mapping_disclosure(window, cx))
-            .child(muted(
+            .child(self.render_advanced_disclosure(window, cx))
+    }
+
+    fn render_advanced_disclosure(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let open = self.advanced_open;
+        Collapsible::new()
+            .open(open)
+            .child(self.disclosure_row(
+                "save-sync-advanced-disclosure",
+                "Advanced / How sync works",
+                open,
+                |view| view.advanced_open = !view.advanced_open,
+                window,
+                cx,
+            ))
+            .content(self.render_advanced_detail(window, cx))
+    }
+
+    fn render_advanced_detail(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let can_apply_debounce = self.state.save_sync_available || self.state.save_sync_enabled;
+        let mut detail = v_flex()
+            .gap_2()
+            .pt_2()
+            .child(muted_xs(
                 "Changed files upload automatically. Remote-only changes replace an unchanged synchronized baseline; simultaneous changes and active files are kept for review. Local deletion never deletes remote saves.",
                 cx,
             ))
             .child(muted_xs("Sync continues while RomMFS runs, including in the tray.", cx))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_end()
+                    .child(div().w_32().child(field_column(
+                        "Debounce (seconds)",
+                        Input::new(&self.debounce_input).w_full().small(),
+                        cx,
+                    )))
+                    .child(
+                        Button::new("save-sync-apply-debounce")
+                            .label("Apply")
+                            .outline()
+                            .small()
+                            .disabled(!can_apply_debounce)
+                            .on_click(cx.listener(|view, _, _, cx| view.apply_save_sync_debounce(cx))),
+                    ),
+            );
+        if let Some(error) = self.debounce_error.clone() {
+            detail = detail.child(error_line(error, cx));
+        }
+        detail
     }
 
     fn render_mapping_disclosure(
@@ -1085,6 +1379,7 @@ impl RommfsWindow {
                 "save-sync-mapping-disclosure",
                 "Mapping preview and skipped files",
                 open,
+                |view| view.mapping_open = !view.mapping_open,
                 window,
                 cx,
             ))
@@ -1101,37 +1396,117 @@ impl RommfsWindow {
         let queue = self.state.save_sync_queue.clone();
         let can_export = self.state.save_sync_effective_saves_root.is_some()
             && self.state.save_sync_account_id.is_some();
-        let can_apply_debounce = self.state.save_sync_available || self.state.save_sync_enabled;
+        let has_games = !self.state.save_file_games.is_empty();
 
         let mut detail = v_flex()
             .gap_2()
             .pt_2()
             .child(muted_xs(
-                format!(
-                    "Read-only filename/metadata scan; save contents are not opened. Bounded to {MAX_EXISTING_SAVE_SCAN_ENTRIES} entries and {MAX_EXISTING_SAVE_SCAN_DEPTH} directory levels."
-                ),
-                cx,
-            ))
-            .child(muted_xs(
-                "Files are associated by a unique game filename, a server-provided save target, or an explicit file mapping. Paths and file bytes are preserved; ambiguous files are not guessed.",
+                "Files are associated by a unique game filename, a server-provided save target, or an explicit file mapping. Ambiguous files are not guessed.",
                 cx,
             ))
             .child(muted_xs(existing_save_inventory_summary(existing_saves.as_ref()), cx));
 
-        if !self.state.save_file_games.is_empty() {
+        if has_games {
             detail = detail
-                .child(section_heading("Map an unmatched file"))
-                .child(field_column(
-                    "Relative save path",
-                    Input::new(&self.save_file_input).w_full(),
-                    cx,
-                ))
                 .child(field_column(
                     "Game",
                     Select::new(&self.save_game_select)
                         .w_full()
                         .accessibility_label("Save file game")
                         .placeholder("Select the owning game…"),
+                    cx,
+                ))
+                .child(muted_xs(
+                    "Unmatched files grouped by folder. Pick a game above, then map a whole group or a single path.",
+                    cx,
+                ));
+        }
+        // Group by containing directory: "naomi/reicast — 24 .nvmem files"
+        // instead of 24 identical rows. The groups render even before the
+        // game list arrives; the map action waits for it.
+        let mut groups: std::collections::BTreeMap<String, UnmatchedSaveGroup> = Default::default();
+        for file in &self.state.save_file_unmatched {
+            let dir = file
+                .path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let entry = groups.entry(dir).or_default();
+            entry.count += 1;
+            let ext = file
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!(".{}", e.to_lowercase()))
+                .unwrap_or_else(|| "file".into());
+            if !entry.extensions.contains(&ext) {
+                entry.extensions.push(ext);
+            }
+            entry.mappable |= file.mappable;
+            if entry.reason.is_empty() {
+                entry.reason = file.reason.clone();
+            }
+        }
+        for (dir, group) in groups.iter().take(32) {
+            let dir_display = if dir.is_empty() {
+                "(save folder root)"
+            } else {
+                dir.as_str()
+            };
+            let mut row = v_flex().gap_1().child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().truncate().text_sm().child(format!(
+                                "{dir_display} — {} {} {}",
+                                group.count,
+                                group.extensions.join("/"),
+                                if group.count == 1 { "file" } else { "files" },
+                            ))),
+                    )
+                    .when(group.mappable && has_games, |this| {
+                        let prefix = dir.clone();
+                        this.child(
+                            Button::new(format!("map-group-{dir}"))
+                                .label("Map group to game…")
+                                .outline()
+                                .small()
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    let id = view
+                                        .save_game_select
+                                        .read(cx)
+                                        .selected_value()
+                                        .and_then(|s| s.split_once(" · "))
+                                        .and_then(|(id, _)| id.parse::<i64>().ok());
+                                    if let Some(rom_id) = id {
+                                        view.controller.send(Command::AssociateSaveFolder {
+                                            prefix: PathBuf::from(prefix.clone()),
+                                            rom_id,
+                                        });
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            );
+            row = row.child(muted_xs(group.reason.clone(), cx));
+            detail = detail.child(row);
+        }
+        if groups.len() > 32 {
+            detail = detail.child(muted_xs(format!("…{} more folders", groups.len() - 32), cx));
+        }
+        if has_games {
+            detail = detail
+                .child(section_heading("Map a single file"))
+                .child(field_column(
+                    "Relative save path",
+                    Input::new(&self.save_file_input).w_full(),
                     cx,
                 ))
                 .child(
@@ -1155,12 +1530,6 @@ impl RommfsWindow {
                             cx.notify();
                         })),
                 );
-            for path in self.state.save_file_unmatched.iter().take(128) {
-                detail = detail.child(muted_xs(path.clone(), cx));
-            }
-            if self.state.save_file_unmatched.len() > 128 {
-                detail = detail.child(muted_xs(format!("{} more unmatched files; map a relative path above or choose a narrower save folder",self.state.save_file_unmatched.len()-128),cx));
-            }
         }
 
         for path in preview {
@@ -1171,29 +1540,6 @@ impl RommfsWindow {
                     .text_color(cx.theme().muted_foreground)
                     .child(path),
             );
-        }
-
-        detail = detail.child(
-            h_flex()
-                .gap_3()
-                .items_end()
-                .child(div().w_32().child(field_column(
-                    "Debounce (seconds)",
-                    Input::new(&self.debounce_input).w_full().small(),
-                    cx,
-                )))
-                .child(
-                    Button::new("save-sync-apply-debounce")
-                        .label("Apply")
-                        .outline()
-                        .small()
-                        .disabled(!can_apply_debounce)
-                        .on_click(cx.listener(|view, _, _, cx| view.apply_save_sync_debounce(cx))),
-                ),
-        );
-
-        if let Some(error) = self.debounce_error.clone() {
-            detail = detail.child(error_line(error, cx));
         }
 
         // Live queue detail only exists once sync is enabled and has run.

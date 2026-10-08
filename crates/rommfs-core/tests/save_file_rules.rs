@@ -63,7 +63,7 @@ fn scan_associates_multiple_files_by_unique_stem_or_server_target_and_reports_am
         .unwrap()
         .unmatched
         .iter()
-        .any(|s| s.starts_with(&too_long)));
+        .any(|s| s.display().starts_with(&too_long)));
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink("/", dir.path().join("switch/redirect")).unwrap();
@@ -72,7 +72,7 @@ fn scan_associates_multiple_files_by_unique_stem_or_server_target_and_reports_am
             .unwrap()
             .unmatched
             .iter()
-            .any(|s| s.contains("redirect")));
+            .any(|s| s.display().contains("redirect")));
     }
 }
 
@@ -192,7 +192,7 @@ fn unavailable_explicit_owner_is_preserved_and_diagnosed_without_blocking_other_
     assert!(plan
         .unmatched
         .iter()
-        .all(|issue| issue.contains("game 99 is unavailable")));
+        .all(|issue| issue.reason.contains("game 99 is unavailable")));
     assert!(rules
         .associate(Path::new("gb/Other.srm"), root.path())
         .is_err());
@@ -301,7 +301,7 @@ fn deleted_missing_and_unlaunchable_associations_leave_available_games_syncable(
         assert!(
             plan.unmatched
                 .iter()
-                .any(|issue| issue.contains("game 2 is unavailable")),
+                .any(|issue| issue.reason.contains("game 2 is unavailable")),
             "{scenario}"
         );
     }

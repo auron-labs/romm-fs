@@ -8,7 +8,7 @@ use crate::save_sync::{
 };
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -60,6 +60,12 @@ impl Source {
         match self {
             Self::Firmware(f) => f.file_size_bytes,
             Self::Cheat { size, .. } => *size,
+        }
+    }
+    fn describe(&self) -> String {
+        match self {
+            Self::Firmware(f) => format!("firmware {} {:?}", f.id, f.file_name),
+            Self::Cheat { file_id, name, .. } => format!("ROM file {file_id} {name:?}"),
         }
     }
     fn download(&self, client: &RommClient, writer: &mut dyn Write) -> Result<u64> {
@@ -190,17 +196,45 @@ pub fn materialize_auxiliaries(
                 .into(),
         ));
     }
-    let mut paths = HashSet::new();
-    for (path, _) in &files {
-        if !paths.insert(path.to_string_lossy().to_lowercase()) {
-            return Err(Error::Unsupported(format!(
-                "Multiple auxiliary sources target {}; no files were published",
-                path.display()
-            )));
+    // Library entries can legitimately share a destination (the same BIOS
+    // uploaded under two platforms). Identical sources publish once; genuinely
+    // different sources for one destination are reported and only that file is
+    // skipped instead of aborting the whole run.
+    let mut grouped: BTreeMap<String, (PathBuf, Vec<Source>)> = BTreeMap::new();
+    for (path, source) in files {
+        grouped
+            .entry(path.to_string_lossy().to_lowercase())
+            .or_insert_with(|| (path, Vec::new()))
+            .1
+            .push(source);
+    }
+    let mut files = Vec::with_capacity(grouped.len());
+    for (_, (destination, group)) in grouped {
+        let mut distinct: Vec<Source> = Vec::new();
+        for source in group {
+            if !distinct.iter().any(|s| s.identity() == source.identity()) {
+                distinct.push(source);
+            }
+        }
+        let first = &distinct[0];
+        if distinct.iter().all(|s| s.size() == first.size()) {
+            // Equal size/version metadata is not content identity. Keep every
+            // distinct source so publication can compare the downloaded hashes.
+            files.push((destination, distinct));
+        } else {
+            report.warnings.push(format!(
+                "Conflicting auxiliary sources target {}; it was skipped: {}",
+                destination.display(),
+                distinct
+                    .iter()
+                    .map(|s| s.describe())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
         }
     }
     let total = files.len();
-    for (n, (path, source)) in files.into_iter().enumerate() {
+    for (n, (path, sources)) in files.into_iter().enumerate() {
         if !active.load(Ordering::Acquire) {
             return Err(Error::Cancelled);
         }
@@ -209,7 +243,7 @@ pub fn materialize_auxiliaries(
             &index_path,
             &mut index,
             &path,
-            &source,
+            &sources,
             active,
             &mut report,
         );
@@ -228,10 +262,11 @@ fn publish(
     index_path: &Path,
     index: &mut Index,
     path: &Path,
-    source: &Source,
+    sources: &[Source],
     active: &AtomicBool,
     report: &mut AuxiliaryReport,
 ) -> Result<()> {
+    let source = sources.first().expect("nonempty auxiliary source group");
     ensure_no_reparse_components(path)?;
     let key = path
         .to_str()
@@ -284,23 +319,34 @@ fn publish(
         guard = hold_save_directory_chain(&chain)?;
     }
     let _parent_guard = guard;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    let mut writer = BoundedWriter {
-        inner: temp.as_file_mut(),
-        active,
-        remaining: source.size(),
-    };
-    source.download(client, &mut writer)?;
-    if writer.remaining != 0 {
-        return Err(Error::Unsupported(
-            "Auxiliary download was shorter than its inventoried size".into(),
-        ));
+    let (temp, hash) = download_source(client, parent, source, active)?;
+    for other in &sources[1..] {
+        let (_, other_hash) = download_source(client, parent, other, active)?;
+        if other_hash != hash {
+            return Err(Error::Unsupported(format!(
+                "Conflicting auxiliary contents; destination was skipped: {}",
+                sources
+                    .iter()
+                    .map(Source::describe)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        }
     }
     if !active.load(Ordering::Acquire) {
         return Err(Error::Cancelled);
     }
-    temp.as_file().sync_all()?;
-    let hash = hash_save_content(&mut temp.reopen()?)?;
+    if sources.len() > 1 {
+        report.warnings.push(format!(
+            "Content-verified duplicate auxiliary sources for {} publish once: {}",
+            path.display(),
+            sources
+                .iter()
+                .map(Source::describe)
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
     index.files.insert(
         key.clone(),
         Owned {
@@ -323,6 +369,32 @@ fn publish(
     save_index(index_path, index)?;
     report.published += 1;
     Ok(())
+}
+
+fn download_source(
+    client: &RommClient,
+    parent: &Path,
+    source: &Source,
+    active: &AtomicBool,
+) -> Result<(tempfile::NamedTempFile, String)> {
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut writer = BoundedWriter {
+        inner: temp.as_file_mut(),
+        active,
+        remaining: source.size(),
+    };
+    source.download(client, &mut writer)?;
+    if writer.remaining != 0 {
+        return Err(Error::Unsupported(
+            "Auxiliary download was shorter than its inventoried size".into(),
+        ));
+    }
+    if !active.load(Ordering::Acquire) {
+        return Err(Error::Cancelled);
+    }
+    temp.as_file().sync_all()?;
+    let hash = hash_save_content(&mut temp.reopen()?)?;
+    Ok((temp, hash))
 }
 fn save_index(path: &Path, index: &Index) -> Result<()> {
     ensure_no_reparse_components(path)?;

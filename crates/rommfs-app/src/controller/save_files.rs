@@ -79,6 +79,66 @@ impl Worker {
         }
         self.refresh_save_sync();
     }
+    /// Associate currently-unmatched files directly in `prefix` (a
+    /// save-root-relative directory group) with one game. A file that fails
+    /// validation stays unmatched; it never blocks the others.
+    pub(super) fn associate_save_folder(&mut self, prefix: &Path, rom_id: i64) {
+        let result = (|| -> Result<()> {
+            let scope = self
+                .save_sync_scope
+                .as_ref()
+                .ok_or_else(|| Error::Unsupported("Choose a save folder first".into()))?;
+            let rules = self.save_file_rules.as_ref().ok_or_else(|| {
+                Error::Unsupported("Refresh the save files before mapping".into())
+            })?;
+            let settings = self.save_sync_settings.as_ref().ok_or_else(|| {
+                Error::Unsupported("Save mapping settings are unavailable".into())
+            })?;
+            let plan = rules.scan(&scope.effective_saves_root)?;
+            let mut mapped = 0usize;
+            let mut skipped = 0usize;
+            for file in &plan.unmatched {
+                // Match the immediate parent, exactly as the UI groups rows.
+                // An empty parent is the save-root group, not the whole tree.
+                let in_group = file.path.parent().unwrap_or(Path::new("")) == prefix;
+                if !in_group {
+                    continue;
+                }
+                // Some unmatched reasons (unsafe paths, shared dirs) must stay
+                // unmatched even under a bulk association.
+                if rules
+                    .mapping(rom_id, &file.path, &scope.effective_saves_root)
+                    .is_err()
+                {
+                    skipped += 1;
+                    continue;
+                }
+                settings.associate_file(scope, &file.path, rom_id)?;
+                mapped += 1;
+            }
+            if mapped == 0 {
+                return Err(Error::Unsupported(format!(
+                    "No unmatched files under {} could be associated",
+                    prefix.display()
+                )));
+            }
+            if skipped > 0 {
+                self.sink.emit(AppEvent::log(
+                    Level::Warn,
+                    "save-sync",
+                    format!(
+                        "Mapped {mapped} files under {}; {skipped} were not eligible",
+                        prefix.display()
+                    ),
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            self.save_sync_runtime_problem = Some(e.to_string());
+        }
+        self.refresh_save_sync();
+    }
     pub(super) fn refresh_save_files(&mut self, input: DiscoveryInput) {
         let discovery = discover_installations(input);
         self.save_file_rules = None;
@@ -345,6 +405,42 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_actions_map_only_their_visible_immediate_parent_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut worker, _fixture, _events) = generic_worker(directory.path());
+        populate_games(&mut worker);
+        let root = worker
+            .preferences
+            .as_ref()
+            .unwrap()
+            .save_root
+            .clone()
+            .unwrap();
+        std::fs::create_dir_all(root.join("gb/unrelated")).unwrap();
+        for path in ["mystery.srm", "gb/mystery.srm", "gb/unrelated/other.srm"] {
+            std::fs::write(root.join(path), b"save").unwrap();
+        }
+        worker.refresh_save_sync();
+        worker.associate_save_folder(Path::new("gb"), 1);
+        let settings = worker.save_sync_settings.as_ref().unwrap();
+        let scope = worker.save_sync_scope.as_ref().unwrap();
+        assert_eq!(
+            settings.file_associations(scope).unwrap(),
+            std::collections::BTreeMap::from([("gb/mystery.srm".into(), 1)])
+        );
+        worker.associate_save_folder(Path::new(""), 1);
+        let settings = worker.save_sync_settings.as_ref().unwrap();
+        let scope = worker.save_sync_scope.as_ref().unwrap();
+        assert_eq!(
+            settings.file_associations(scope).unwrap(),
+            std::collections::BTreeMap::from([
+                ("gb/mystery.srm".into(), 1),
+                ("mystery.srm".into(), 1)
+            ])
+        );
+    }
     fn generic_worker(
         directory: &Path,
     ) -> (
@@ -540,6 +636,56 @@ mod tests {
         }
         assert_eq!(std::fs::read(root.join(path)).unwrap(), b"local save");
         assert_eq!(fixture.count_requests("GET", "/api/saves"), 0);
+    }
+
+    #[test]
+    fn associate_save_folder_maps_a_directory_group_and_leaves_other_unmatched() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut worker, _fixture, _events) = generic_worker(directory.path());
+        populate_games(&mut worker);
+        let root = worker
+            .preferences
+            .as_ref()
+            .unwrap()
+            .save_root
+            .clone()
+            .unwrap();
+        // A subdirectory whose name matches no game stem: all files inside
+        // scan unmatched until the user maps the group.
+        std::fs::create_dir_all(root.join("gb/sub")).unwrap();
+        std::fs::write(root.join("gb/sub/a.srm"), b"a").unwrap();
+        std::fs::write(root.join("gb/sub/b.srm"), b"b").unwrap();
+        std::fs::write(root.join("gb/Other.srm"), b"o").unwrap();
+        worker.refresh_save_sync();
+        worker.associate_save_folder(Path::new("gb/sub"), 1);
+        let scope = worker.save_sync_scope.clone().unwrap();
+        let associations = worker
+            .save_sync_settings
+            .as_ref()
+            .unwrap()
+            .file_associations(&scope)
+            .unwrap();
+        assert_eq!(associations.len(), 2);
+        assert!(associations.keys().any(|p| p.ends_with("a.srm")));
+        assert!(associations.keys().any(|p| p.ends_with("b.srm")));
+        worker.refresh_save_sync();
+        assert!(worker
+            .save_sync_mapping_report
+            .as_ref()
+            .unwrap()
+            .mappings
+            .iter()
+            .any(|m| m.rom_key.rom_id == 1 && m.relative_path.ends_with("a.srm")));
+        // An empty/absent group keeps existing associations; nothing is
+        // deleted and the failure is reported, not silent.
+        worker.associate_save_folder(Path::new("missing"), 1);
+        let associations = worker
+            .save_sync_settings
+            .as_ref()
+            .unwrap()
+            .file_associations(&scope)
+            .unwrap();
+        assert_eq!(associations.len(), 2);
     }
 
     #[test]
