@@ -304,7 +304,7 @@ impl RommClient {
         )
     }
 
-    fn download_content(
+    pub(super) fn download_content(
         &self,
         url: String,
         writer: &mut dyn Write,

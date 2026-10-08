@@ -5,6 +5,7 @@ use rommfs_core::romm::{RemoteSave, RommClient, SaveApiFailure, SaveSyncIdentity
 use rommfs_core::save_sync::{sha256_content_hash, SaveMapping, SaveSyncScope, MAX_SAVE_BYTES};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 pub(super) struct IncomingJob {
     pub(super) mapping: SaveMapping,
@@ -17,6 +18,7 @@ pub(super) struct VerifiedRemoteSave {
     pub(super) metadata: RemoteSave,
     pub(super) content_hash: String,
     pub(super) bytes: Vec<u8>,
+    pub(super) file: Option<Arc<tempfile::NamedTempFile>>,
     pub(super) history_time: DateTime<Utc>,
 }
 
@@ -39,6 +41,7 @@ struct CacheKey {
 struct CachedRemoteSave {
     metadata: RemoteSave,
     bytes: Vec<u8>,
+    file: Option<Arc<tempfile::NamedTempFile>>,
     content_hash: String,
 }
 
@@ -77,7 +80,14 @@ pub(super) fn reconcile_attempt(
         retry_after: None,
     })?;
     cache.enter_scope(&job.scope);
-    let inventory = client.save_inventory(job.mapping.rom_key.rom_id, job.mapping.profile.id)?;
+    let slot = job.mapping.remote_slot().map_err(|error| SaveApiFailure {
+        error,
+        retry_after: None,
+    })?;
+    let mut inventory = client.save_inventory(job.mapping.rom_key.rom_id, &slot)?;
+    if let Some(legacy) = job.mapping.legacy_slot() {
+        inventory.extend(client.save_inventory(job.mapping.rom_key.rom_id, legacy)?);
+    }
     if let Some(message) = validate_inventory_identity(&inventory, job) {
         return Err(SaveApiFailure {
             error: Error::InvalidCatalogue(message),
@@ -90,7 +100,7 @@ pub(super) fn reconcile_attempt(
         .collect::<HashSet<_>>();
     cache.saves.retain(|key, _| {
         key.rom_id != job.mapping.rom_key.rom_id
-            || key.slot != job.mapping.profile.id
+            || key.slot != slot
             || present_ids.contains(&key.save_id)
     });
     let mut saves = Vec::new();
@@ -107,8 +117,8 @@ pub(super) fn reconcile_attempt(
         }
         if owned_revision_from_filename(&metadata.file_name).is_none()
             || metadata.missing_from_fs
-            || metadata.file_size_bytes == 0
-            || metadata.file_size_bytes > MAX_SAVE_BYTES
+            || (job.mapping.profile.id != rommfs_core::save_sync::GENERIC_FILE_PROFILE
+                && (metadata.file_size_bytes == 0 || metadata.file_size_bytes > MAX_SAVE_BYTES))
         {
             unsupported_count += 1;
             continue;
@@ -133,14 +143,45 @@ pub(super) fn reconcile_attempt(
             .get(&key)
             .filter(|cached| cached.metadata == metadata)
             .cloned();
-        let (bytes, content_hash) = if let Some(cached) = cached {
-            (cached.bytes, cached.content_hash)
+        let (bytes, file, content_hash) = if let Some(cached) = cached {
+            (cached.bytes, cached.file, cached.content_hash)
         } else {
             if !super::transfer::is_active(enabled, active) {
                 return Err(cancelled_failure());
             }
-            let bytes = client.download_save_content(metadata.id)?;
-            if bytes.len() as u64 != metadata.file_size_bytes {
+            let (bytes, file, content_hash) =
+                if job.mapping.profile.id == rommfs_core::save_sync::GENERIC_FILE_PROFILE {
+                    let mut file = tempfile::NamedTempFile::new().map_err(|e| SaveApiFailure {
+                        error: e.into(),
+                        retry_after: None,
+                    })?;
+                    client.download_save_to(
+                        metadata.id,
+                        metadata.file_size_bytes,
+                        &mut file,
+                        active,
+                    )?;
+                    file.as_file().sync_all().map_err(|e| SaveApiFailure {
+                        error: e.into(),
+                        retry_after: None,
+                    })?;
+                    let mut reader = file.reopen().map_err(|e| SaveApiFailure {
+                        error: e.into(),
+                        retry_after: None,
+                    })?;
+                    let hash = rommfs_core::save_sync::hash_save_content(&mut reader).map_err(
+                        |error| SaveApiFailure {
+                            error,
+                            retry_after: None,
+                        },
+                    )?;
+                    (Vec::new(), Some(Arc::new(file)), hash)
+                } else {
+                    let bytes = client.download_save_content(metadata.id)?;
+                    let hash = sha256_content_hash(&bytes);
+                    (bytes, None, hash)
+                };
+            if file.is_none() && bytes.len() as u64 != metadata.file_size_bytes {
                 return Err(SaveApiFailure {
                     error: Error::InvalidCatalogue(format!(
                         "RomM save {} content size did not match inventory",
@@ -149,12 +190,12 @@ pub(super) fn reconcile_attempt(
                     retry_after: None,
                 });
             }
-            let content_hash = sha256_content_hash(&bytes);
             cache.saves.insert(
                 key.clone(),
                 CachedRemoteSave {
                     metadata: metadata.clone(),
                     bytes: bytes.clone(),
+                    file: file.clone(),
                     content_hash: content_hash.clone(),
                 },
             );
@@ -169,12 +210,13 @@ pub(super) fn reconcile_attempt(
                 };
                 cache.saves.remove(&oldest_key);
             }
-            (bytes, content_hash)
+            (bytes, file, content_hash)
         };
         saves.push(VerifiedRemoteSave {
             metadata,
             content_hash,
             bytes,
+            file,
             history_time,
         });
     }
@@ -190,7 +232,7 @@ fn validate_inventory_identity(inventory: &[RemoteSave], job: &IncomingJob) -> O
         .any(|save| {
             save.rom_id != job.mapping.rom_key.rom_id
                 || save.user_id != job.identity.account_id
-                || save.slot.as_deref() != Some(job.mapping.profile.id)
+                || !job.mapping.accepts_remote_slot(save.slot.as_deref())
         })
         .then(|| {
             "RomM save inventory did not match the authenticated account, ROM, and slot".into()
@@ -198,7 +240,10 @@ fn validate_inventory_identity(inventory: &[RemoteSave], job: &IncomingJob) -> O
 }
 
 pub(super) fn owned_revision_from_filename(filename: &str) -> Option<&str> {
-    let stem = filename.strip_prefix("rommfs-")?.strip_suffix(".srm")?;
+    let name = filename.strip_prefix("rommfs-")?;
+    let stem = name
+        .strip_suffix(".srm")
+        .or_else(|| name.strip_suffix(".bin"))?;
     let revision = if let Some((revision, tag)) = stem.split_once(" [") {
         if !is_server_datetime_tag(tag.strip_suffix(']')?) {
             return None;

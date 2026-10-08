@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 use super::incoming_transfer::IncomingJob;
 use super::transfer::{run_transfer_worker, TransferUpdate, WorkerJob};
+#[path = "tests/ordinary.rs"]
+mod ordinary;
 
 const ACCOUNT_ID: i64 = 42;
 const ROM_ID: i64 = 7;
@@ -2106,6 +2108,53 @@ fn disabling_while_incoming_body_is_blocked_prevents_late_publication() {
 
     assert!(!case.mapping.target_path.exists());
     assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+}
+
+#[test]
+fn stopping_the_actor_drains_its_blocked_transfer_worker_before_returning() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    fixture.use_romm_save_store(ACCOUNT_ID, 201);
+    seed_remote(
+        &fixture,
+        31,
+        "550e8400-e29b-41d4-a716-446655440000",
+        b"pending remote bytes",
+        "2026-10-05T12:34:56Z",
+    );
+    let barrier = FixtureBodyBarrier::new();
+    fixture.on(
+        "GET",
+        "/api/saves/31/content?optimistic=false",
+        ResponseSpec::HeldBytes {
+            status: 200,
+            bytes: b"pending remote bytes".to_vec(),
+            barrier: barrier.clone(),
+        },
+    );
+    let case = case(directory.path(), &fixture, false);
+    fs::remove_file(&case.mapping.target_path).unwrap();
+    let (sink, _events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(barrier.wait_until_blocked(Duration::from_secs(5)));
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let shutdown = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        agent.stop();
+        done_tx.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let stopped_early = done_rx.recv_timeout(Duration::from_millis(200));
+    // Release even on assertion failure so fixture teardown never hangs.
+    barrier.release();
+    assert!(
+        matches!(stopped_early, Err(mpsc::RecvTimeoutError::Timeout)),
+        "stop returned while its transfer was still blocked"
+    );
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    shutdown.join().unwrap();
+    assert!(!case.mapping.target_path.exists());
 }
 
 #[test]

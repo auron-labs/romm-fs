@@ -7,7 +7,9 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+blocking = "1"
 chrono.workspace = true
+futures-lite = "2"
 isahc.workspace = true
 parking_lot.workspace = true
 quick-xml = { workspace = true, features = ["serialize"] }

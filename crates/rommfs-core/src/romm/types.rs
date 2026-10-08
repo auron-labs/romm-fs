@@ -63,6 +63,10 @@ pub struct RomDto {
 /// Metadata supplied with the paginated catalogue; no per-game detail fetch.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RomMetadata {
+    #[serde(default)]
+    pub save_target: Option<String>,
+    #[serde(default)]
+    pub save_target_layout: Option<String>,
     pub name: Option<String>,
     pub summary: Option<String>,
     pub title_id: Option<String>,

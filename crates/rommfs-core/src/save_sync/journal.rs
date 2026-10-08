@@ -226,7 +226,7 @@ impl SaveSyncJournal {
                     file_id INTEGER NOT NULL,
                     remote_id TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
-                    size INTEGER NOT NULL CHECK (size > 0),
+                     size INTEGER NOT NULL CHECK (size >= 0),
                     reason TEXT NOT NULL,
                     state TEXT NOT NULL,
                     staged_path TEXT NOT NULL,
@@ -242,11 +242,44 @@ impl SaveSyncJournal {
             )
             .map_err(sqlite)?;
 
+        // Additive ordinary-file migration: keep all incoming records and
+        // baselines, but allow an API-valid empty file. SQLite cannot alter a
+        // CHECK constraint in place. Rebuild atomically, preserving row order.
+        let incoming_schema: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='save_sync_incoming'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(sqlite)?;
+        if incoming_schema.contains("CHECK (size > 0)") {
+            let replacement = incoming_schema.replace("CHECK (size > 0)", "CHECK (size >= 0)");
+            connection.execute_batch(&format!("BEGIN IMMEDIATE;
+                DROP INDEX save_sync_incoming_state;
+                ALTER TABLE save_sync_incoming RENAME TO save_sync_incoming_v1;
+                {replacement};
+                INSERT INTO save_sync_incoming SELECT * FROM save_sync_incoming_v1;
+                DROP TABLE save_sync_incoming_v1;
+                CREATE INDEX save_sync_incoming_state ON save_sync_incoming (server_id, account_id, installation_root, effective_saves_root, state);
+                COMMIT;")).map_err(sqlite)?;
+        }
+        ensure_column(
+            &connection,
+            "save_sync_incoming",
+            "replacement_backup",
+            "TEXT",
+        )?;
+
         let mut journal = Self {
             connection,
             scope,
             private_root,
         };
+        // Relative paths use one persisted separator convention. Old Windows
+        // journals used backslashes; slots arriving from RomM use forward
+        // slashes. Normalize before recovery so the same file is not mistaken
+        // for a proposed destination change. Absolute roots/backups are untouched.
+        journal.connection.execute("UPDATE save_sync_slots SET relative_path=replace(relative_path,char(92),'/'),proposed_relative_path=replace(proposed_relative_path,char(92),'/') WHERE server_id=?1 AND account_id=?2 AND installation_root=?3 AND effective_saves_root=?4",rusqlite::params_from_iter(scope_only_params(&journal.scope))).map_err(sqlite)?;
         journal.recover_incoming_publications()?;
         journal.recover_interrupted_publications()?;
         Ok(journal)
@@ -333,6 +366,9 @@ fn scope_key_params(scope: &SaveSyncScope, key: &RomKey) -> Vec<rusqlite::types:
 }
 
 fn path_string(path: &Path) -> Result<String> {
+    if path.is_relative() {
+        return super::portable_save_path(path);
+    }
     path.to_str()
         .map(ToOwned::to_owned)
         .ok_or_else(|| Error::Unsupported("save-sync path is not valid Unicode".into()))

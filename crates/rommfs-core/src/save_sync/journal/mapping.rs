@@ -1,5 +1,5 @@
 use super::super::mapping::{SaveMapping, SaveProfile, RETROBAT_GB_SRM_PROFILE};
-use super::super::path::open_save_read;
+use super::super::path::open_save_read_for;
 use super::super::settings::windows_path_key;
 use super::private_snapshot_path;
 use super::snapshot::hash_reader;
@@ -20,7 +20,10 @@ impl SaveSyncJournal {
     pub fn reconcile_mappings(&mut self, report: &MappingReport) -> Result<()> {
         for mapping in &report.mappings {
             self.validate_key(&mapping.rom_key)?;
-            if mapping.profile.id != RETROBAT_GB_SRM_PROFILE {
+            if !matches!(
+                mapping.profile.id,
+                RETROBAT_GB_SRM_PROFILE | crate::save_sync::GENERIC_FILE_PROFILE
+            ) {
                 return Err(Error::Unsupported("unrecognized save profile".into()));
             }
             validate_mapping_path(&mapping.relative_path)?;
@@ -29,6 +32,37 @@ impl SaveSyncJournal {
             self.validate_key(&unmapped.rom_key)?;
         }
         let transaction = self.connection.transaction().map_err(sqlite)?;
+        // Upgrade matching legacy identities atomically, carrying baseline,
+        // removal state, pending snapshots, and incoming records with them.
+        // Consent is deliberately migrated separately and stays disabled.
+        for mapping in report
+            .mappings
+            .iter()
+            .filter(|m| m.profile.id == crate::save_sync::GENERIC_FILE_PROFILE)
+        {
+            let relative = path_string(&mapping.relative_path)?;
+            let old_ids: Vec<i64> = transaction.prepare("SELECT file_id FROM save_sync_slots WHERE server_id=?1 AND account_id=?2 AND installation_root=?3 AND effective_saves_root=?4 AND rom_id=?5 AND profile_id=?6 AND lower(relative_path)=lower(?7)").map_err(sqlite)?.query_map(rusqlite::params![self.scope.server_id,self.scope.account_id,windows_path_key(&self.scope.installation_root),windows_path_key(&self.scope.effective_saves_root),mapping.rom_key.rom_id,RETROBAT_GB_SRM_PROFILE,relative], |r| r.get(0)).map_err(sqlite)?.collect::<std::result::Result<_,_>>().map_err(sqlite)?;
+            if old_ids.len() > 1 {
+                return Err(Error::Unsupported(
+                    "Legacy save mappings are ambiguous; migration left all records intact".into(),
+                ));
+            }
+            for old_id in old_ids {
+                if query_mapping(&transaction, &self.scope, &mapping.rom_key)?.is_some() {
+                    return Err(Error::Unsupported(
+                        "Legacy and ordinary file identities collide; review required".into(),
+                    ));
+                }
+                for table in [
+                    "save_sync_slots",
+                    "save_sync_snapshots",
+                    "save_sync_incoming",
+                ] {
+                    transaction.execute(&format!("UPDATE {table} SET file_id=?1 WHERE server_id=?2 AND account_id=?3 AND installation_root=?4 AND effective_saves_root=?5 AND rom_id=?6 AND file_id=?7"),rusqlite::params![mapping.rom_key.file_id,self.scope.server_id,self.scope.account_id,windows_path_key(&self.scope.installation_root),windows_path_key(&self.scope.effective_saves_root),mapping.rom_key.rom_id,old_id]).map_err(sqlite)?;
+                }
+                transaction.execute("UPDATE save_sync_slots SET profile_id=?1 WHERE server_id=?2 AND account_id=?3 AND installation_root=?4 AND effective_saves_root=?5 AND rom_id=?6 AND file_id=?7",rusqlite::params![mapping.profile.id,self.scope.server_id,self.scope.account_id,windows_path_key(&self.scope.installation_root),windows_path_key(&self.scope.effective_saves_root),mapping.rom_key.rom_id,mapping.rom_key.file_id]).map_err(sqlite)?;
+            }
+        }
         transaction
             .execute(
                 "UPDATE save_sync_slots SET candidate_available = 0
@@ -209,6 +243,13 @@ impl SaveSyncJournal {
             .map_err(sqlite)
     }
 
+    pub fn slots(&self) -> Result<Vec<JournalSlot>> {
+        let keys = self.connection.prepare("SELECT rom_server_id,rom_id,file_id FROM save_sync_slots WHERE server_id=?1 AND account_id=?2 AND installation_root=?3 AND effective_saves_root=?4 ORDER BY rom_id,file_id").map_err(sqlite)?.query_map(rusqlite::params_from_iter(scope_only_params(&self.scope)), |r| Ok(RomKey { server_id:r.get(0)?, rom_id:r.get(1)?,file_id:r.get(2)? })).map_err(sqlite)?.collect::<std::result::Result<Vec<_>,_>>().map_err(sqlite)?;
+        keys.iter()
+            .filter_map(|key| self.slot(key).transpose())
+            .collect()
+    }
+
     /// Return confirmed local files whose latest generation has no durable
     /// snapshot yet. The scheduler uses this at startup to recover a debounce
     /// that was interrupted before publication.
@@ -283,10 +324,15 @@ impl SaveSyncJournal {
             let visible_rom_name = format!("{stem}.gb");
             dirty.push(SaveMapping {
                 rom_key: slot.rom_key,
-                profile: SaveProfile::gameboy(),
+                profile: if slot.profile_id == crate::save_sync::GENERIC_FILE_PROFILE {
+                    SaveProfile::ordinary_files()
+                } else {
+                    SaveProfile::gameboy()
+                },
                 target_path: self.scope.effective_saves_root.join(&slot.relative_path),
                 relative_path: slot.relative_path,
                 visible_rom_name,
+                legacy_compatible: false,
             });
         }
         Ok(dirty)
@@ -327,12 +373,15 @@ impl SaveSyncJournal {
         mapping: &SaveMapping,
         allow_attention: bool,
     ) -> Result<LocalObservation> {
-        let content_hash =
-            match open_save_read(&self.scope.effective_saves_root, &mapping.relative_path) {
-                Ok(mut file) => Some(hash_reader(&mut file)?),
-                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error),
-            };
+        let content_hash = match open_save_read_for(
+            &self.scope.effective_saves_root,
+            &mapping.relative_path,
+            mapping.profile.id == crate::save_sync::GENERIC_FILE_PROFILE,
+        ) {
+            Ok(mut file) => Some(hash_reader(&mut file)?),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         self.record_local_observation(mapping, content_hash, allow_attention)
     }
 

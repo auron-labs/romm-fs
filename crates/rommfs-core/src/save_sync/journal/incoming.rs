@@ -9,11 +9,29 @@ use crate::catalog::RomKey;
 use crate::error::{Error, Result};
 use rusqlite::OptionalExtension;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 impl SaveSyncJournal {
+    /// Persist the recovery location before moving a previously synchronized
+    /// baseline. Recovery never deletes this file or overwrites a new local save.
+    pub fn record_incoming_backup(&self, incoming_id: &str, backup: &Path) -> Result<()> {
+        let record = self.incoming_by_id(incoming_id)?;
+        if record.state != "publishing" {
+            return Err(Error::Unsupported(
+                "Incoming replacement has no publication intent".into(),
+            ));
+        }
+        super::super::ensure_no_reparse_components(backup)?;
+        backup
+            .strip_prefix(&self.scope.effective_saves_root)
+            .map_err(|_| {
+                Error::Unsupported("Replacement backup is outside the save folder".into())
+            })?;
+        self.connection.execute("UPDATE save_sync_incoming SET replacement_backup=?1 WHERE server_id=?2 AND account_id=?3 AND installation_root=?4 AND effective_saves_root=?5 AND incoming_id=?6", rusqlite::params![path_string(backup)?,self.scope.server_id,self.scope.account_id,windows_path_key(&self.scope.installation_root),windows_path_key(&self.scope.effective_saves_root),incoming_id]).map_err(sqlite)?;
+        Ok(())
+    }
     /// Keep an already verified remote body in the private spool before any
     /// decision that could expose it to the RetroBat saves directory.
     #[allow(clippy::too_many_arguments)]
@@ -27,19 +45,78 @@ impl SaveSyncJournal {
         baseline_remote_id: Option<&str>,
         baseline_remote_hash: Option<&str>,
     ) -> Result<IncomingSaveRecord> {
+        self.stage_incoming_reader(
+            mapping,
+            remote_id,
+            &mut std::io::Cursor::new(bytes),
+            bytes.len() as u64,
+            &sha256_content_hash(bytes),
+            reason,
+            baseline_local_hash,
+            baseline_remote_id,
+            baseline_remote_hash,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_incoming_file(
+        &mut self,
+        mapping: &SaveMapping,
+        remote_id: &str,
+        path: &Path,
+        reason: &str,
+        baseline_local_hash: Option<&str>,
+        baseline_remote_id: Option<&str>,
+        baseline_remote_hash: Option<&str>,
+    ) -> Result<IncomingSaveRecord> {
+        super::super::ensure_no_reparse_components(path)?;
+        let mut file = super::snapshot::open_private_snapshot(path)?;
+        let size = file.metadata()?.len();
+        let hash = super::snapshot::hash_reader(&mut file)?;
+        file.seek(SeekFrom::Start(0))?;
+        self.stage_incoming_reader(
+            mapping,
+            remote_id,
+            &mut file,
+            size,
+            &hash,
+            reason,
+            baseline_local_hash,
+            baseline_remote_id,
+            baseline_remote_hash,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_incoming_reader(
+        &mut self,
+        mapping: &SaveMapping,
+        remote_id: &str,
+        reader: &mut impl Read,
+        size: u64,
+        content_hash: &str,
+        reason: &str,
+        baseline_local_hash: Option<&str>,
+        baseline_remote_id: Option<&str>,
+        baseline_remote_hash: Option<&str>,
+    ) -> Result<IncomingSaveRecord> {
         self.validate_key(&mapping.rom_key)?;
         validate_relative_save_path(&mapping.relative_path).map_err(Error::Unsupported)?;
-        if mapping.profile.id != super::super::mapping::RETROBAT_GB_SRM_PROFILE
-            || bytes.is_empty()
-            || bytes.len() as u64 > super::super::path::MAX_SAVE_BYTES
+        let ordinary = mapping.profile.id == crate::save_sync::GENERIC_FILE_PROFILE;
+        if (!ordinary
+            && (mapping.profile.id != super::super::mapping::RETROBAT_GB_SRM_PROFILE
+                || size == 0
+                || size > super::super::path::MAX_SAVE_BYTES))
             || remote_id.parse::<i64>().is_err()
         {
             return Err(Error::Unsupported(
                 "incoming save identity, profile, or size is invalid".into(),
             ));
         }
-        ensure_no_rtc_companion(&self.scope.effective_saves_root, &mapping.relative_path)?;
-        let content_hash = sha256_content_hash(bytes);
+        if !ordinary {
+            ensure_no_rtc_companion(&self.scope.effective_saves_root, &mapping.relative_path)?;
+        }
+        let content_hash = content_hash.to_owned();
         let existing = self
             .connection
             .query_row(
@@ -94,7 +171,11 @@ impl SaveSyncJournal {
         let artifact_name = format!("{id}.incoming");
         let stage_path = self.private_root.join(&artifact_name);
         let mut stage = create_private_artifact(&stage_path)?;
-        stage.write_all(bytes)?;
+        if std::io::copy(reader, &mut stage)? != size {
+            return Err(Error::Unsupported(
+                "Incoming save changed during staging".into(),
+            ));
+        }
         stage.sync_all()?;
         sync_private_directory(&self.private_root)?;
         if !incoming_path_has_hash(&stage_path, &content_hash)? {
@@ -124,7 +205,7 @@ impl SaveSyncJournal {
                     mapping.rom_key.file_id,
                     remote_id,
                     content_hash,
-                    bytes.len() as u64,
+                    size,
                     reason,
                     artifact_name,
                     baseline_local_hash,
@@ -139,7 +220,7 @@ impl SaveSyncJournal {
             rom_key: mapping.rom_key.clone(),
             remote_id: remote_id.to_owned(),
             content_hash,
-            size: bytes.len() as u64,
+            size,
             reason: reason.to_owned(),
             path: stage_path,
             state: "staged".into(),
@@ -213,7 +294,9 @@ impl SaveSyncJournal {
         }
         self.validate_key(&mapping.rom_key)?;
         validate_relative_save_path(&mapping.relative_path).map_err(Error::Unsupported)?;
-        ensure_no_rtc_companion(&self.scope.effective_saves_root, &mapping.relative_path)?;
+        if mapping.profile.id != crate::save_sync::GENERIC_FILE_PROFILE {
+            ensure_no_rtc_companion(&self.scope.effective_saves_root, &mapping.relative_path)?;
+        }
         let transaction = self.connection.transaction().map_err(sqlite)?;
         let mapped_path: Option<String> = transaction
             .query_row(
@@ -524,15 +607,11 @@ fn incoming_path_has_hash(path: &Path, expected_hash: &str) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() == 0
-        || metadata.len() > super::super::path::MAX_SAVE_BYTES
-    {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Ok(false);
     }
-    let bytes = fs::read(path)?;
-    Ok(sha256_content_hash(&bytes) == expected_hash)
+    let mut file = super::snapshot::open_private_snapshot(path)?;
+    Ok(super::snapshot::hash_reader(&mut file)? == expected_hash)
 }
 
 fn sync_private_directory(path: &Path) -> Result<()> {

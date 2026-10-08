@@ -13,7 +13,7 @@ use rommfs_core::events::{
 };
 use rommfs_core::romm::{RommClient, SaveSyncIdentity};
 use rommfs_core::save_sync::{
-    SaveMapping, SaveSyncJournal, SaveSyncScheduler, SaveSyncScope, SnapshotState,
+    SaveFileRules, SaveMapping, SaveSyncJournal, SaveSyncScheduler, SaveSyncScope, SnapshotState,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -55,6 +55,35 @@ impl SaveSyncAgent {
         enabled: impl Into<SaveSyncEnablement>,
         sink: EventSink,
     ) -> Result<Self> {
+        Self::start_with_rules(
+            scope,
+            mappings,
+            identity,
+            client,
+            journal_path,
+            spool_path,
+            debounce_secs,
+            session_id,
+            enabled,
+            sink,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_with_rules(
+        scope: SaveSyncScope,
+        mappings: Vec<SaveMapping>,
+        identity: SaveSyncIdentity,
+        client: Arc<RommClient>,
+        journal_path: PathBuf,
+        spool_path: PathBuf,
+        debounce_secs: u32,
+        session_id: u64,
+        enabled: impl Into<SaveSyncEnablement>,
+        sink: EventSink,
+        rules: Option<SaveFileRules>,
+    ) -> Result<Self> {
         let enabled = enabled.into();
         let (stop, stop_rx) = mpsc::channel();
         let (commands, command_rx) = mpsc::channel();
@@ -71,6 +100,7 @@ impl SaveSyncAgent {
                 if let Err(error) = run_actor(
                     ActorConfig {
                         scope,
+                        rules,
                         mappings,
                         identity,
                         client,
@@ -159,6 +189,7 @@ fn actor_failure_status(
             .iter()
             .map(|mapping| SaveSyncGameStatus {
                 rom_id: mapping.rom_key.rom_id,
+                file_id: mapping.rom_key.file_id,
                 rom_name: mapping.visible_rom_name.clone(),
                 local_hash: None,
                 remote_id: None,
@@ -202,6 +233,7 @@ fn actor_failure_status(
         }
         let mut game = SaveSyncGameStatus {
             rom_id: mapping.rom_key.rom_id,
+            file_id: mapping.rom_key.file_id,
             rom_name: mapping.visible_rom_name.clone(),
             local_hash: slot
                 .as_ref()
@@ -210,11 +242,10 @@ fn actor_failure_status(
             remote_hash: slot
                 .as_ref()
                 .and_then(|slot| slot.remote_baseline_hash.clone()),
-            incoming_ids: status
-                .incoming
+            incoming_ids: incoming
                 .iter()
-                .filter(|record| record.rom_id == mapping.rom_key.rom_id)
-                .map(|record| record.incoming_id.clone())
+                .filter(|record| record.rom_key == mapping.rom_key)
+                .map(|record| record.id.clone())
                 .collect(),
             issue: slot.as_ref().and_then(|slot| slot.last_failure.clone()),
             installed_incoming: false,
@@ -234,6 +265,7 @@ impl Drop for SaveSyncAgent {
 }
 
 struct ActorConfig {
+    rules: Option<SaveFileRules>,
     scope: SaveSyncScope,
     mappings: Vec<SaveMapping>,
     identity: SaveSyncIdentity,
@@ -255,12 +287,27 @@ struct ActorContext<'a> {
     active: &'a AtomicBool,
 }
 
+struct TransferThread {
+    active: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+impl Drop for TransferThread {
+    fn drop(&mut self) {
+        // Also runs on actor errors/unwinding: disable first, then drain the
+        // bounded HTTP operation before the controller considers sync stopped.
+        self.active.store(false, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 struct ActorState {
     dispatched: HashMap<String, RomKey>,
     paused_until: HashMap<RomKey, Instant>,
     reconciled_keys: HashSet<RomKey>,
     inventory_dispatched: HashSet<RomKey>,
-    game_states: HashMap<i64, SaveSyncGameStatus>,
+    game_states: HashMap<RomKey, SaveSyncGameStatus>,
     transfer_failures: HashMap<String, (RomKey, String)>,
     capture_failures: HashMap<RomKey, String>,
     reconciliation_failures: HashMap<RomKey, String>,
@@ -296,6 +343,7 @@ fn run_actor(
     sink: EventSink,
 ) -> Result<()> {
     let ActorConfig {
+        rules,
         scope,
         mappings,
         identity,
@@ -331,7 +379,7 @@ fn run_actor(
             active_mappings.push(mapping);
         }
     }
-    let mappings = active_mappings;
+    let mut mappings = active_mappings;
     let context = ActorContext {
         session_id,
         scope: &scope,
@@ -351,7 +399,7 @@ fn run_actor(
     let transfer_gate = enabled.clone();
     let transfer_active = Arc::clone(&active);
     let transfer_client = Arc::clone(&client);
-    thread::Builder::new()
+    let transfer_handle = thread::Builder::new()
         .name("rommfs-save-upload".into())
         .spawn(move || {
             run_transfer_worker(
@@ -362,6 +410,10 @@ fn run_actor(
                 transfer_active,
             )
         })?;
+    let _transfer_thread = TransferThread {
+        active: active.clone(),
+        handle: Some(transfer_handle),
+    };
 
     let mut scheduler = SaveSyncScheduler::with_seconds(debounce_secs);
     let restored = scheduler.restore_dirty(&mut journal, Instant::now())?;
@@ -408,6 +460,15 @@ fn run_actor(
     }
     let mut next_fallback_scan = Instant::now() + FALLBACK_SCAN_INTERVAL;
     state.next_inventory_poll = next_fallback_scan;
+    if let Some(rules) = &rules {
+        let _ = transfer_tx.send(WorkerJob::Discover {
+            rules: rules.clone(),
+            scope: scope.clone(),
+            account_id: identity.account_id,
+        });
+    }
+    let mut next_discovery = Instant::now() + FALLBACK_SCAN_INTERVAL;
+    let mut local_discovery_needed = rules.is_some();
 
     loop {
         if !active.load(Ordering::SeqCst) || !enabled.is_enabled() {
@@ -416,6 +477,100 @@ fn run_actor(
         if stop_rx.try_recv().is_ok() {
             break;
         }
+        let updates: Vec<_> = result_rx.try_iter().collect();
+        let mut discovered = Vec::new();
+        let mut remaining = Vec::new();
+        for update in updates {
+            match update {
+                TransferUpdate::Discovered(Ok(found)) => discovered.extend(found),
+                TransferUpdate::Discovered(Err(failure)) => {
+                    state.authentication_required |=
+                        super::incoming_transfer::requires_sign_in(&failure);
+                    state.network_paused |= super::incoming_transfer::is_network_pause(&failure);
+                    sink.emit(AppEvent::log(
+                        Level::Warn,
+                        "save-sync",
+                        format!("Remote file discovery deferred: {}", failure.error),
+                    ));
+                }
+                update => remaining.push(update),
+            }
+        }
+        if let Some(rules) = &rules {
+            if local_discovery_needed || Instant::now() >= next_fallback_scan {
+                local_discovery_needed = false;
+                match rules.scan(&scope.effective_saves_root) {
+                    Ok(plan) => {
+                        discovered.extend(plan.report.mappings);
+                        for path in plan.unmatched.iter().take(20) {
+                            sink.emit(AppEvent::log(Level::Warn, "save-sync", path.clone()));
+                        }
+                    }
+                    Err(e) => sink.emit(AppEvent::log(
+                        Level::Warn,
+                        "save-sync",
+                        format!("Save scan deferred: {e}"),
+                    )),
+                }
+            }
+            if Instant::now() >= next_discovery && !state.network_paused {
+                let _ = transfer_tx.send(WorkerJob::Discover {
+                    rules: rules.clone(),
+                    scope: scope.clone(),
+                    account_id: identity.account_id,
+                });
+                next_discovery = Instant::now() + FALLBACK_SCAN_INTERVAL;
+            }
+        }
+        if !discovered.is_empty() {
+            let mut candidates = mappings.clone();
+            candidates.extend(discovered.iter().cloned());
+            rommfs_core::save_sync::ensure_distinct(&candidates)?;
+            let mut added = Vec::new();
+            for mapping in discovered {
+                if !mappings.iter().any(|m| m.rom_key == mapping.rom_key) {
+                    added.push(mapping.clone());
+                    mappings.push(mapping);
+                }
+            }
+            rommfs_core::save_sync::ensure_distinct(&mappings)?;
+            if !added.is_empty() {
+                journal.reconcile_mappings(&rommfs_core::save_sync::MappingReport {
+                    mappings: mappings.clone(),
+                    ..Default::default()
+                })?;
+                for mapping in added {
+                    let slot = journal
+                        .slot(&mapping.rom_key)?
+                        .expect("reconciled mapping exists");
+                    if !slot.mapping_confirmed && !slot.needs_attention {
+                        journal.confirm_mapping(&mapping.rom_key, &mapping.relative_path)?;
+                    }
+                    if slot.relative_path != mapping.relative_path || slot.needs_attention {
+                        continue;
+                    }
+                    scheduler.hint(&mapping, Instant::now());
+                    if transfer_tx
+                        .send(WorkerJob::Reconcile(Box::new(IncomingJob {
+                            mapping: mapping.clone(),
+                            identity: identity.clone(),
+                            scope: scope.clone(),
+                        })))
+                        .is_ok()
+                    {
+                        state.inventory_dispatched.insert(mapping.rom_key.clone());
+                    }
+                }
+            }
+        }
+        let context = ActorContext {
+            session_id,
+            scope: &scope,
+            mappings: &mappings,
+            identity: &identity,
+            enabled: &enabled,
+            active: &active,
+        };
         for command in command_rx.try_iter() {
             match command {
                 AgentCommand::Export {
@@ -444,10 +599,12 @@ fn run_actor(
             let path = match signal {
                 WatcherSignal::Path(path) => path,
                 WatcherSignal::Rescan => {
+                    local_discovery_needed = true;
                     next_fallback_scan = Instant::now();
                     continue;
                 }
                 WatcherSignal::Error(message) => {
+                    local_discovery_needed = true;
                     sink.emit(AppEvent::log(
                         Level::Warn,
                         "save-sync",
@@ -458,6 +615,7 @@ fn run_actor(
                 }
             };
             if same_path(&path, &scope.effective_saves_root) {
+                local_discovery_needed = true;
                 update_root_watch(
                     watcher.as_mut(),
                     &scope.effective_saves_root,
@@ -494,11 +652,20 @@ fn run_actor(
                 } else {
                     scheduler.hint(mapping, Instant::now());
                 }
+            } else if rules.is_some() {
+                // The fallback observation below consumes its deadline in this
+                // iteration. Retain discovery independently so an unknown file
+                // is scanned next iteration rather than stranded for 60 seconds.
+                local_discovery_needed = true;
+                next_fallback_scan = Instant::now();
             }
         }
 
-        for update in result_rx.try_iter() {
+        for update in remaining {
             match update {
+                TransferUpdate::Discovered(_) => {
+                    unreachable!("discovery consumed before borrowing mappings")
+                }
                 TransferUpdate::Retry {
                     revision,
                     state: snapshot_state,
@@ -854,6 +1021,7 @@ fn handle_reconciled_update(
                     }
                     let game = SaveSyncGameStatus {
                         rom_id: key.rom_id,
+                        file_id: key.file_id,
                         rom_name: mapping.visible_rom_name.clone(),
                         local_hash: outcome.local_hash,
                         remote_id: outcome.remote_id,
@@ -866,7 +1034,7 @@ fn handle_reconciled_update(
                         issue: outcome.message.clone(),
                         installed_incoming: outcome.installed,
                     };
-                    state.game_states.insert(key.rom_id, game.clone());
+                    state.game_states.insert(key.clone(), game.clone());
                     sink.emit(AppEvent::SaveSyncReconciliation {
                         session_id: context.session_id,
                         game,
@@ -958,9 +1126,10 @@ fn remember_reconciliation_failure(
     };
     let game = state
         .game_states
-        .entry(key.rom_id)
+        .entry(key.clone())
         .or_insert_with(|| SaveSyncGameStatus {
             rom_id: key.rom_id,
+            file_id: key.file_id,
             rom_name: mapping.visible_rom_name.clone(),
             local_hash: None,
             remote_id: None,
@@ -978,9 +1147,10 @@ fn ensure_game_state(key: &RomKey, mappings: &[SaveMapping], state: &mut ActorSt
     };
     state
         .game_states
-        .entry(key.rom_id)
+        .entry(key.clone())
         .or_insert_with(|| SaveSyncGameStatus {
             rom_id: key.rom_id,
+            file_id: key.file_id,
             rom_name: mapping.visible_rom_name.clone(),
             local_hash: None,
             remote_id: None,
@@ -1020,10 +1190,11 @@ fn emit_reconciliation_failure(
 ) -> Result<()> {
     let mut game = state
         .game_states
-        .get(&key.rom_id)
+        .get(key)
         .cloned()
         .unwrap_or(SaveSyncGameStatus {
             rom_id: key.rom_id,
+            file_id: key.file_id,
             rom_name: mapping.visible_rom_name.clone(),
             local_hash: None,
             remote_id: None,
@@ -1290,16 +1461,20 @@ fn emit_queue_status(
             .count();
     let mut games = state.game_states.values().cloned().collect::<Vec<_>>();
     for game in &mut games {
-        if let Some(mapping) = mappings
-            .iter()
-            .find(|mapping| mapping.rom_key.rom_id == game.rom_id)
-        {
+        if let Some(mapping) = mappings.iter().find(|mapping| {
+            (mapping.rom_key.rom_id, mapping.rom_key.file_id) == (game.rom_id, game.file_id)
+        }) {
+            if let Some(slot) = journal.slot(&mapping.rom_key)? {
+                game.local_hash = slot.current_local_hash;
+                game.remote_id = slot.remote_slot_id;
+                game.remote_hash = slot.remote_baseline_hash;
+            }
             if let Some(failure) = game_failure(&mapping.rom_key, state) {
                 game.issue = Some(failure.to_owned());
             }
         }
     }
-    games.sort_by_key(|game| game.rom_id);
+    games.sort_by_key(|game| (game.rom_id, game.file_id));
     sink.emit(AppEvent::SaveSyncQueueUpdated(SaveSyncQueueStatus {
         session_id: context.session_id,
         mapped_games: mappings.len(),

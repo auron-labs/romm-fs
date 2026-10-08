@@ -211,10 +211,15 @@ pub fn build_catalogue_for_layout(
                     ("switchupdates".into(), file.file_name.clone())
                 } else {
                     skipped_unsupported += 1;
-                    warn(format!(
-                        "rom {} file {}: category {:?} has no verified RetroBat destination",
-                        rom.id, file.id, category
-                    ));
+                    if category == "cheat" && file.file_name.to_ascii_lowercase().ends_with(".cht")
+                    {
+                        warn(format!("rom {} file {}: RetroArch cheat belongs outside the ROM tree; use Settings → Install library BIOS, keys and cheats",rom.id,file.id));
+                    } else {
+                        warn(format!(
+                            "rom {} file {}: category {:?} has no verified RetroBat destination",
+                            rom.id, file.id, category
+                        ));
+                    }
                     continue;
                 }
             } else {

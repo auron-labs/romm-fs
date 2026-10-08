@@ -16,9 +16,9 @@ reproducible defects separately.
 **Current validation status:** all Windows runtime and human cases remain
 pending on the Linux implementation host. Do not run them as a prerequisite for
 continuing implementation. [Implementation status](../.planning/IMPLEMENTATION-STATUS.md)
-separates finished code from remaining installer, save, auxiliary and tray work.
-The existing GB-save cases below remain regression coverage, not evidence of
-generalized ordinary-file save support.
+separates implemented code from deferred runtime acceptance.
+Portable ordinary-file fixtures and the full Windows UI cross-target check are
+not evidence of emulator, tray, installer or native save-lock behavior.
 
 ## 1. Prepare the host and evidence
 
@@ -276,8 +276,17 @@ exceptions rather than treating skipped protection checks as passes.
 | `META-ACTIVITY` | Refresh while EmulationStation or a Switch emulator runs, then exit. Also exercise unavailable access permissions. | Ready metadata waits, does not clobber in-memory history, publishes after safe exclusive access, and reports access/capability failures. |
 | `META-NETWORK` | Trace listing, XML generation and artwork requests separately. Include missing artwork and a rejected session. | No ROM bodies/detail requests; missing artwork nonfatal, authentication rejection requires sign-in, local references load in RetroBat. |
 
-Installer automation, generalized saves, external auxiliary materialization and
-tray/login cases remain unimplemented; record those as `NOT RUN`, not passes.
+### Installer, ordinary files, auxiliaries and lifecycle — all pending
+
+| Case | Procedure | Required evidence |
+| --- | --- | --- |
+| `INSTALLER` | Download the official stable package, cancel during download, retry, launch, and cancel inside its wizard. Select a completed fresh install for setup. | Digest/size verified before execution; no executable partial download; no guessed silent flags or process killing; cancelled/partial installs left untouched. A zero exit code alone does not prove installation. |
+| `FILES-CLEAN` | Use two disposable save roots and the same game/account. Transfer companions, nested extensionless files, empty files and a >1 MiB file; give the second client no first-client journal. | Byte hashes and relative paths match; remote slots reconstruct paths despite filename rewriting; watcher notices new files. |
+| `FILES-CONFLICT` | Establish a synchronized baseline; change only remote, then change both sides, then delete local. Hold a local file open without sharing writes/deletion. | Remote-only update safely replaces unchanged baseline and keeps backup; simultaneous/active changes stay pending; deliberate deletion does not restore or delete remote files. |
+| `FILES-MIGRATION` | Upgrade a copied legacy journal with queued work and old enabled SRAM consent. | Baselines/snapshots/incoming/removal state retained; broader scope off until explicitly enabled. |
+| `AUXILIARY` | Install lawful BIOS, unpacked Switch firmware/keys and RetroArch .cht files. Retry, modify a local file, supply an unsupported archive, and change the server version. | Correct effective destinations and ownership index; no game hydration/list entries; unrelated/modified/changed-version files preserved and actionable issues shown; auxiliaries not watched as saves. |
+| `TRAY` | Hide a mounted window, reopen from tray, start a second instance, then Quit during activity. | Mount/sync survive hiding; one process/mount; status/error accessible; Quit drains workers. Taskbar and tray icons visible. |
+| `LOGIN` | Enable using remembered browser sign-in, log in again, then repeat with rejected auth or a failed mount. | Hidden startup authenticates, mounts, then resumes only the valid prior consent scope. Failure accessible from tray and no sync starts after a failed startup mount. Logout removes login registration. |
 
 ## 3. Test a real RomM through CFAPI
 
@@ -526,7 +535,7 @@ earlier password grant and GET preflight window from all app request counts.
 | `UI-MOUNT-LIST` | Run `Get-ChildItem -LiteralPath '<mount>' -Recurse` before opening a ROM. | Metadata appears. Use native fixture counters from section 2 as proof of no content downloads; Explorer may have other readers. |
 | `UI-MOUNT-READ` | Run `Get-FileHash -LiteralPath '<mounted ROM>' -Algorithm SHA256`; compare with its known source. Repeat. | Hashes match; warm reads do not create a new ROM transfer. Hashing performs a content read. |
 | `UI-MOUNT-STOP` | Press **Stop**, inspect the folder, then **Start** again. | Folder is restored empty; sibling `<folder>.rommfs-root` marker remains; cached bytes are reused. |
-| `UI-MOUNT-CLOSE` | Close the app while mounted, then inspect the folder. | Mount currently stops; owned frontend metadata remains. No tray/background app exists yet. |
+| `UI-MOUNT-CLOSE` | Close the window while mounted, then inspect the folder; reopen from tray and explicitly Quit. | Hiding retains the mount; Quit stops it and preserves owned metadata. If tray creation fails, closing the visible window quits instead. |
 | `UI-MOUNT-LEGACY-ROOT` | Put a sentinel file in a separate disposable folder; record its hash; attempt to mount there. | Mount is refused; sentinel and hash remain unchanged. Never test against a real old ROM/save library. |
 | `UI-MOUNT-OWNERSHIP` | Claim a test folder for server A, stop, then try it for a different server identity. | Ownership mismatch is refused. A configured URL base path is part of server identity. |
 
@@ -597,18 +606,18 @@ record that interaction as `BLOCKED` for activation—not a generic keyboard
 `PASS`; separately record visible disabled-state/focus behavior. Never claim
 visual focus based only on key bindings or source tests.
 
-Only visible catalogue `.gb` games map to `gb/<visible ROM stem>.srm` under the
-effective saves root. `.gbc`, `.rtc`, save states, memory cards, ambiguous names,
-multi-file ROMs, and other profiles are excluded. Check exclusions in the automated
-mapping/profile tests and any matching disposable entries available on this host.
-Record skipped counts separately from mapped game counts. A bounded or unavailable
-preview scan must be labelled partial/unavailable, not a complete zero-file scan.
+Ordinary files of every format, including `.rtc`, extensionless, empty and large
+files, can be associated with a visible game through unique stems, server save
+targets or an explicit mapping. Shared saves/cards remain excluded. Use only a
+save-data root; unmatched files are visible, not guessed. Record mapped file
+counts separately from unmatched paths. An unavailable/limit-exceeded scan is
+not a complete zero-file result. Legacy GB-profile tests cover migration only.
 
 ## 6. Run a live save-sync smoke test
 
 Use one disposable RomM account and the same playable Game Boy catalogue entry
 for both installations. Record account ID, ROM ID, slot
-`rommfs-retrobat-gb-srm-v1`, effective saves root, mapped `.srm` paths, and
+`rommfs-file-v2:gb/<visible ROM stem>.srm`, effective saves root, mapped `.srm` paths, and
 baseline SHA256 values for the actual valid local save and each relevant remote
 save. Begin with no remote saves for that test game/account/profile so old
 history cannot obscure the result. Save backups outside both saves roots and

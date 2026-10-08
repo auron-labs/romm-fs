@@ -11,32 +11,9 @@ pub const MAX_SAVE_BYTES: u64 = 1024 * 1024;
 /// filename. In particular, Windows ADS and traversal syntax are rejected on
 /// every host, not just when running on Windows.
 pub fn validate_relative_save_path(path: &Path) -> std::result::Result<(), String> {
-    let mut path_components = path.components();
-    let system = match path_components.next() {
-        Some(Component::Normal(component)) => component
-            .to_str()
-            .ok_or_else(|| "save target path is not valid Unicode".to_string())?,
-        _ => return Err("save target must be a relative path without traversal".into()),
-    };
-    let filename = match path_components.next() {
-        Some(Component::Normal(component)) => component
-            .to_str()
-            .ok_or_else(|| "save target path is not valid Unicode".to_string())?,
-        _ => return Err("save target must contain one system directory and one filename".into()),
-    };
-    if path_components.next().is_some() {
-        return Err("save target must contain one system directory and one filename".into());
-    }
-    if !system.eq_ignore_ascii_case("gb")
-        || !filename.rsplit_once('.').is_some_and(|(stem, extension)| {
-            !stem.is_empty() && extension.eq_ignore_ascii_case("srm")
-        })
-    {
-        return Err("save target is outside the supported Game Boy SRAM profile".into());
-    }
-    validate_windows_path_component(system)?;
-    validate_windows_path_component(filename)?;
-    Ok(())
+    super::portable_save_path(path)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Reject components that have special meaning or are not representable as a
@@ -154,9 +131,15 @@ pub(crate) fn ensure_no_rtc_companion(root: &Path, relative_path: &Path) -> Resu
     Ok(())
 }
 
-pub(crate) fn open_save_read(root: &Path, relative_path: &Path) -> Result<SaveReadHandle> {
+pub(crate) fn open_save_read_for(
+    root: &Path,
+    relative_path: &Path,
+    ordinary: bool,
+) -> Result<SaveReadHandle> {
     let path = resolve_save_target(root, relative_path)?;
-    ensure_no_rtc_companion(root, relative_path)?;
+    if !ordinary {
+        ensure_no_rtc_companion(root, relative_path)?;
+    }
     let parent = path
         .parent()
         .ok_or_else(|| Error::Unsupported("save target has no parent directory".into()))?;
@@ -180,7 +163,7 @@ pub(crate) fn open_save_read(root: &Path, relative_path: &Path) -> Result<SaveRe
             "save target is not a plain single file".into(),
         ));
     }
-    if metadata.len() == 0 || metadata.len() > MAX_SAVE_BYTES {
+    if !ordinary && (metadata.len() == 0 || metadata.len() > MAX_SAVE_BYTES) {
         return Err(Error::Unsupported(format!(
             "Game Boy SRAM must be nonempty and no larger than {MAX_SAVE_BYTES} bytes"
         )));
@@ -261,7 +244,6 @@ mod tests {
             Path::new("gb/name. "),
             Path::new("gb/CON.srm"),
             Path::new("gb/CONIN$.srm"),
-            Path::new("snes/game.srm"),
         ] {
             assert!(validate_relative_save_path(path).is_err(), "{path:?}");
         }

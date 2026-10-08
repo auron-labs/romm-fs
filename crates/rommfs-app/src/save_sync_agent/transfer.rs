@@ -20,6 +20,7 @@ pub(super) const ACTOR_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
 
 pub(super) enum TransferUpdate {
+    Discovered(std::result::Result<Vec<SaveMapping>, SaveApiFailure>),
     Retry {
         revision: String,
         state: SnapshotState,
@@ -63,6 +64,11 @@ pub(super) struct TransferJob {
 }
 
 pub(super) enum WorkerJob {
+    Discover {
+        rules: rommfs_core::save_sync::SaveFileRules,
+        scope: SaveSyncScope,
+        account_id: i64,
+    },
     Upload(Box<TransferJob>),
     Reconcile(Box<IncomingJob>),
 }
@@ -121,7 +127,8 @@ pub(super) fn run_transfer_worker(
                     sign_in_required.load(Ordering::SeqCst),
                     &updates,
                 ),
-                Ok(WorkerJob::Reconcile(_)) | Err(RecvTimeoutError::Timeout) => {}
+                Ok(WorkerJob::Reconcile(_) | WorkerJob::Discover { .. })
+                | Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             continue;
@@ -136,6 +143,28 @@ pub(super) fn run_transfer_worker(
             .map(|due| due.saturating_duration_since(now).min(ACTOR_POLL_INTERVAL))
             .unwrap_or(ACTOR_POLL_INTERVAL);
         match rx.recv_timeout(next) {
+            Ok(WorkerJob::Discover {
+                rules,
+                scope,
+                account_id,
+            }) => {
+                let result = (|| {
+                    if !is_active(&enabled, &active) {
+                        return Err(SaveApiFailure {
+                            error: Error::Cancelled,
+                            retry_after: None,
+                        });
+                    }
+                    let all = client.all_save_inventory()?;
+                    rules
+                        .remote_mappings(&all, account_id, &scope.effective_saves_root)
+                        .map_err(|error| SaveApiFailure {
+                            error,
+                            retry_after: None,
+                        })
+                })();
+                let _ = updates.send(TransferUpdate::Discovered(result));
+            }
             Ok(WorkerJob::Reconcile(job)) => {
                 let mut context = ReconciliationContext {
                     client: &client,
@@ -366,7 +395,7 @@ fn upload_attempt(
     job: &TransferJob,
     already_ambiguous: bool,
     enabled: &SaveSyncEnablement,
-    active: &AtomicBool,
+    active: &Arc<AtomicBool>,
 ) -> UploadAttempt {
     if !is_active(enabled, active) {
         return UploadAttempt::Paused("save sync is disabled".into());
@@ -378,11 +407,20 @@ fn upload_attempt(
     ) {
         return UploadAttempt::Paused(format!("save-sync scope changed: {error}"));
     }
-    let slot_name = job.mapping.profile.id;
-    let inventory = match client.save_inventory(job.snapshot.rom_key.rom_id, slot_name) {
+    let slot_name = match job.mapping.remote_slot() {
+        Ok(slot) => slot,
+        Err(e) => return UploadAttempt::Paused(e.to_string()),
+    };
+    let mut inventory = match client.save_inventory(job.snapshot.rom_key.rom_id, &slot_name) {
         Ok(inventory) => inventory,
         Err(failure) => return api_failure(failure, already_ambiguous, false),
     };
+    if let Some(legacy) = job.mapping.legacy_slot() {
+        match client.save_inventory(job.snapshot.rom_key.rom_id, legacy) {
+            Ok(saves) => inventory.extend(saves),
+            Err(e) => return api_failure(e, already_ambiguous, false),
+        }
+    }
     if !is_active(enabled, active) {
         return UploadAttempt::Paused("save sync was disabled during inventory".into());
     }
@@ -433,25 +471,59 @@ fn upload_attempt(
     ) {
         return UploadAttempt::Paused(format!("save-sync scope changed before upload: {error}"));
     }
-    let bytes = match read_snapshot(&job.snapshot.path, &job.snapshot.content_hash) {
+    let ordinary = job.mapping.profile.id == rommfs_core::save_sync::GENERIC_FILE_PROFILE;
+    let bytes = match if ordinary {
+        std::fs::File::open(&job.snapshot.path)
+            .map_err(Error::from)
+            .and_then(|mut file| {
+                if rommfs_core::save_sync::hash_save_content(&mut file)?
+                    != job.snapshot.content_hash
+                {
+                    return Err(Error::Unsupported(
+                        "Private snapshot failed SHA-256 verification".into(),
+                    ));
+                }
+                Ok(Vec::new())
+            })
+    } else {
+        read_snapshot(&job.snapshot.path, &job.snapshot.content_hash)
+    } {
         Ok(bytes) => bytes,
         Err(error) => return UploadAttempt::Paused(error.to_string()),
     };
     if !is_active(enabled, active) {
         return UploadAttempt::Paused("save sync was disabled before upload".into());
     }
-    let filename = remote_filename(&job.snapshot.revision);
-    let response = match client.upload_save(
-        job.snapshot.rom_key.rom_id,
-        slot_name,
-        "retroarch-gambatte",
-        &filename,
-        &bytes,
-    ) {
+    let filename = if ordinary {
+        format!("rommfs-{}.bin", job.snapshot.revision)
+    } else {
+        remote_filename(&job.snapshot.revision)
+    };
+    let response = match if ordinary {
+        client.upload_save_file(
+            job.snapshot.rom_key.rom_id,
+            &slot_name,
+            &filename,
+            &job.snapshot.path,
+            active,
+        )
+    } else {
+        client.upload_save(
+            job.snapshot.rom_key.rom_id,
+            &slot_name,
+            "retroarch-gambatte",
+            &filename,
+            &bytes,
+        )
+    } {
         Ok(response) => response,
         Err(failure) => return api_failure(failure, true, true),
     };
-    if let Some(problem) = validate_remote_save(&response, job, Some(bytes.len() as u64)) {
+    if let Some(problem) = validate_remote_save(
+        &response,
+        job,
+        fs::metadata(&job.snapshot.path).ok().map(|m| m.len()),
+    ) {
         return UploadAttempt::Attention(problem);
     }
     if !is_active(enabled, active) {
@@ -480,7 +552,7 @@ fn validate_inventory(inventory: &[RemoteSave], job: &TransferJob) -> Option<Str
     for save in inventory {
         if save.rom_id != job.snapshot.rom_key.rom_id
             || save.user_id != job.identity.account_id
-            || save.slot.as_deref() != Some(job.mapping.profile.id)
+            || !job.mapping.accepts_remote_slot(save.slot.as_deref())
         {
             return Some(
                 "RomM save inventory did not match the authenticated account and slot".into(),
@@ -497,7 +569,7 @@ fn validate_remote_save(
 ) -> Option<String> {
     if save.rom_id != job.snapshot.rom_key.rom_id
         || save.user_id != job.identity.account_id
-        || save.slot.as_deref() != Some(job.mapping.profile.id)
+        || !job.mapping.accepts_remote_slot(save.slot.as_deref())
         || !remote_filename_matches_revision(&save.file_name, &job.snapshot.revision)
         || save.missing_from_fs
         || expected_size.is_some_and(|size| save.file_size_bytes != size)
@@ -635,8 +707,11 @@ fn post_upload_inventory(
     if !is_active(enabled, active) {
         return UploadAttempt::Paused("save sync was disabled before post-upload inventory".into());
     }
-    let inventory = match client.save_inventory(job.snapshot.rom_key.rom_id, job.mapping.profile.id)
-    {
+    let slot_name = match job.mapping.remote_slot() {
+        Ok(slot) => slot,
+        Err(e) => return UploadAttempt::Paused(e.to_string()),
+    };
+    let inventory = match client.save_inventory(job.snapshot.rom_key.rom_id, &slot_name) {
         Ok(inventory) => inventory,
         Err(failure) => return api_failure(failure, true, false),
     };
@@ -691,8 +766,22 @@ fn verify_remote_bytes(
             retry_after: None,
         });
     }
-    let bytes = client.download_save_content(remote.id)?;
-    Ok(sha256_content_hash(&bytes) == expected_hash)
+    let mut file = tempfile::tempfile().map_err(|e| SaveApiFailure {
+        error: e.into(),
+        retry_after: None,
+    })?;
+    client.download_save_to(remote.id, remote.file_size_bytes, &mut file, active)?;
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0)).map_err(|e| SaveApiFailure {
+        error: e.into(),
+        retry_after: None,
+    })?;
+    Ok(
+        rommfs_core::save_sync::hash_save_content(&mut file).map_err(|error| SaveApiFailure {
+            error,
+            retry_after: None,
+        })? == expected_hash,
+    )
 }
 
 fn read_snapshot(path: &Path, expected_hash: &str) -> Result<Vec<u8>> {
@@ -723,10 +812,10 @@ pub(super) fn remote_filename_matches_revision(filename: &str, expected_revision
     if !is_app_revision(expected_revision) {
         return false;
     }
-    let Some(stem) = filename
-        .strip_prefix("rommfs-")
-        .and_then(|name| name.strip_suffix(".srm"))
-    else {
+    let Some(stem) = filename.strip_prefix("rommfs-").and_then(|name| {
+        name.strip_suffix(".srm")
+            .or_else(|| name.strip_suffix(".bin"))
+    }) else {
         return false;
     };
     let revision = if let Some((revision, tag)) = stem.split_once(" [") {
@@ -805,6 +894,38 @@ fn validate_account_and_mappings(
         return Err(Error::Unsupported(
             "save-sync account or server no longer matches the scoped journal".into(),
         ));
+    }
+    if mappings
+        .iter()
+        .all(|m| m.profile.id == rommfs_core::save_sync::GENERIC_FILE_PROFILE)
+    {
+        rommfs_core::save_sync::ensure_no_reparse_components(&scope.effective_saves_root)?;
+        if scope.installation_root != scope.effective_saves_root {
+            let (_, saves) = rommfs_core::retrobat::launcher_paths(&scope.installation_root)?;
+            if saves != scope.effective_saves_root {
+                return Err(Error::Unsupported(
+                    "RetroBat save folder changed after consent".into(),
+                ));
+            }
+        }
+        rommfs_core::save_sync::ensure_distinct(mappings)?;
+        for mapping in mappings {
+            if mapping.rom_key
+                != rommfs_core::save_sync::save_file_key(
+                    &scope.server_id,
+                    mapping.rom_key.rom_id,
+                    &mapping.relative_path,
+                )?
+                || mapping.target_path
+                    != resolve_save_target(&scope.effective_saves_root, &mapping.relative_path)?
+            {
+                return Err(Error::Unsupported(
+                    "Save file identity or destination changed after consent".into(),
+                ));
+            }
+            mapping.remote_slot()?;
+        }
+        return Ok(());
     }
     let visible_names = mappings
         .iter()

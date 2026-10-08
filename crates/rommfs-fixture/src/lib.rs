@@ -587,7 +587,8 @@ fn save_inventory_json(target: &str, saves: &Mutex<HashMap<i64, FixtureSaveRecor
         saves
             .values()
             .filter(|save| {
-                Some(save.rom_id) == rom_id && slot.as_deref() == Some(save.slot.as_str())
+                (rom_id.is_none() || Some(save.rom_id) == rom_id)
+                    && (slot.is_none() || slot.as_deref() == Some(save.slot.as_str()))
             })
             .map(save_json_value)
             .collect(),
@@ -620,7 +621,24 @@ fn query_value(target: &str, key: &str) -> Option<String> {
         .1
         .split('&')
         .filter_map(|part| part.split_once('='))
-        .find_map(|(name, value)| (name == key).then(|| value.to_owned()))
+        .find_map(|(name, value)| (name == key).then(|| decode_query_value(value)))?
+}
+
+fn decode_query_value(value: &str) -> Option<String> {
+    let mut decoded = Vec::new();
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        decoded.push(match byte {
+            b'+' => b' ',
+            b'%' => {
+                let high = (bytes.next()? as char).to_digit(16)?;
+                let low = (bytes.next()? as char).to_digit(16)?;
+                (high * 16 + low) as u8
+            }
+            other => other,
+        });
+    }
+    String::from_utf8(decoded).ok()
 }
 
 /// Read one HTTP request line, headers, and body according to Content-Length.

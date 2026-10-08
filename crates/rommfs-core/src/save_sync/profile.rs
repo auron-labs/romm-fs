@@ -51,6 +51,21 @@ pub(crate) fn resolve_retrobat_paths(installation_root: &Path) -> Result<(PathBu
     Ok((home, saves))
 }
 
+pub(crate) fn resolve_auxiliary_root(installation: &Path, key: &str) -> Result<PathBuf> {
+    resolve_retrobat_paths(installation)?;
+    let launcher = installation.join("emulationstation");
+    let config = read_key_values(&launcher.join("emulatorLauncher.cfg"))?;
+    let local = configured_install_path(&config, installation, &launcher);
+    let path = resolve_launcher_path(
+        lookup(&config, key),
+        &local,
+        &local.parent().unwrap_or(&local).join(key),
+        false,
+    )?;
+    super::path::ensure_no_reparse_components(&path)?;
+    Ok(path)
+}
+
 /// Resolve the source-verified RetroBat 8.2.1 Game Boy/Gambatte layout without
 /// creating directories or changing any emulator configuration.
 pub fn resolve_retrobat_gb_profile(

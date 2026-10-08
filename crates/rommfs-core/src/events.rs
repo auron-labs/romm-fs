@@ -28,6 +28,7 @@ pub struct LogLine {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SaveSyncGameStatus {
     pub rom_id: i64,
+    pub file_id: i64,
     pub rom_name: String,
     pub local_hash: Option<String>,
     pub remote_id: Option<String>,
@@ -69,6 +70,28 @@ pub struct SaveSyncQueueStatus {
 /// Events emitted by workers. UI renders these; tests assert on them.
 #[derive(Clone, Debug)]
 pub enum AppEvent {
+    AuxiliaryStatus {
+        running: bool,
+        detail: String,
+        error: Option<String>,
+    },
+    StartupPreference {
+        enabled: bool,
+        error: Option<String>,
+    },
+    SaveFileMappings {
+        session_id: u64,
+        games: Vec<(i64, String)>,
+        unmatched: Vec<String>,
+    },
+    RetroBatInstaller {
+        running: bool,
+        ready: bool,
+        received: u64,
+        total: Option<u64>,
+        detail: String,
+        error: Option<String>,
+    },
     FrontendMetadata {
         pending: bool,
         detail: String,
@@ -283,6 +306,10 @@ impl EventSink {
             | AppEvent::MountFailed { .. }
             | AppEvent::MountStopped
             | AppEvent::MountProgress { .. }
+            | AppEvent::RetroBatSetup { .. }
+            | AppEvent::AuxiliaryStatus { .. }
+            | AppEvent::RetroBatInstaller { .. }
+            | AppEvent::StartupPreference { .. }
             | AppEvent::Evicted { .. }
             | AppEvent::EvictFailed { .. } => Some(LogLine {
                 unix_secs: crate::cache::now_unix_secs(),

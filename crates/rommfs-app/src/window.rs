@@ -33,8 +33,9 @@ use rommfs_core::save_sync::{
     ExistingSavePreview, ExistingSaveScanStatus, MAX_EXISTING_SAVE_SCAN_DEPTH,
     MAX_EXISTING_SAVE_SCAN_ENTRIES,
 };
+use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::rc::Rc;
 use std::time::Duration;
 
 actions!(
@@ -139,14 +140,17 @@ fn fmt_count(n: usize) -> String {
 // ---------------------------------------------------------------------------
 
 struct RommfsWindow {
-    controller: Controller,
-    event_rx: mpsc::Receiver<AppEvent>,
+    controller: Rc<Controller>,
+    session: Rc<RefCell<crate::session::ApplicationSession>>,
     state: UiState,
     url_input: Entity<InputState>,
     user_input: Entity<InputState>,
     password_input: Entity<InputState>,
     mount_input: Entity<InputState>,
     install_select: Entity<SelectState<Vec<SharedString>>>,
+    save_folder_input: Entity<InputState>,
+    save_file_input: Entity<InputState>,
+    save_game_select: Entity<SelectState<Vec<SharedString>>>,
     debounce_input: Entity<InputState>,
     debounce_input_applied: String,
     debounce_error: Option<String>,
@@ -161,8 +165,12 @@ struct RommfsWindow {
 }
 
 impl RommfsWindow {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (controller, event_rx) = Controller::spawn();
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        session: Rc<RefCell<crate::session::ApplicationSession>>,
+    ) -> Self {
+        let controller = session.borrow().controller();
 
         let url_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("http://romm.local:8080"));
@@ -180,6 +188,14 @@ impl RommfsWindow {
             .unwrap_or_else(|| "C:\\RomM".to_string());
         let mount_input = cx.new(|cx| InputState::new(window, cx).default_value(default_mount));
         let install_select =
+            cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
+        let save_folder_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Folder containing only save data"));
+        let save_file_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Relative path, for example switch/user/title/0")
+        });
+        let save_game_select =
             cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
         let debounce_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -262,13 +278,16 @@ impl RommfsWindow {
 
         let view = Self {
             controller,
-            event_rx,
+            session,
             state: UiState::new(LOG_CAP),
             url_input,
             user_input,
             password_input,
             mount_input,
             install_select,
+            save_folder_input,
+            save_file_input,
+            save_game_select,
             debounce_input,
             debounce_input_applied: rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string(),
             debounce_error: None,
@@ -291,11 +310,22 @@ impl RommfsWindow {
         let mut new_logs = false;
         let mut save_sync_updated = false;
         let mut changed = false;
-        while let Ok(event) = self.event_rx.try_recv() {
+        let events = self.session.borrow_mut().drain();
+        for event in events {
             if matches!(event, AppEvent::Log(_)) {
                 new_logs = true;
             }
             match &event {
+                AppEvent::SaveFileMappings {
+                    session_id, games, ..
+                } if *session_id == self.state.save_sync_session_id => {
+                    let items = games
+                        .iter()
+                        .map(|(id, name)| SharedString::from(format!("{id} · {name}")))
+                        .collect::<Vec<_>>();
+                    self.save_game_select
+                        .update(cx, |state, cx| state.set_items(items, window, cx));
+                }
                 AppEvent::SaveSyncUpdated { .. } | AppEvent::SaveSyncSessionChanged { .. } => {
                     save_sync_updated = true;
                 }
@@ -742,11 +772,29 @@ impl RommfsWindow {
         let locked = self.state.retrobat_setup_running
             || matches!(self.state.mount, MountState::Mounted | MountState::Mounting);
         v_flex().gap_3()
+            .child(section_heading("Background operation"))
+            .child(Button::new("start-at-login").label(if self.state.start_at_login { "Disable start at login" } else { "Enable start at login" })
+                .disabled(!cfg!(windows) || (!self.state.start_at_login && self.state.conn != ConnState::Connected))
+                .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::SetStartAtLogin { enabled: !view.state.start_at_login }); cx.notify(); })))
+            .child(muted("On Windows, closing the window hides RomMFS in the tray. Use tray Quit to stop background work. Login startup reconnects and mounts before resuming previously authorized save sync.",cx))
+            .when_some(self.state.startup_error.clone(),|this,error| this.child(error_line(error,cx)))
             .child(section_heading("Library layout"))
             .child(RadioGroup::horizontal("library-layout").children(["Generic folders", "RetroBat"])
                 .selected_index(Some(self.integration_choice)).disabled(locked)
                 .on_change(cx.listener(|view,index,_,cx| { view.integration_choice = *index; cx.notify(); })))
             .when(self.integration_choice == 1, |this| this
+                .child(h_flex().gap_2()
+                    .child(Button::new("download-retrobat").label("Download official installer")
+                        .disabled(self.state.installer_running)
+                        .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::DownloadRetroBatInstaller); cx.notify(); })))
+                    .child(Button::new("launch-retrobat-installer").label("Launch installer…")
+                        .disabled(!self.state.installer_ready || self.state.installer_running)
+                        .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::LaunchRetroBatInstaller); cx.notify(); })))
+                    .when(self.state.installer_running, |this| this.child(Button::new("cancel-retrobat-installer").label("Cancel download")
+                        .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::CancelRetroBatInstaller); cx.notify(); })))))
+                .when_some(self.state.installer_detail.clone(), |this,detail| this.child(muted(detail,cx)))
+                .when_some(self.state.installer_error.clone(), |this,error| this.child(error_line(error,cx)))
+                .when_some(self.state.installer_progress.1, |this,total| this.child(Progress::new("installer-progress").value(if total == 0 { 0. } else { 100. * self.state.installer_progress.0 as f32 / total as f32 })))
                 .child(field_column("RetroBat installation", Input::new(&self.retrobat_input).w_full(), cx))
                 .child(muted("Requires a fresh installation configured through RomMFS setup. Its ROM directory must be empty or already managed by RomMFS.",cx))
                 .child(field_column("Managed ROM folder", Input::new(&self.mount_input).w_full(), cx))
@@ -767,7 +815,14 @@ impl RommfsWindow {
                     let root = view.retrobat_input.read(cx).value().trim().to_owned();
                     view.controller.send(Command::SetIntegration { mode, retrobat_root: (!root.is_empty()).then(|| PathBuf::from(root)) });
                     cx.notify();
-                })))
+                    })))
+                .child(Button::new("materialize-auxiliary").label("Install library BIOS, keys and cheats")
+                    .disabled(locked || self.state.conn != ConnState::Connected)
+                    .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::MaterializeAuxiliary); cx.notify(); })))
+                .child(Button::new("cancel-auxiliary").label("Cancel auxiliary download")
+                    .disabled(!self.state.auxiliary_running)
+                    .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::CancelAuxiliary); cx.notify(); })))
+                .child(muted("Downloads user-library BIOS, individual Switch firmware/keys, and RetroArch .cht cheats. No archives are extracted, no unowned or modified file is overwritten, and these files are never save data. Stop emulators before continuing.",cx))
             .when(locked, |this| this.child(muted("Stop the mount before changing its layout.",cx)))
             .when_some(self.state.integration_error.clone(), |this,error| this.child(error_line(error,cx)))
             .when_some(self.state.retrobat_setup_detail.clone(), |this,detail| this.child(muted(detail,cx)))
@@ -897,8 +952,8 @@ impl RommfsWindow {
             .state
             .save_sync_profile_version
             .as_deref()
-            .map(|version| format!("RetroBat {version} · RetroArch / Gambatte · Game Boy"))
-            .unwrap_or_else(|| "RetroBat profile not verified".into());
+            .map(|version| format!("Save folder checked · {version}"))
+            .unwrap_or_else(|| "Choose a save folder".into());
         let scope = match (
             &self.state.save_sync_server_id,
             self.state.save_sync_account_id,
@@ -908,20 +963,6 @@ impl RommfsWindow {
                 self.user_input.read(cx).value()
             ),
             _ => "Server and account not verified".into(),
-        };
-        let (supported, skipped) = match self.state.save_sync_existing_saves.as_ref() {
-            Some(preview)
-                if matches!(
-                    preview.status,
-                    ExistingSaveScanStatus::Complete | ExistingSaveScanStatus::Partial
-                ) =>
-            {
-                (
-                    fmt_count(preview.supported_files),
-                    fmt_count(preview.skipped_files),
-                )
-            }
-            _ => ("—".into(), "—".into()),
         };
 
         v_flex()
@@ -1010,20 +1051,26 @@ impl RommfsWindow {
                             .child(div().truncate().child(saves_folder)),
                     ),
             )
+            .child(field_column("Custom save-data folder",Input::new(&self.save_folder_input).w_full(),cx))
+            .child(Button::new("choose-save-folder").label("Use save folder")
+                .disabled(self.state.conn != ConnState::Connected)
+                .on_click(cx.listener(|view,_,_,cx| {
+                    view.controller.send(Command::SelectSaveFolder { path: PathBuf::from(view.save_folder_input.read(cx).value().trim()) }); cx.notify();
+                })))
+            .child(muted("Select saves only, not an emulator's entire portable folder. All file formats and companions are supported. Shared saves and memory cards remain excluded.",cx))
             .child(muted(profile, cx))
             .child(muted(scope, cx))
             .child(div().text_sm().child(format!(
-                "{} mapped games · {} supported saves · {} skipped files",
+                "{} mapped files · {} unmatched files",
                 fmt_count(self.state.save_sync_mapped_targets),
-                supported,
-                skipped,
+                fmt_count(self.state.save_sync_catalogue_unmapped),
             )))
             .child(self.render_mapping_disclosure(window, cx))
             .child(muted(
-                "Existing saves are never replaced. Incoming differences are kept for review.",
+                "Changed files upload automatically. Remote-only changes replace an unchanged synchronized baseline; simultaneous changes and active files are kept for review. Local deletion never deletes remote saves.",
                 cx,
             ))
-            .child(muted_xs("Sync runs only while RomMFS is open.", cx))
+            .child(muted_xs("Sync continues while RomMFS runs, including in the tray.", cx))
     }
 
     fn render_mapping_disclosure(
@@ -1066,10 +1113,55 @@ impl RommfsWindow {
                 cx,
             ))
             .child(muted_xs(
-                "Preview only: gb/*.gb → gb/<visible ROM stem>.srm. RTC companions, .gbc, and other profiles are skipped. Existing remote differences require review.",
+                "Files are associated by a unique game filename, a server-provided save target, or an explicit file mapping. Paths and file bytes are preserved; ambiguous files are not guessed.",
                 cx,
             ))
             .child(muted_xs(existing_save_inventory_summary(existing_saves.as_ref()), cx));
+
+        if !self.state.save_file_games.is_empty() {
+            detail = detail
+                .child(section_heading("Map an unmatched file"))
+                .child(field_column(
+                    "Relative save path",
+                    Input::new(&self.save_file_input).w_full(),
+                    cx,
+                ))
+                .child(field_column(
+                    "Game",
+                    Select::new(&self.save_game_select)
+                        .w_full()
+                        .accessibility_label("Save file game")
+                        .placeholder("Select the owning game…"),
+                    cx,
+                ))
+                .child(
+                    Button::new("associate-save-file")
+                        .label("Map file")
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            let id = view
+                                .save_game_select
+                                .read(cx)
+                                .selected_value()
+                                .and_then(|s| s.split_once(" · "))
+                                .and_then(|(id, _)| id.parse::<i64>().ok());
+                            if let Some(rom_id) = id {
+                                view.controller.send(Command::AssociateSaveFile {
+                                    relative_path: PathBuf::from(
+                                        view.save_file_input.read(cx).value().trim(),
+                                    ),
+                                    rom_id,
+                                });
+                            }
+                            cx.notify();
+                        })),
+                );
+            for path in self.state.save_file_unmatched.iter().take(128) {
+                detail = detail.child(muted_xs(path.clone(), cx));
+            }
+            if self.state.save_file_unmatched.len() > 128 {
+                detail = detail.child(muted_xs(format!("{} more unmatched files; map a relative path above or choose a narrower save folder",self.state.save_file_unmatched.len()-128),cx));
+            }
+        }
 
         for path in preview {
             detail = detail.child(
@@ -1121,13 +1213,13 @@ impl RommfsWindow {
             });
             detail = detail
                 .child(
-                    div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Affected games"),
+                    div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Affected files"),
                 )
                 .child(
                     div()
                         .text_sm()
                         .child(format!(
-                            "{} mapped · {} reconciled · {} pending uploads · {} incoming · {} games need attention",
+                            "{} mapped · {} reconciled · {} pending uploads · {} incoming · {} files need attention",
                             queue.mapped_games,
                             queue.reconciled_games,
                             queue.pending_outbound,
@@ -1552,7 +1644,7 @@ fn fmt_bytes(n: u64) -> String {
 
 fn existing_save_inventory_summary(preview: Option<&ExistingSavePreview>) -> String {
     let Some(preview) = preview else {
-        return "Existing-save inventory not available until the path, profile, and catalogue are verified.".into();
+        return "Refresh to discover new or unmatched save files.".into();
     };
     let diagnostics = if preview.diagnostics.is_empty() {
         String::new()
@@ -1581,7 +1673,7 @@ fn existing_save_inventory_summary(preview: Option<&ExistingSavePreview>) -> Str
                 format!(" ({reasons})")
             };
             format!(
-                "Existing files ({completeness}): {} supported mapped SRAM files; {} skipped{skipped}.{diagnostics}",
+                "Existing files ({completeness}): {} recognized files; {} skipped{skipped}.{diagnostics}",
                 preview.supported_files, preview.skipped_files
             )
         }
@@ -1736,8 +1828,50 @@ pub fn run() {
                 KeyBinding::new("enter", ActivateControl, Some("Disclosure")),
                 KeyBinding::new("space", ActivateControl, Some("Disclosure")),
             ]);
+            let instance = match crate::desktop::Instance::acquire() {
+                Ok(Some(instance)) => instance,
+                Ok(None) => {
+                    cx.quit();
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("RomMFS could not establish single-instance ownership: {error}");
+                    cx.quit();
+                    return;
+                }
+            };
+            let session = Rc::new(RefCell::new(crate::session::ApplicationSession::new()));
+            let quit_session = session.clone();
+            let instance = Rc::new(instance);
+            let quit_instance = instance.clone();
+            cx.on_app_quit(move |_| {
+                let _instance = &quit_instance;
+                quit_session.borrow().shutdown();
+                std::future::ready(())
+            })
+            .detach();
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            let startup = std::env::args().any(|a| a == "--startup");
+            #[cfg(windows)]
+            let tray = match crate::desktop::tray::Tray::new() {
+                Ok(tray) => Some(tray),
+                Err(error) => {
+                    session.borrow().controller().sink().emit(AppEvent::log(
+                        Level::Error,
+                        "tray",
+                        format!("Tray unavailable; the window will stay accessible: {error}"),
+                    ));
+                    None
+                }
+            };
 
             let bounds = Bounds::centered(None, size(px(1160.0), px(920.0)), cx);
+            let view_session = session.clone();
             gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -1746,12 +1880,71 @@ pub fn run() {
                         title: Some("RomMFS".into()),
                         ..Default::default()
                     }),
+                    show: {
+                        #[cfg(windows)]
+                        {
+                            !startup || tray.is_none()
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            let _ = startup;
+                            true
+                        }
+                    },
                     ..Default::default()
                 },
                 cx,
-                |window, cx| cx.new(|cx| RommfsWindow::new(window, cx)),
+                move |window, cx| {
+                    #[cfg(windows)]
+                    {
+                        let hwnd = match raw_window_handle::HasWindowHandle::window_handle(window)
+                            .map(|h| h.as_raw())
+                        {
+                            Ok(raw_window_handle::RawWindowHandle::Win32(handle)) => {
+                                handle.hwnd.get() as usize
+                            }
+                            _ => panic!("Windows window has no HWND"),
+                        };
+                        crate::desktop::tray::set_window_icon(hwnd);
+                        if tray.is_some() {
+                            window.on_window_should_close(cx, move |_, _| {
+                                crate::desktop::tray::hide(hwnd);
+                                false
+                            });
+                        }
+                        let tray_session = view_session.clone();
+                        cx.spawn(async move |cx| {
+                            let _instance = instance;
+                            let mut tray = tray;
+                            loop {
+                                cx.background_executor().timer(POLL_INTERVAL).await;
+                                if let Some(tray) = &mut tray {
+                                    let status = tray_session.borrow().status();
+                                    tray.update_status(status);
+                                    for action in tray.actions() {
+                                        match action {
+                                            crate::desktop::tray::Action::Open => {
+                                                crate::desktop::tray::show(hwnd)
+                                            }
+                                            crate::desktop::tray::Action::Quit => {
+                                                cx.update(|cx| cx.quit());
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                        .detach();
+                    }
+                    #[cfg(not(windows))]
+                    let _instance = instance;
+                    cx.new(|cx| RommfsWindow::new(window, cx, view_session))
+                },
             )
             .expect("failed to open window");
-            cx.activate(true);
+            if !startup {
+                cx.activate(true);
+            }
         });
 }

@@ -1,10 +1,11 @@
 use rommfs_core::error::{Error, Result};
+#[cfg(test)]
+use rommfs_core::save_sync::sha256_content_hash;
 use rommfs_core::save_sync::{
-    ensure_no_reparse_components, hold_save_directory_chain, path_is_reparse_point,
-    sha256_content_hash, validate_windows_path_component, SaveSyncScope, MAX_SAVE_BYTES,
+    ensure_no_reparse_components, hash_save_content, hold_save_directory_chain,
+    path_is_reparse_point, validate_windows_path_component, SaveSyncScope,
 };
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
@@ -52,10 +53,168 @@ pub(super) fn publish_missing_save(
     approved_root: &Path,
     validate_before_publish: impl Fn() -> Result<()>,
 ) -> Result<()> {
+    let _parents = prepare_save_parent(target, approved_root)?;
     publish_no_clobber(staged, target, expected_hash, || {
         validate_save_destination(target, approved_root)?;
         validate_before_publish()
     })
+}
+
+fn prepare_save_parent(
+    target: &Path,
+    root: &Path,
+) -> Result<rommfs_core::save_sync::SaveDirectoryChainGuard> {
+    validate_destination_syntax(target)?;
+    target.strip_prefix(root).map_err(|_| {
+        Error::Unsupported("Save destination is outside the approved folder".into())
+    })?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| Error::Unsupported("Save destination has no parent".into()))?;
+    ensure_no_reparse_components(parent)?;
+    let existing = parent
+        .ancestors()
+        .find(|p| p.is_dir())
+        .ok_or_else(|| Error::Unsupported("Save folder has no existing ancestor".into()))?;
+    let mut guard = hold_save_directory_chain(existing)?;
+    let mut path = existing.to_path_buf();
+    for part in parent
+        .strip_prefix(existing)
+        .map_err(|_| Error::Unsupported("Save parent is invalid".into()))?
+        .components()
+    {
+        path.push(part.as_os_str());
+        match fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+        guard = hold_save_directory_chain(&path)?;
+    }
+    Ok(guard)
+}
+
+/// Preserve the old baseline at a journaled sibling path, then atomically
+/// create the new file without clobbering a concurrent emulator-created file.
+/// On Windows the baseline handle denies writers/deletion and is renamed by
+/// handle, not by a path that could be exchanged after verification.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn publish_changed_save(
+    staged: &Path,
+    target: &Path,
+    expected_hash: &str,
+    baseline_hash: &str,
+    backup: &Path,
+    root: &Path,
+    validate: impl Fn() -> Result<()>,
+) -> Result<()> {
+    let _parents = prepare_save_parent(target, root)?;
+    validate_save_destination(target, root)?;
+    validate()?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ,
+        };
+        options
+            .access_mode(FILE_GENERIC_READ | DELETE)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut baseline = options.open(target)?;
+    let metadata = baseline.metadata()?;
+    if !metadata.is_file()
+        || path_is_reparse_point(&metadata)
+        || hash_save_content(&mut baseline)? != baseline_hash
+    {
+        return Err(Error::Unsupported(
+            "Local save changed or is active; both versions were kept".into(),
+        ));
+    }
+    let sibling = flushed_sibling_copy(staged, target, expected_hash, &|| {
+        validate_save_destination(target, root)?;
+        validate()
+    })?;
+    let result = (|| {
+        validate()?;
+        ensure_no_reparse_components(backup)?;
+        if backup.exists() {
+            return Err(Error::Unsupported(
+                "Save backup already exists; review the previous interrupted replacement".into(),
+            ));
+        }
+        rename_baseline(&baseline, target, backup)?;
+        // Linux portable tests cannot establish emulator locks. Rehash the
+        // moved baseline as well; a changed file is never discarded.
+        use std::io::{Seek, SeekFrom};
+        baseline.seek(SeekFrom::Start(0))?;
+        if hash_save_content(&mut baseline)? != baseline_hash {
+            return Err(Error::Unsupported(format!(
+                "Save changed during replacement; its bytes are preserved at {}",
+                backup.display()
+            )));
+        }
+        validate()?;
+        atomic_create_only(&sibling, target)?;
+        sync_parent(target)
+    })();
+    drop(baseline);
+    if result.is_err() {
+        let _ = fs::remove_file(&sibling);
+        // Restore only into a missing target. Never overwrite a file that
+        // appeared during the interruption; preserve the backup for review.
+        if backup.exists() && !target.exists() {
+            let _ = atomic_create_only(backup, target);
+        }
+    }
+    result
+}
+
+fn rename_baseline(file: &File, source: &Path, backup: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
+        };
+        let name: Vec<u16> = backup.as_os_str().encode_wide().collect();
+        let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let length = offset + name.len() * 2;
+        let mut buffer = vec![0u64; length.div_ceil(8)];
+        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: u64 storage supplies FILE_RENAME_INFO alignment and enough
+        // initialized bytes for its trailing UTF-16 filename. The exclusive
+        // plain-file handle remains live throughout the synchronous call.
+        unsafe {
+            (*info).Anonymous.ReplaceIfExists = false;
+            (*info).RootDirectory = std::ptr::null_mut();
+            (*info).FileNameLength = (name.len() * 2) as u32;
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast::<u8>().add(offset).cast::<u16>(),
+                name.len(),
+            );
+            if SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileRenameInfo,
+                info.cast(),
+                length as u32,
+            ) == 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        let _ = source;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        fs::rename(source, backup).map_err(Error::Io)
+    }
 }
 
 pub(super) fn export_incoming(
@@ -206,19 +365,14 @@ fn flushed_sibling_copy(
             "private incoming stage is not a plain file".into(),
         ));
     }
-    let input = File::open(source)?;
+    let mut input = File::open(source)?;
     let metadata = input.metadata()?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_SAVE_BYTES {
+    if !metadata.is_file() {
         return Err(Error::Unsupported(
             "private incoming stage has an invalid size".into(),
         ));
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    input.take(MAX_SAVE_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.is_empty()
-        || bytes.len() as u64 > MAX_SAVE_BYTES
-        || sha256_content_hash(&bytes) != expected_hash
-    {
+    if hash_save_content(&mut input)? != expected_hash {
         return Err(Error::Unsupported(
             "private incoming stage failed size or SHA-256 verification".into(),
         ));
@@ -235,8 +389,16 @@ fn flushed_sibling_copy(
     let sibling = parent.join(format!(".{name}.rommfs-{}.tmp", Uuid::new_v4()));
     let mut file = private_create_new(&sibling)?;
     let write_result = (|| {
-        file.write_all(&bytes)?;
+        use std::io::{Seek, SeekFrom};
+        input.seek(SeekFrom::Start(0))?;
+        std::io::copy(&mut input, &mut file)?;
         file.sync_all()?;
+        let mut verify = File::open(&sibling)?;
+        if hash_save_content(&mut verify)? != expected_hash {
+            return Err(Error::Unsupported(
+                "Incoming file changed during publication staging".into(),
+            ));
+        }
         Ok::<_, Error>(())
     })();
     drop(file);
@@ -406,6 +568,49 @@ mod tests {
                 .extension()
                 .is_some_and(|extension| extension == "tmp")
         })
+    }
+
+    #[test]
+    fn baseline_replacement_preserves_concurrent_target_and_restores_on_cancellation() {
+        for concurrent in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("saves");
+            fs::create_dir(&root).unwrap();
+            let staged = directory.path().join("incoming.stage");
+            let target = root.join("ordinary.dat");
+            let backup = root.join(".ordinary.dat.rommfs-backup-test");
+            fs::write(&staged, b"remote update").unwrap();
+            fs::write(&target, b"baseline").unwrap();
+            let interrupted = AtomicBool::new(false);
+            let result = publish_changed_save(
+                &staged,
+                &target,
+                &sha256_content_hash(b"remote update"),
+                &sha256_content_hash(b"baseline"),
+                &backup,
+                &root,
+                || {
+                    if backup.exists() && !interrupted.swap(true, Ordering::SeqCst) {
+                        if concurrent {
+                            fs::write(&target, b"concurrent bytes")?;
+                        } else {
+                            return Err(Error::Cancelled);
+                        }
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert!(interrupted.load(Ordering::SeqCst));
+            if concurrent {
+                assert_eq!(fs::read(&target).unwrap(), b"concurrent bytes");
+                assert_eq!(fs::read(&backup).unwrap(), b"baseline");
+            } else {
+                assert_eq!(fs::read(&target).unwrap(), b"baseline");
+            }
+            assert_eq!(fs::read(&staged).unwrap(), b"remote update");
+            assert!(!has_publication_sibling(&root));
+        }
     }
 
     #[test]

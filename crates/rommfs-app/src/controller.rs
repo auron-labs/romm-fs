@@ -35,6 +35,10 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+mod auxiliary;
+mod installer;
+mod save_files;
+
 const EVICTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +83,16 @@ const MAX_DOWNLOAD_ROWS: usize = 128;
 
 /// Everything the window draws — derived ONLY from real worker events.
 pub struct UiState {
+    pub auxiliary_running: bool,
+    pub start_at_login: bool,
+    pub startup_error: Option<String>,
+    pub save_file_games: Vec<(i64, String)>,
+    pub save_file_unmatched: Vec<String>,
+    pub installer_running: bool,
+    pub installer_ready: bool,
+    pub installer_progress: (u64, Option<u64>),
+    pub installer_detail: Option<String>,
+    pub installer_error: Option<String>,
     pub integration: IntegrationMode,
     pub retrobat_root: Option<String>,
     pub integration_error: Option<String>,
@@ -134,6 +148,16 @@ pub struct UiState {
 impl UiState {
     pub fn new(log_cap: usize) -> Self {
         Self {
+            start_at_login: false,
+            auxiliary_running: false,
+            startup_error: None,
+            save_file_games: Vec::new(),
+            save_file_unmatched: Vec::new(),
+            installer_running: false,
+            installer_ready: false,
+            installer_progress: (0, None),
+            installer_detail: None,
+            installer_error: None,
             integration: IntegrationMode::Generic,
             retrobat_root: None,
             integration_error: None,
@@ -190,6 +214,44 @@ impl UiState {
     /// Apply one worker event. This is THE transition table the UI uses.
     pub fn apply(&mut self, event: &AppEvent) {
         match event {
+            AppEvent::AuxiliaryStatus {
+                running,
+                detail,
+                error,
+            } => {
+                self.auxiliary_running = *running;
+                self.retrobat_setup_running = *running;
+                self.retrobat_setup_detail = Some(detail.clone());
+                self.retrobat_setup_error = error.clone();
+            }
+            AppEvent::StartupPreference { enabled, error } => {
+                self.start_at_login = *enabled;
+                self.startup_error = error.clone();
+            }
+            AppEvent::SaveFileMappings {
+                session_id,
+                games,
+                unmatched,
+            } => {
+                if *session_id == self.save_sync_session_id {
+                    self.save_file_games = games.clone();
+                    self.save_file_unmatched = unmatched.clone();
+                }
+            }
+            AppEvent::RetroBatInstaller {
+                running,
+                ready,
+                received,
+                total,
+                detail,
+                error,
+            } => {
+                self.installer_running = *running;
+                self.installer_ready = *ready;
+                self.installer_progress = (*received, *total);
+                self.installer_detail = Some(detail.clone());
+                self.installer_error = error.clone();
+            }
             AppEvent::FrontendMetadata {
                 pending,
                 detail,
@@ -413,11 +475,9 @@ impl UiState {
                 if *session_id != self.save_sync_session_id {
                     return;
                 }
-                if let Some(existing) = self
-                    .save_sync_games
-                    .iter_mut()
-                    .find(|existing| existing.rom_id == game.rom_id)
-                {
+                if let Some(existing) = self.save_sync_games.iter_mut().find(|existing| {
+                    (existing.rom_id, existing.file_id) == (game.rom_id, game.file_id)
+                }) {
                     *existing = game.clone();
                 } else {
                     self.save_sync_games.push(game.clone());
@@ -449,6 +509,8 @@ impl UiState {
             }
             AppEvent::SaveSyncSessionChanged { session_id } => {
                 if *session_id >= self.save_sync_session_id {
+                    self.save_file_games.clear();
+                    self.save_file_unmatched.clear();
                     self.save_sync_session_id = *session_id;
                     self.save_sync_enabled = false;
                     self.save_sync_available = false;
@@ -626,6 +688,21 @@ impl UiState {
 
 /// Commands the window sends to the controller.
 pub enum Command {
+    CancelAuxiliary,
+    MaterializeAuxiliary,
+    SetStartAtLogin {
+        enabled: bool,
+    },
+    SelectSaveFolder {
+        path: PathBuf,
+    },
+    AssociateSaveFile {
+        relative_path: PathBuf,
+        rom_id: i64,
+    },
+    DownloadRetroBatInstaller,
+    CancelRetroBatInstaller,
+    LaunchRetroBatInstaller,
     SetupRetroBat {
         installation: PathBuf,
         managed_root: PathBuf,
@@ -678,6 +755,8 @@ fn invalidates_save_sync_scope(command: &Command) -> bool {
     matches!(
         command,
         Command::SetIntegration { .. }
+            | Command::SelectSaveFolder { .. }
+            | Command::AssociateSaveFile { .. }
             | Command::SetupRetroBat { .. }
             | Command::BeginPairing { .. }
             | Command::CancelPairing
@@ -698,7 +777,7 @@ pub struct Controller {
     sink: EventSink,
     cmd_tx: mpsc::Sender<CommandEnvelope>,
     // worker thread handle held for shutdown joining
-    worker: Option<JoinHandle<()>>,
+    worker: std::sync::Mutex<Option<JoinHandle<()>>>,
     save_sync_gate: SaveSyncCommandGate,
     connection_gate: SaveSyncCommandGate,
 }
@@ -741,7 +820,7 @@ impl Controller {
             Self {
                 sink,
                 cmd_tx,
-                worker: Some(worker),
+                worker: std::sync::Mutex::new(Some(worker)),
                 save_sync_gate,
                 connection_gate,
             },
@@ -778,16 +857,23 @@ impl Controller {
     pub fn sink(&self) -> EventSink {
         self.sink.clone()
     }
+    pub fn shutdown(&self) {
+        self.send(Command::Shutdown);
+        if let Some(worker) = self
+            .worker
+            .lock()
+            .expect("controller worker mutex poisoned")
+            .take()
+        {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl Drop for Controller {
-    /// Closing the app stops the worker and mount (PRD: no background
-    /// process survives the window).
+    /// The application session, not a visible window, owns shutdown.
     fn drop(&mut self) {
-        self.send(Command::Shutdown);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        self.shutdown();
     }
 }
 
@@ -809,7 +895,13 @@ struct PendingPairing {
 }
 
 struct Worker {
+    auxiliary_job: Option<auxiliary::AuxiliaryJob>,
+    startup_restoring: bool,
+    startup_requires_mount: bool,
+    save_file_rules: Option<rommfs_core::save_sync::SaveFileRules>,
+    installer: installer::InstallerJob,
     metadata_job: Option<mpsc::Receiver<Result<rommfs_core::retrobat::ArtworkBatch>>>,
+    metadata_handle: Option<JoinHandle<()>>,
     metadata_active: Option<Arc<std::sync::atomic::AtomicBool>>,
     metadata_source: Option<(Catalogue, CatalogueSnapshot)>,
     metadata_ready: Option<rommfs_core::retrobat::ArtworkBatch>,
@@ -826,6 +918,7 @@ struct Worker {
     catalogue_account: Option<String>,
     source_snapshot: Option<CatalogueSnapshot>,
     refresh_result: Option<mpsc::Receiver<Result<CatalogueSnapshot>>>,
+    refresh_handle: Option<JoinHandle<()>>,
     refresh_active: Option<Arc<std::sync::atomic::AtomicBool>>,
     catalogue_operation_id: u64,
     /// Latest complete projection, retained for warm remounts.
@@ -863,7 +956,13 @@ impl Worker {
     fn new_with_gate(sink: EventSink, save_sync_gate: SaveSyncCommandGate) -> Self {
         let current_save_sync_epoch = save_sync_gate.current_epoch();
         Self {
+            startup_restoring: false,
+            startup_requires_mount: false,
+            auxiliary_job: None,
+            save_file_rules: None,
+            installer: installer::InstallerJob::default(),
             metadata_job: None,
+            metadata_handle: None,
             metadata_active: None,
             metadata_source: None,
             metadata_ready: None,
@@ -881,6 +980,7 @@ impl Worker {
             catalogue_account: None,
             source_snapshot: None,
             refresh_result: None,
+            refresh_handle: None,
             refresh_active: None,
             catalogue_operation_id: 0,
             names: HashMap::new(),
@@ -949,12 +1049,19 @@ impl Worker {
     }
 
     fn refresh_save_sync(&mut self) {
+        if self.startup_restoring || (self.startup_requires_mount && self.mount.is_none()) {
+            return;
+        }
         self.refresh_save_sync_from(save_sync_discovery_input());
     }
 
     fn refresh_save_sync_from(&mut self, input: DiscoveryInput) {
         self.advance_save_sync_session();
         self.stop_save_sync_agent();
+        if self.preferences.is_some() {
+            self.refresh_save_files(input);
+            return;
+        }
         let discovery = discover_installations(input);
         let mut selected_problem = self.save_sync_settings_problem.clone();
         let mut selected_root = None;
@@ -1192,6 +1299,16 @@ impl Worker {
     }
 
     fn select_save_sync_installation(&mut self, path: &Path) {
+        if let Some(prefs) = self.preferences.as_mut() {
+            prefs.save_root = None;
+            // Selecting a save installation must not change the mounted
+            // library's integration capabilities or metadata destination.
+            if let Some(settings) = &self.connection_settings {
+                if let Err(e) = settings.save(prefs) {
+                    self.save_sync_runtime_problem = Some(e.to_string());
+                }
+            }
+        }
         self.stop_save_sync_agent();
         self.save_sync_enabled = false;
         self.save_sync_scope = None;
@@ -1228,10 +1345,13 @@ impl Worker {
                 && self
                     .save_sync_mapping_report
                     .as_ref()
-                    .is_some_and(|report| report.supported_count() > 0);
+                    .is_some_and(|report| {
+                        report.supported_count() > 0 || self.save_file_rules.is_some()
+                    });
             if !ready {
                 self.save_sync_runtime_problem = Some(
-                    "Enable refused: account, RetroBat 8.2.1 profile, and visible save mapping are not verified.".into(),
+                    "Enable refused: verify the account, save folder, and game mappings first."
+                        .into(),
                 );
                 self.refresh_save_sync();
                 return;
@@ -1255,7 +1375,12 @@ impl Worker {
                 enabled,
                 debounce_secs: self.save_sync_debounce_secs,
             };
-            if let Err(error) = settings.save(scope, settings_value) {
+            let saved = if self.save_file_rules.is_some() {
+                settings.save_files(scope, settings_value)
+            } else {
+                settings.save(scope, settings_value)
+            };
+            if let Err(error) = saved {
                 self.save_sync_runtime_problem =
                     Some(format!("Consent could not be saved: {error}"));
                 self.refresh_save_sync();
@@ -1282,13 +1407,16 @@ impl Worker {
             self.save_sync_settings.as_ref(),
             self.save_sync_scope.as_ref(),
         ) {
-            if let Err(error) = settings.save(
-                scope,
-                ConsentSettings {
-                    enabled: self.save_sync_enabled,
-                    debounce_secs: seconds,
-                },
-            ) {
+            let consent = ConsentSettings {
+                enabled: self.save_sync_enabled,
+                debounce_secs: seconds,
+            };
+            let saved = if self.save_file_rules.is_some() {
+                settings.save_files(scope, consent)
+            } else {
+                settings.save(scope, consent)
+            };
+            if let Err(error) = saved {
                 self.save_sync_runtime_problem =
                     Some(format!("Debounce could not be saved: {error}"));
             }
@@ -1411,6 +1539,7 @@ impl Worker {
             }
             games.push(SaveSyncGameStatus {
                 rom_id: mapping.rom_key.rom_id,
+                file_id: mapping.rom_key.file_id,
                 rom_name: mapping.visible_rom_name.clone(),
                 local_hash: slot.current_local_hash,
                 remote_id: slot.remote_slot_id,
@@ -1556,6 +1685,7 @@ impl Worker {
                     integration: IntegrationMode::Generic,
                     retrobat_root: None,
                     start_at_login: false,
+                    save_root: None,
                 });
             }
         }
@@ -1717,6 +1847,7 @@ impl Worker {
                 integration: IntegrationMode::Generic,
                 retrobat_root: None,
                 start_at_login: false,
+                save_root: None,
             });
         preferences.device_identifier = pairing.identifier.clone();
         // A credential-store failure leaves the authenticated in-memory session
@@ -1775,15 +1906,30 @@ impl Worker {
                 ));
             }
             self.sink.emit(AppEvent::Connecting);
+            self.startup_restoring =
+                std::env::args().any(|arg| arg == "--startup") && preferences.start_at_login;
+            self.startup_requires_mount = self.startup_restoring;
+            self.sink.emit(AppEvent::StartupPreference {
+                enabled: preferences.start_at_login,
+                error: None,
+            });
             self.accept_connection(client, &preferences.server, Some(identity));
-            if std::env::args().any(|arg| arg == "--startup") && preferences.start_at_login {
+            if self.startup_restoring {
                 if let Some(root) = &preferences.mount_root {
                     self.start_mount(&root.display().to_string());
+                }
+                self.startup_restoring = false;
+                if self.mount.is_some() {
+                    self.refresh_save_sync();
+                } else {
+                    self.log(Level::Warn,"startup","Automatic mount did not complete; save sync remains stopped. Open RomMFS to inspect the error.");
+                    self.sink.emit(AppEvent::StartupPreference { enabled:preferences.start_at_login,error:Some("Automatic mount did not complete. Start the mount before resuming save sync.".into()) });
                 }
             }
             Ok(())
         })();
         if let Err(error) = result {
+            self.startup_restoring = false;
             self.fail_connect(&error);
         }
         if self.client.is_none() {
@@ -1792,6 +1938,10 @@ impl Worker {
     }
 
     fn clear_active_connection(&mut self) {
+        self.startup_requires_mount = false;
+        self.startup_restoring = false;
+        self.cancel_auxiliary();
+        self.save_file_rules = None;
         self.cancel_pairing();
         self.stop_save_sync_agent();
         self.stop_mount();
@@ -1824,6 +1974,19 @@ impl Worker {
             Ok(())
         })();
         self.preferences = None;
+        if cfg!(windows) {
+            if let Err(e) = crate::desktop::set_start_at_login(false) {
+                self.log(
+                    Level::Warn,
+                    "startup",
+                    format!("Could not remove login startup entry: {e}"),
+                );
+            }
+        }
+        self.sink.emit(AppEvent::StartupPreference {
+            enabled: false,
+            error: None,
+        });
         if let Err(error) = result {
             self.log(
                 Level::Error,
@@ -1859,6 +2022,9 @@ impl Worker {
             active.store(false, std::sync::atomic::Ordering::Release);
         }
         self.metadata_job = None;
+        if let Some(handle) = self.metadata_handle.take() {
+            let _ = handle.join();
+        }
         self.metadata_ready = None;
         self.metadata_source = None;
         self.metadata_wait_reported = false;
@@ -1913,11 +2079,11 @@ impl Worker {
             "Caching frontend artwork without downloading ROMs",
             None,
         );
-        std::thread::spawn(move || {
+        self.metadata_handle = Some(std::thread::spawn(move || {
             let _ = tx.send(rommfs_core::retrobat::cache_artwork_cancellable(
                 &client, &catalogue, &roms, &cache, &active,
             ));
-        });
+        }));
     }
 
     fn poll_metadata(&mut self) {
@@ -1930,6 +2096,9 @@ impl Worker {
                 }
             };
             self.metadata_job = None;
+            if let Some(handle) = self.metadata_handle.take() {
+                let _ = handle.join();
+            }
             match result {
                 Ok(artwork) => self.metadata_ready = Some(artwork),
                 Err(error) => {
@@ -2044,6 +2213,7 @@ impl Worker {
     }
 
     fn setup_retrobat(&mut self, installation: &Path, managed_root: &Path) {
+        self.cancel_auxiliary();
         self.sink.emit(AppEvent::RetroBatSetup {
             running: true,
             detail: "Checking installation and ROM ownership".into(),
@@ -2099,6 +2269,7 @@ impl Worker {
     }
 
     fn set_integration(&mut self, mode: IntegrationMode, root: Option<PathBuf>) {
+        self.cancel_auxiliary();
         let previous = self.preferences.clone();
         let result: Result<()> = (|| {
             if self.mount.is_some() {
@@ -2257,9 +2428,9 @@ impl Worker {
         self.refresh_active = Some(active);
         let (tx, rx) = mpsc::channel();
         self.refresh_result = Some(rx);
-        std::thread::spawn(move || {
+        self.refresh_handle = Some(std::thread::spawn(move || {
             let _ = tx.send(fetch_catalogue(&client, &sink, operation_id));
-        });
+        }));
     }
 
     fn poll_catalogue_refresh(&mut self) {
@@ -2275,6 +2446,9 @@ impl Worker {
         };
         self.refresh_result = None;
         self.refresh_active = None;
+        if let Some(handle) = self.refresh_handle.take() {
+            let _ = handle.join();
+        }
         self.finish_catalogue_refresh(result);
     }
 
@@ -2283,6 +2457,9 @@ impl Worker {
             active.store(false, std::sync::atomic::Ordering::Release);
         }
         self.refresh_result = None;
+        if let Some(handle) = self.refresh_handle.take() {
+            let _ = handle.join();
+        }
     }
 
     fn finish_catalogue_refresh(&mut self, result: Result<CatalogueSnapshot>) {
@@ -2351,6 +2528,26 @@ impl Worker {
 
     fn start_mount(&mut self, path: &str) {
         let path = path.trim();
+        if self.auxiliary_job.is_some() {
+            self.fail_mount(
+                "wait for auxiliary downloads",
+                path,
+                &Error::Unsupported(
+                    "Finish or cancel auxiliary materialization before mounting".into(),
+                ),
+            );
+            return;
+        }
+        if self.save_sync_scope.as_ref().is_some_and(|scope| {
+            rommfs_core::save_sync::paths_overlap(Path::new(path), &scope.effective_saves_root)
+        }) {
+            self.fail_mount(
+                "check save-folder separation",
+                path,
+                &Error::Unsupported("ROM and save folders must not overlap".into()),
+            );
+            return;
+        }
         if self.mount.is_some() {
             // Duplicate starts can already be queued when the UI receives
             // MountStarting. Keep the real mounted state authoritative.
@@ -2496,6 +2693,13 @@ impl Worker {
             Ok(mount) => {
                 let mounted_path = mount.root.display().to_string();
                 self.mount = Some(mount);
+                if self.startup_requires_mount {
+                    self.startup_requires_mount = false;
+                    self.sink.emit(AppEvent::StartupPreference {
+                        enabled: self.preferences.as_ref().is_some_and(|p| p.start_at_login),
+                        error: None,
+                    });
+                }
                 self.fs = Some(fs);
                 if let Some(preferences) = &mut self.preferences {
                     preferences.mount_root = Some(root.clone());
@@ -2662,7 +2866,11 @@ fn worker_loop_with_interval_from(
         worker.poll_pairing();
         worker.poll_catalogue_refresh();
         worker.poll_metadata();
+        worker.installer.poll(&worker.sink);
+        worker.poll_auxiliary();
         let received = if worker.refresh_result.is_some()
+            || worker.auxiliary_job.is_some()
+            || worker.installer.is_running()
             || worker.pairing.is_some()
             || worker.metadata_job.is_some()
             || worker.metadata_ready.is_some()
@@ -2684,6 +2892,8 @@ fn worker_loop_with_interval_from(
             Ok(envelope) => envelope,
             Err(mpsc::RecvTimeoutError::Timeout)
                 if worker.refresh_result.is_some()
+                    || worker.auxiliary_job.is_some()
+                    || worker.installer.is_running()
                     || worker.pairing.is_some()
                     || worker.metadata_job.is_some()
                     || worker.metadata_ready.is_some() =>
@@ -2708,6 +2918,23 @@ fn worker_loop_with_interval_from(
         // Commands run one at a time on the worker thread; UI stays
         // responsive while network/filesystem work blocks here.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &cmd {
+            Command::CancelAuxiliary => worker.cancel_auxiliary(),
+            Command::MaterializeAuxiliary => worker.materialize_auxiliary(),
+            Command::SetStartAtLogin { enabled } => worker.set_start_at_login(*enabled),
+            Command::SelectSaveFolder { path } => worker.select_save_folder(path),
+            Command::AssociateSaveFile {
+                relative_path,
+                rom_id,
+            } => worker.associate_save_file(relative_path, *rom_id),
+            Command::DownloadRetroBatInstaller => {
+                let directory = worker
+                    .save_sync_storage_dir
+                    .as_ref()
+                    .map(|p| p.join("installers"));
+                worker.installer.download(directory, &worker.sink);
+            }
+            Command::CancelRetroBatInstaller => worker.installer.cancel(&worker.sink),
+            Command::LaunchRetroBatInstaller => worker.installer.launch(&worker.sink),
             Command::SetupRetroBat {
                 installation,
                 managed_root,
@@ -2740,6 +2967,8 @@ fn worker_loop_with_interval_from(
                 destination,
             } => worker.export_save_sync_incoming(*session_id, incoming_id, destination),
             Command::Shutdown => {
+                worker.cancel_auxiliary();
+                worker.installer.cancel(&worker.sink);
                 worker.cancel_pairing();
                 worker.cancel_catalogue_refresh();
                 worker.stop_save_sync_agent();
@@ -2777,12 +3006,31 @@ fn worker_loop_with_interval_from(
                 | Command::SetSaveSyncEnabled { .. }
                 | Command::SetSaveSyncDebounce { .. }
                 | Command::ExportSaveSyncIncoming { .. } => {}
+                Command::SelectSaveFolder { .. } | Command::AssociateSaveFile { .. } => {}
                 Command::Shutdown => {}
+                Command::MaterializeAuxiliary => {}
+                Command::CancelAuxiliary => {}
+                Command::SetStartAtLogin { .. } => {}
+                Command::DownloadRetroBatInstaller
+                | Command::CancelRetroBatInstaller
+                | Command::LaunchRetroBatInstaller => {}
             }
         }
         if shutdown {
             break;
         }
+    }
+    worker.cancel_auxiliary();
+    worker.cancel_catalogue_refresh();
+    worker.cancel_metadata();
+    if worker.save_sync_agent.is_some() {
+        worker.stop_save_sync_agent();
+    }
+    if worker.mount.is_some() {
+        worker.stop_mount();
+    }
+    if worker.installer.is_running() {
+        worker.installer.cancel(&worker.sink);
     }
 }
 
@@ -2916,6 +3164,7 @@ fn stopped_retrobat_guard(installation: &Path) -> anyhow::Result<Vec<std::fs::Fi
             "emulationstation/emulationstation.exe",
             "emulators/eden/eden.exe",
             "emulators/citron/citron.exe",
+            "emulators/retroarch/retroarch.exe",
         ] {
             let path = installation.join(relative);
             rommfs_core::save_sync::ensure_no_reparse_components(&path)?;
@@ -3139,6 +3388,36 @@ fn log_line(level: Level, op: &'static str, message: String) -> rommfs_core::eve
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn application_owner_keeps_worker_alive_after_view_handle_drops_and_quit_joins_once() {
+        let (sink, _events) = rommfs_core::events::channel();
+        let (cmd_tx, commands) = mpsc::channel::<CommandEnvelope>();
+        let (facts, observed) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            for envelope in commands {
+                let stopping = matches!(envelope.command, Command::Shutdown);
+                facts.send(stopping).unwrap();
+                if stopping {
+                    break;
+                }
+            }
+        });
+        let application = std::rc::Rc::new(Controller {
+            sink,
+            cmd_tx,
+            worker: std::sync::Mutex::new(Some(worker)),
+            save_sync_gate: SaveSyncCommandGate::new(),
+            connection_gate: SaveSyncCommandGate::new(),
+        });
+        let view = application.clone();
+        drop(view);
+        application.send(Command::StopMount);
+        assert!(!observed.recv_timeout(Duration::from_secs(2)).unwrap());
+        application.shutdown();
+        assert!(observed.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert!(application.worker.lock().unwrap().is_none());
+        application.shutdown();
+    }
     use super::*;
     use rommfs_core::cache::{CacheIndex, FakeClock, LiveState, NoopHydratedRemover};
     use rommfs_core::download::ContentSource;
@@ -3294,6 +3573,36 @@ mod tests {
         }
         assert!(!state.frontend_metadata_pending);
         assert!(state.frontend_metadata_error.is_none());
+    }
+
+    #[test]
+    fn changing_accounts_drains_catalogue_and_artwork_threads_before_returning() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let (sink, _events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        let completed = Arc::new(AtomicUsize::new(0));
+        for artwork in [true, false] {
+            let active = Arc::new(AtomicBool::new(true));
+            let flag = active.clone();
+            let done = completed.clone();
+            let handle = std::thread::spawn(move || {
+                while flag.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                done.fetch_add(1, Ordering::SeqCst);
+            });
+            if artwork {
+                worker.metadata_active = Some(active);
+                worker.metadata_handle = Some(handle);
+            } else {
+                worker.refresh_active = Some(active);
+                worker.refresh_handle = Some(handle);
+            }
+        }
+        worker.clear_active_connection();
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+        assert!(worker.metadata_handle.is_none());
+        assert!(worker.refresh_handle.is_none());
     }
 
     impl ContentSource for UnusedSource {
@@ -3544,9 +3853,9 @@ mod tests {
         }
         assert!(!enabled);
         assert_eq!(debounce_secs, rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS);
-        assert!(problem.unwrap().contains(
-            "account, RetroBat 8.2.1 profile, and visible save mapping are not verified"
-        ));
+        assert!(problem
+            .unwrap()
+            .contains("verify the account, save folder, and game mappings first"));
     }
 
     #[test]
@@ -3849,7 +4158,7 @@ mod tests {
             effective_saves_root: save_root,
         };
         settings
-            .save(
+            .save_files(
                 &scope,
                 ConsentSettings {
                     enabled: true,
@@ -3857,6 +4166,32 @@ mod tests {
                 },
             )
             .unwrap();
+
+        let path = PathBuf::from("gb/Game.srm");
+        let mapping = rommfs_core::save_sync::SaveMapping {
+            rom_key: rommfs_core::save_sync::save_file_key(&scope.server_id, 7, &path).unwrap(),
+            profile: rommfs_core::save_sync::SaveProfile::ordinary_files(),
+            target_path: scope.effective_saves_root.join(&path),
+            relative_path: path,
+            visible_rom_name: "Game.gb".into(),
+            legacy_compatible: true,
+        };
+        let mut journal = SaveSyncJournal::open(
+            settings_dir.join("save-sync-journal.db"),
+            settings_dir.join("save-sync-snapshots"),
+            scope.clone(),
+        )
+        .unwrap();
+        journal
+            .reconcile_mappings(&rommfs_core::save_sync::MappingReport {
+                mappings: vec![mapping.clone()],
+                ..Default::default()
+            })
+            .unwrap();
+        journal
+            .confirm_mapping(&mapping.rom_key, &mapping.relative_path)
+            .unwrap();
+        drop(journal);
 
         let (sink, events) = rommfs_core::events::channel();
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -3875,7 +4210,7 @@ mod tests {
         let controller = Controller {
             sink,
             cmd_tx,
-            worker: Some(worker),
+            worker: std::sync::Mutex::new(Some(worker)),
             save_sync_gate: gate,
             connection_gate: SaveSyncCommandGate::new(),
         };
@@ -3978,7 +4313,13 @@ mod tests {
                 Arc::new(FakeClock::new(100)),
             ));
             let worker = Worker {
+                auxiliary_job: None,
+                startup_restoring: false,
+                startup_requires_mount: false,
+                save_file_rules: None,
+                installer: installer::InstallerJob::default(),
                 metadata_job: None,
+                metadata_handle: None,
                 metadata_active: None,
                 metadata_source: None,
                 metadata_ready: None,
@@ -3995,6 +4336,7 @@ mod tests {
                 catalogue_account: None,
                 source_snapshot: None,
                 refresh_result: None,
+                refresh_handle: None,
                 refresh_active: None,
                 catalogue_operation_id: 0,
                 names: HashMap::from([(key, "game.nes".into())]),
@@ -4268,6 +4610,7 @@ mod tests {
             integration: IntegrationMode::Generic,
             retrobat_root: None,
             start_at_login: false,
+            save_root: None,
         };
         worker
             .connection_settings
@@ -4305,6 +4648,7 @@ mod tests {
             integration: IntegrationMode::Generic,
             retrobat_root: None,
             start_at_login: false,
+            save_root: None,
         });
         worker.set_integration(IntegrationMode::RetroBat, Some(directory.path().into()));
         assert_eq!(

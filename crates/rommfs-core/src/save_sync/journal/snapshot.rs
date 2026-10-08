@@ -1,6 +1,6 @@
 use super::super::mapping::SaveMapping;
 use super::super::path::{
-    ensure_no_rtc_companion, is_reparse_point, open_save_read, MAX_SAVE_BYTES,
+    ensure_no_rtc_companion, is_reparse_point, open_save_read_for, MAX_SAVE_BYTES,
 };
 use super::super::settings::windows_path_key;
 use super::mapping::query_local_state;
@@ -41,10 +41,12 @@ impl SaveSyncJournal {
         let revision = Uuid::new_v4().to_string();
         let temporary_path = self.private_root.join(format!("{revision}.tmp"));
         let snapshot_path = self.private_root.join(format!("{revision}.snapshot"));
-        let actual_hash = match copy_save_snapshot(
+        let ordinary = mapping.profile.id == crate::save_sync::GENERIC_FILE_PROFILE;
+        let actual_hash = match copy_save_snapshot_for(
             &self.scope.effective_saves_root,
             &mapping.relative_path,
             &temporary_path,
+            ordinary,
         ) {
             Ok(hash) => hash,
             Err(error) => {
@@ -58,11 +60,13 @@ impl SaveSyncJournal {
                 "save content changed during snapshot capture; capture remains dirty".into(),
             ));
         }
-        if let Err(error) =
-            ensure_no_rtc_companion(&self.scope.effective_saves_root, &mapping.relative_path)
-        {
-            remove_if_present(&temporary_path)?;
-            return Err(error);
+        if !ordinary {
+            if let Err(error) =
+                ensure_no_rtc_companion(&self.scope.effective_saves_root, &mapping.relative_path)
+            {
+                remove_if_present(&temporary_path)?;
+                return Err(error);
+            }
         }
 
         if let Err(error) = self.prepare_snapshot(
@@ -805,33 +809,33 @@ fn artifact_name(path: &Path, revision: &str, extension: &str) -> Result<String>
 
 pub(super) fn hash_reader(reader: &mut impl Read) -> Result<String> {
     let mut hasher = Sha256::new();
-    let mut total = 0u64;
     let mut buffer = [0u8; 16 * 1024];
     loop {
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
-        total += read as u64;
-        if total > MAX_SAVE_BYTES {
-            return Err(Error::Unsupported(format!(
-                "Game Boy SRAM exceeds the {MAX_SAVE_BYTES}-byte capture limit"
-            )));
-        }
         hasher.update(&buffer[..read]);
-    }
-    if total == 0 {
-        return Err(Error::Unsupported("Game Boy SRAM is empty".into()));
     }
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
+#[cfg(test)]
 pub(super) fn copy_save_snapshot(
     root: &Path,
     relative_path: &Path,
     temporary: &Path,
 ) -> Result<String> {
-    let mut source = open_save_read(root, relative_path)?;
+    copy_save_snapshot_for(root, relative_path, temporary, false)
+}
+
+fn copy_save_snapshot_for(
+    root: &Path,
+    relative_path: &Path,
+    temporary: &Path,
+    ordinary: bool,
+) -> Result<String> {
+    let mut source = open_save_read_for(root, relative_path, ordinary)?;
     let mut destination = private_create_new(temporary)?;
     let mut hasher = Sha256::new();
     let mut total = 0u64;
@@ -842,7 +846,7 @@ pub(super) fn copy_save_snapshot(
             break;
         }
         total += read as u64;
-        if total > MAX_SAVE_BYTES {
+        if !ordinary && total > MAX_SAVE_BYTES {
             return Err(Error::Unsupported(format!(
                 "Game Boy SRAM exceeds the {MAX_SAVE_BYTES}-byte capture limit"
             )));
@@ -850,7 +854,7 @@ pub(super) fn copy_save_snapshot(
         destination.write_all(&buffer[..read])?;
         hasher.update(&buffer[..read]);
     }
-    if total == 0 {
+    if !ordinary && total == 0 {
         return Err(Error::Unsupported("Game Boy SRAM is empty".into()));
     }
     destination.sync_all()?;
@@ -874,11 +878,7 @@ fn path_has_hash(path: &Path, expected_hash: &str) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    if !metadata.is_file()
-        || is_reparse_point(&metadata)
-        || metadata.len() == 0
-        || metadata.len() > MAX_SAVE_BYTES
-    {
+    if !metadata.is_file() || is_reparse_point(&metadata) {
         return Ok(false);
     }
     let mut file = match open_private_snapshot(path) {
@@ -893,7 +893,7 @@ fn path_has_hash(path: &Path, expected_hash: &str) -> Result<bool> {
     Ok(hash_reader(&mut file)? == expected_hash)
 }
 
-fn open_private_snapshot(path: &Path) -> std::io::Result<File> {
+pub(super) fn open_private_snapshot(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(windows)]

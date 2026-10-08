@@ -2,8 +2,13 @@
 //! (GPUI window itself stays in main/window and is not required for tests).
 
 pub mod controller;
+mod desktop;
+#[cfg(windows)]
+mod icon;
 mod save_sync_agent;
 #[cfg(windows)]
 mod save_sync_native;
+#[cfg(feature = "ui")]
+mod session;
 #[cfg(feature = "ui")]
 pub mod window;

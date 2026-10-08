@@ -22,6 +22,8 @@ pub struct ConnectionPreferences {
     pub retrobat_root: Option<PathBuf>,
     #[serde(default)]
     pub start_at_login: bool,
+    #[serde(default)]
+    pub save_root: Option<PathBuf>,
 }
 
 pub struct ConnectionSettings(Connection);

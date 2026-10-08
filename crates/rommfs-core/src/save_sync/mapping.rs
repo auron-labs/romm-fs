@@ -21,6 +21,14 @@ pub struct SaveProfile {
 }
 
 impl SaveProfile {
+    pub fn ordinary_files() -> Self {
+        Self {
+            id: super::GENERIC_FILE_PROFILE,
+            system_dir: "",
+            rom_extension: "",
+            save_extension: "",
+        }
+    }
     pub(super) fn gameboy() -> Self {
         Self {
             id: RETROBAT_GB_SRM_PROFILE,
@@ -40,6 +48,26 @@ pub struct SaveMapping {
     /// Exact target for preview. It is not created by mapping.
     pub target_path: PathBuf,
     pub visible_rom_name: String,
+    /// Only the uniquely recoverable original GB SRAM may read a legacy slot.
+    pub legacy_compatible: bool,
+}
+
+impl SaveMapping {
+    pub fn accepts_remote_slot(&self, slot: Option<&str>) -> bool {
+        self.remote_slot().ok().as_deref() == slot
+            || (self.legacy_slot().is_some() && self.legacy_slot() == slot)
+    }
+    pub fn legacy_slot(&self) -> Option<&'static str> {
+        (self.profile.id == super::GENERIC_FILE_PROFILE && self.legacy_compatible)
+            .then_some(RETROBAT_GB_SRM_PROFILE)
+    }
+    pub fn remote_slot(&self) -> Result<String> {
+        if self.profile.id == super::GENERIC_FILE_PROFILE {
+            super::file_slot(&self.relative_path)
+        } else {
+            Ok(self.profile.id.into())
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,6 +213,7 @@ pub fn map_catalogue(catalogue: &Catalogue, effective_saves_root: &Path) -> Resu
             target_path,
             relative_path,
             visible_rom_name: entry.file_name.clone(),
+            legacy_compatible: false,
         });
     }
     report

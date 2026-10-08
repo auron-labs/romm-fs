@@ -88,7 +88,7 @@ come from the catalogue, not from an invented nested content URL.
   pairing again; password OAuth token refresh semantics do not apply to them.
 - `GET /api/users/me` verifies the numeric account before cached metadata is
   restored. Snapshots are scoped by normalized server and account, not username.
-- Requested scopes: `platforms.read roms.read me.read assets.read assets.write`.
+- Requested scopes: `platforms.read roms.read me.read assets.read assets.write firmware.read`.
   Missing optional save permissions pause saves rather than granting consent.
 - Only paired secrets are stored in Windows Credential Manager. Preferences are
   nonsecret SQLite data. Passwords are not persisted; Linux has no plaintext
@@ -123,8 +123,9 @@ Sources: [ROM schema](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a86
 | Switch update/DLC `.nsp` | ROM file category `update`/`dlc`, original route | `_library/<category>/<rom_id>/...` | Flat `switchupdates` | No |
 | Other auxiliary categories | ROM file category, original route | `_library/<category>/<rom_id>/...` | Specific unsupported-destination diagnostic | No |
 | Covers/screenshots | Catalogue resource paths | Not published | Local `.rommfs-artwork` and gamelist references | Media references only |
-| BIOS/keys/firmware/cheats outside ROM tree | Dedicated library/API and destination contract unresolved | No automatic materialization | **Not implemented**; do not invent ROM-file routes for BIOS inventories | No |
-| Save files | `/api/saves` inventory/upload/content; see below | Generalized sync not implemented | Existing opt-in GB profile only | No |
+| RetroArch `.cht` cheats | ROM-file category `cheat`, original route | Retained `_library` auxiliary | Explicit materialization into effective `cheats/retroarch/<platform>/<relative>` | No |
+| BIOS/keys/firmware | `GET /api/firmware`, `/api/firmware/{id}/content/{file_name}`; `firmware.read` | No external automatic placement | Explicit materialization: effective BIOS folder; Switch portable Eden/Citron keys or NAND registered directory | No |
+| Save files | `/api/saves` inventory/upload/content; see below | Opt-in save-data folder | Opt-in effective saves folder or custom root | No |
 
 Current save-client routes are `GET /api/saves?rom_id=&slot=`, multipart
 `POST /api/saves?rom_id=&slot=&emulator=&overwrite=false&autocleanup=false`
@@ -134,9 +135,35 @@ slot and missing-file status. See `crates/rommfs-core/src/romm/saves.rs`.
 
 Save uploads sanitize/rewrite filenames, including a timestamp tag when `slot`
 is supplied. A local journal is not enough to preserve remote relative paths.
-The generalized remote identity/path representation and clean-second-client
-reconstruction remain implementation dependencies; nested/companion/large-save
-round-trips must not be claimed complete.
+Ordinary-file slots use `rommfs-file-v2:<canonical relative path>` (forward
+slashes). RomM stores the slot unchanged, independently of sanitized/timestamped
+filenames. The database limits slots to 255 characters; the client rejects
+overlong/unsafe paths rather than truncating. Uploaded UUID `.bin` filenames
+identify revisions, not destinations. Clean-client fixtures reconstruct nested,
+companion, extensionless, empty and >1 MiB files from slots and content alone.
+`GET /api/saves` without a game/slot filter returns the current user's saves,
+enabling one account-wide discovery request rather than one request per game.
+Per-file reconciliation still filters by game and slot. Legacy GB slots are
+recognized for a single known GB filename; migration retains queued revisions
+and baselines, but requires new broader-scope consent.
+
+`save_target` and `save_target_layout` in the ROM catalogue supply file/folder
+association rules. Unknown/split layouts and ambiguous title matches require
+explicit local mapping. No save format is parsed. Source:
+[save endpoints](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/endpoints/saves.py),
+[slot limits](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/models/assets.py).
+
+Firmware DTOs retain ID, platform ID, filename, byte size, missing flag and
+update timestamp. Server `file_path` is not a trusted local destination.
+Only unpacked Switch `.nca` files and key files are placed in portable emulator
+folders; firmware archives and unknown cheat formats get explicit diagnostics.
+Ownership/version publication never overwrites an unowned or modified file;
+changed server auxiliary versions require explicit removal of the unchanged
+owned local file before rematerialization. Firmware inventory failures do not
+prevent independently supported cheats from being installed. Sources:
+[firmware endpoints](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/endpoints/firmware.py),
+[firmware schema](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/endpoints/responses/firmware.py),
+[RetroArch cheat destination](https://github.com/RetroBat-Official/emulatorlauncher/blob/af2dc472fecfaadf851ecf0e92d1e4eb7c519b31/emulatorLauncher/Generators/LibRetro.Generator.cs).
 
 ## Library scan (test-harness only, not app scope)
 

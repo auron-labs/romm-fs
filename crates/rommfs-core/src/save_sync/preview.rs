@@ -361,6 +361,7 @@ mod tests {
             relative_path: PathBuf::from("gb/Game.srm"),
             target_path: root.join("gb/Game.srm"),
             visible_rom_name: "Game.gb".into(),
+            legacy_compatible: false,
         };
         MappingReport {
             mappings: vec![mapping],

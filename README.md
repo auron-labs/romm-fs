@@ -10,8 +10,8 @@ through a custom `windows-sys` adapter and shows one small **GPUI** window.
 No separately installed filesystem driver or ProjFS optional feature is required.
 This checkout is under development. Native Windows runtime behavior is **not
 yet verified**; portable tests and cross-target checking are not runtime evidence.
-Installer automation, generalized save sync, external BIOS/cheat materialization,
-and tray/start-at-login remain unfinished. See
+Implementation includes remembered sessions, verified installer downloads,
+ordinary-file saves, supported auxiliary materialization, and Windows tray/login startup. See
 [implementation status](.planning/IMPLEMENTATION-STATUS.md).
 
 ## Workspace
@@ -58,9 +58,13 @@ native sharing/dehydration failures defer eviction while files are in use.
 While mounted, NTFS also stores hydrated ROM bytes; eviction must dehydrate
 that copy before removing the private cache. Allow disk space for both copies.
 
-Closing the window currently stops the mount; tray/start-at-login is not yet
-implemented. Passwords and tokens are never logged. Logout removes the remembered
-sign-in and cancels its active work.
+On Windows, closing the window hides it while mounting and save sync continue.
+The tray offers status, Open and Quit; **Quit** drains workers and stops the mount.
+If the tray cannot be created, closing the visible window quits instead.
+**Settings → Enable start at login** requires remembered browser sign-in and
+launches in the tray, reconnects, mounts, then resumes the same enabled save scope.
+Passwords and tokens are never logged. Logout removes remembered sign-in and
+the login-startup entry, and cancels its active work.
 
 Authentication precedes cached-catalogue restoration. A warm connection uses the
 last complete account-scoped snapshot and schedules one background refresh.
@@ -132,9 +136,14 @@ instant (metadata only); the first launch of a game downloads its file once.
 > The RetroBat integration requires a fresh installation configured through
 > RomMFS setup. Its ROM directory must be empty or already managed by RomMFS.
 
-Install RetroBat from its [official releases](https://github.com/RetroBat-Official/retrobat/releases)
-and stop RetroBat and its emulators. Installer download/execution automation is
-not yet available in RomMFS. Compatible versions are accepted by required layout,
+In **Settings → RetroBat**, use **Download official installer** and then
+**Launch installer…**, or select a fresh installation you installed separately.
+RomMFS discovers the latest stable official Windows package, streams its bytes,
+checks the release size and SHA-256 digest, and rechecks integrity before launch.
+Cancel a download in RomMFS; cancel installation inside the official wizard.
+RomMFS does not guess unattended switches, terminate a writing installer, or
+remove partial installation files. Stop RetroBat and its emulators before setup.
+Compatible versions are accepted by required layout,
 not version equality; 8.2.1 is the source/package research reference.
 
 In **Settings**, select RetroBat, choose its installation and a separate managed
@@ -163,9 +172,23 @@ gamelist. Switch update/DLC `.nsp` files go in flat `switchupdates` and are not
 listed as launchable games. Actual RetroBat loading and Windows ACL protection
 remain awaiting native validation.
 
+**Install library BIOS, keys and cheats** is an explicit separate action while
+the mount and emulators are stopped. It uses RomM's `firmware.read` inventory for
+ordinary BIOS files, Switch `prod.keys`/`title.keys`, and unpacked `.nca` firmware.
+Switch content goes into installed Eden/Citron portable user folders; ordinary
+BIOS goes into the effective RetroBat BIOS folder. ROM-file category `cheat`
+supports RetroArch `.cht` files in the effective `cheats/retroarch` directory.
+Archives are not extracted. Unsupported emulator cheat formats are reported.
+Use **Cancel auxiliary download**, Logout or Quit to cancel and drain the job;
+already completed owned files remain, and partial files are not published.
+An ownership/version index under `.rommfs-auxiliary` makes repeats safe. Unowned,
+emulator-modified, or changed-version files are preserved and reported; installing
+a changed server version requires explicitly removing the unchanged owned file
+and rerunning the action. These directories are excluded from save sync.
+
 ## Optional save sync
 
-Save sync is **off by default**. Select a discovered RetroBat installation,
+Save sync is **off by default**. Choose a save-data folder or a RetroBat installation,
 check the displayed server, authenticated account, effective saves folder,
 existing-file supported/skipped counts, mapped game target count, and target
 path preview, then explicitly enable it.
@@ -181,32 +204,36 @@ previously selected path is shown first even if discovery does not return it,
 and **Browse…** can select an installation discovery missed. A missing prior
 selection stays selected and paused rather than silently switching to another.
 Sync runs only while this app is open, connected, authenticated, and opted in.
-It is not a daemon/autostart task. The explicit RetroBat setup action described
+It runs in the app session, including while the window is hidden. The explicit RetroBat setup action described
 above is separate from enabling saves. The account needs RomM `platforms.read` and
 `roms.read` for existing ROM features, plus `me.read`, `assets.read`, and
 `assets.write` for network save sync; exporting a save already staged locally
 does not make save API requests or require those save scopes.
 
-Generalized ordinary-file save sync is **not yet implemented**. The current
-supported profile was researched against RetroBat 8.2.1 using
-RetroArch/Gambatte for Game Boy. It maps visible catalogue `.gb` ROMs to
-`gb/<visible ROM stem>.srm`; `.gbc`, Gambatte `.rtc` sidecars, ambiguous names,
-save states, memory cards, multi-file ROMs, compressed/converted saves, and
-other profiles are excluded. RetroArch settings and launcher overrides are
-read to resolve the effective saves folder before sync can be enabled.
-Before consent, the preview separately reports mapped game targets and counts
-existing save filenames using filesystem metadata only. The walk is bounded to
-4096 entries and eight directory levels; it never opens or hashes save contents,
-creates a missing saves folder, or makes save API requests. Partial or unavailable
-scans are labelled as such rather than shown as a complete zero-file result.
+All ordinary file formats are accepted, including companions, extensionless,
+empty and large files, and multiple/nested files per game. Bytes are streamed
+without emulator-format conversion or a 1 MiB limit. Select **save data only**,
+not an emulator's entire portable folder. Shared saves and shared memory cards
+remain unsupported; known shared-card folders are conservatively excluded.
+Automatic association uses a unique game filename or a
+server-provided save target; use **Map an unmatched file** for ambiguous paths.
+Before consent, scanning inspects filenames only, without reading save contents
+or calling save APIs. It refuses redirected/unsafe paths and stops with an
+explicit error above 100,000 directory entries. File paths must fit RomM's
+255-character slot contract; overlong paths are reported, never truncated.
+Existing SRAM-only consent cannot enable the broader scope. Matching legacy
+journal records retain baselines, removals, incoming files and queued snapshots.
 
 Uploads use immutable local snapshots, per-generation UUID filenames, and
 RomM's `overwrite=false&autocleanup=false` request options. These prevent
 client-requested replacement/automatic cleanup, but are not a promise that a
 server retains every remote version: server-side retention can prune history
 (RomM 5.3.1, for example, can enforce a 50-save per-ROM/emulator/user limit).
-Incoming content is installed only if that local target has never existed.
-Existing local files are kept for review alongside incoming content. A previously
+Incoming content creates a never-existing target or replaces an unchanged,
+previously synchronized baseline. Windows file sharing defers active saves;
+the prior baseline is retained in a `.rommfs-backup-<id>` sibling and its location
+is recorded before replacement. Simultaneous changes preserve both copies for
+review. A previously
 tracked local delete is remembered; sync neither deletes the remote copy nor
 restores it automatically.
 Use **Export…** to write a staged incoming copy to a separate `.rommfs-incoming`

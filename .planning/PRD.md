@@ -140,7 +140,11 @@ Display real worker events, not timers or fabricated progress. HTTP completion i
 
 Log connection, catalogue, mount, download, eviction, and failure transitions. Preserve useful paths, IDs, status codes, and error causes for debugging. Never log passwords, tokens, cookies, or authentication headers; do not build a generalized redaction framework or suppress ordinary diagnostics.
 
-Closing the app stops its workers and mount. No tray process, background service, autostart, notification system, theme settings, or persistent log-management subsystem.
+The application session owns workers and the mount. On Windows, hiding the
+window retains work; tray Quit drains workers and stops the mount. Optional
+login startup restores verified sign-in, mounts, then resumes existing valid
+save consent. There is no separately deployed background service. Diagnostics
+rotate in the application-data directory.
 
 ## 5. Implementation boundaries
 
@@ -207,7 +211,13 @@ Final handoff must distinguish **implemented**, **passed**, **failed**, and **no
 
 ## 8. Explicit exclusions
 
-No custom game browser/launcher; artwork, metadata export, scraping, or generated gamelists; emulator installation/configuration; save synchronization; BIOS management; game sourcing; DLC/update automation; multi-file reconstruction; archive extraction; range streaming; download pause/resume; prefetch/pinning; cache quotas; remote modifications; live catalogue synchronization; multiple profiles/mounts; OIDC/QR pairing; stored credentials; telemetry; tray/autostart/services; installers/auto-updates; SteamOS/Batocera/macOS deployment work.
+No custom game browser/launcher, game sourcing, archive extraction, range
+streaming, download pause/resume, prefetch/pinning, cache quotas, live mounted
+tree mutation, multiple profiles/mounts, telemetry, separate service or app
+self-updater, or SteamOS/Batocera/macOS deployment work. The approved additions
+include remembered device pairing, local artwork/gamelists, fresh RetroBat
+installer/setup, ordinary-file saves, supported auxiliary files, and tray/login
+startup. Unknown emulator/category destinations are reported rather than guessed.
 
 Do not implement excluded work “to prepare for later.”
 

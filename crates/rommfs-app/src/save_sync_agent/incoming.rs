@@ -1,4 +1,4 @@
-use super::files::publish_missing_save;
+use super::files::{publish_changed_save, publish_missing_save};
 use super::gate::SaveSyncEnablement;
 use super::incoming_transfer::{
     owned_revision_from_filename, IncomingInventory, VerifiedRemoteSave,
@@ -116,13 +116,23 @@ pub(super) fn reconcile_inventory(
         });
     }
 
-    if local_hash.is_none() && !slot.local_ever_existed && slot.local_baseline_hash.is_none() {
-        let staged = journal.stage_incoming(
+    let local_changed = slot.local_baseline_hash.as_deref() != local_hash.as_deref();
+    let remote_changed = slot.remote_baseline_hash.as_deref() != Some(remote.content_hash.as_str());
+    let replace_baseline = mapping.profile.id == rommfs_core::save_sync::GENERIC_FILE_PROFILE
+        && local_hash.is_some()
+        && slot.local_baseline_hash.is_some()
+        && !local_changed
+        && remote_changed
+        && !slot.local_removed;
+    if (local_hash.is_none() && !slot.local_ever_existed && slot.local_baseline_hash.is_none())
+        || replace_baseline
+    {
+        let staged = stage_remote(
+            journal,
             mapping,
-            &remote_id,
-            &remote.bytes,
+            remote,
             "first_remote_save",
-            None,
+            slot.local_baseline_hash.as_deref(),
             slot.remote_slot_id.as_deref(),
             slot.remote_baseline_hash.as_deref(),
         )?;
@@ -146,7 +156,11 @@ pub(super) fn reconcile_inventory(
         let after_check = journal.slot(&mapping.rom_key)?.ok_or_else(|| {
             Error::Unsupported("save mapping disappeared before publication".into())
         })?;
-        if check.present || after_check.local_ever_existed || after_check.local_removed {
+        if (replace_baseline
+            && (check.content_hash != slot.local_baseline_hash || after_check.local_removed))
+            || (!replace_baseline
+                && (check.present || after_check.local_ever_existed || after_check.local_removed))
+        {
             let message = "a local save appeared while the remote download was in flight; both copies were preserved";
             journal.mark_reconciliation_attention(&mapping.rom_key, message)?;
             return Ok(ReconciliationOutcome {
@@ -166,18 +180,44 @@ pub(super) fn reconcile_inventory(
                 return Err(Error::Cancelled);
             }
             validate_configuration(scope, std::slice::from_ref(mapping), identity)?;
-            publish_missing_save(
-                &intent.path,
-                &target,
-                &intent.content_hash,
-                &scope.effective_saves_root,
-                || {
-                    if !is_active(enabled, active) {
-                        return Err(Error::Cancelled);
-                    }
-                    validate_configuration(scope, std::slice::from_ref(mapping), identity)
-                },
-            )?;
+            let validate = || {
+                if !is_active(enabled, active) {
+                    return Err(Error::Cancelled);
+                }
+                validate_configuration(scope, std::slice::from_ref(mapping), identity)
+            };
+            if replace_baseline {
+                let name = target
+                    .file_name()
+                    .ok_or_else(|| Error::Unsupported("Save target has no name".into()))?
+                    .to_string_lossy();
+                let backup = target.with_file_name(format!(".{name}.rommfs-backup-{}", intent.id));
+                journal.record_incoming_backup(&intent.id, &backup)?;
+                publish_changed_save(
+                    &intent.path,
+                    &target,
+                    &intent.content_hash,
+                    slot.local_baseline_hash
+                        .as_deref()
+                        .expect("replacement has baseline"),
+                    &backup,
+                    &scope.effective_saves_root,
+                    validate,
+                )?;
+            } else {
+                publish_missing_save(
+                    &intent.path,
+                    &target,
+                    &intent.content_hash,
+                    &scope.effective_saves_root,
+                    || {
+                        if !is_active(enabled, active) {
+                            return Err(Error::Cancelled);
+                        }
+                        validate_configuration(scope, std::slice::from_ref(mapping), identity)
+                    },
+                )?;
+            }
             journal.finish_incoming_publication(&intent.id, mapping, &remote_history_ids)
         })();
         if let Err(error) = publication {
@@ -251,10 +291,10 @@ pub(super) fn reconcile_inventory(
     } else {
         "two_sided_conflict"
     };
-    let staged = journal.stage_incoming(
+    let staged = stage_remote(
+        journal,
         mapping,
-        &remote_id,
-        &remote.bytes,
+        remote,
         reason,
         slot.local_baseline_hash.as_deref(),
         slot.remote_slot_id.as_deref(),
@@ -370,10 +410,10 @@ fn stage_all(
     saves
         .iter()
         .map(|save| {
-            journal.stage_incoming(
+            stage_remote(
+                journal,
                 mapping,
-                &save.metadata.id.to_string(),
-                &save.bytes,
+                save,
                 reason,
                 baseline_local_hash,
                 baseline_remote_id,
@@ -381,6 +421,40 @@ fn stage_all(
             )
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_remote(
+    journal: &mut SaveSyncJournal,
+    mapping: &SaveMapping,
+    remote: &VerifiedRemoteSave,
+    reason: &str,
+    baseline_local_hash: Option<&str>,
+    baseline_remote_id: Option<&str>,
+    baseline_remote_hash: Option<&str>,
+) -> Result<IncomingSaveRecord> {
+    let id = remote.metadata.id.to_string();
+    if let Some(file) = &remote.file {
+        journal.stage_incoming_file(
+            mapping,
+            &id,
+            file.path(),
+            reason,
+            baseline_local_hash,
+            baseline_remote_id,
+            baseline_remote_hash,
+        )
+    } else {
+        journal.stage_incoming(
+            mapping,
+            &id,
+            &remote.bytes,
+            reason,
+            baseline_local_hash,
+            baseline_remote_id,
+            baseline_remote_hash,
+        )
+    }
 }
 
 fn unique_latest(saves: &[VerifiedRemoteSave]) -> Option<&VerifiedRemoteSave> {

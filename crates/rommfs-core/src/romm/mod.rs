@@ -4,8 +4,10 @@
 //! transfers are never killed by a total-time budget (PRD R3).
 
 pub mod client;
+mod firmware;
 mod pairing;
 mod saves;
+pub use firmware::FirmwareDto;
 pub use pairing::{PairedSession, PairingPoll, PairingRequest};
 pub mod types;
 

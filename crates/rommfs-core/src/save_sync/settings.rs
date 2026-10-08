@@ -83,7 +83,52 @@ impl SaveSyncSettingsStore {
                 );",
             )
             .map_err(sqlite)?;
+        let has_version: bool = connection
+            .prepare("PRAGMA table_info(save_sync_consent)")
+            .map_err(sqlite)?
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(sqlite)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite)?
+            .iter()
+            .any(|c| c == "file_scope_version");
+        if !has_version {
+            connection.execute_batch("ALTER TABLE save_sync_consent ADD COLUMN file_scope_version INTEGER NOT NULL DEFAULT 1;").map_err(sqlite)?;
+        }
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS save_file_associations (server_id TEXT NOT NULL, account_id TEXT NOT NULL, installation_root TEXT NOT NULL, effective_saves_root TEXT NOT NULL, relative_path TEXT NOT NULL, rom_id INTEGER NOT NULL, PRIMARY KEY(server_id,account_id,installation_root,effective_saves_root,relative_path));").map_err(sqlite)?;
         Ok(Self { connection })
+    }
+
+    /// Existing SRAM-only consent is preserved, but cannot authorize a broader
+    /// ordinary-file scope. A fresh explicit enable records version 2.
+    pub fn load_files(&self, scope: &SaveSyncScope) -> Result<ConsentSettings> {
+        let version: Option<i64> = self.connection.query_row("SELECT file_scope_version FROM save_sync_consent WHERE server_id=?1 AND account_id=?2 AND installation_root=?3 AND effective_saves_root=?4",rusqlite::params![scope.server_id,scope.account_id,windows_path_key(&scope.installation_root),windows_path_key(&scope.effective_saves_root)],|r| r.get(0)).optional().map_err(sqlite)?;
+        let mut consent = self.load(scope)?;
+        if version != Some(2) {
+            consent.enabled = false;
+        }
+        Ok(consent)
+    }
+    pub fn save_files(&self, scope: &SaveSyncScope, settings: ConsentSettings) -> Result<()> {
+        self.save(scope, settings)?;
+        self.connection.execute("UPDATE save_sync_consent SET file_scope_version=2 WHERE server_id=?1 AND account_id=?2 AND installation_root=?3 AND effective_saves_root=?4",rusqlite::params![scope.server_id,scope.account_id,windows_path_key(&scope.installation_root),windows_path_key(&scope.effective_saves_root)]).map_err(sqlite)?;
+        Ok(())
+    }
+    pub fn file_associations(
+        &self,
+        scope: &SaveSyncScope,
+    ) -> Result<std::collections::BTreeMap<String, i64>> {
+        validate_scope(scope)?;
+        self.connection.prepare("SELECT relative_path,rom_id FROM save_file_associations WHERE server_id=?1 AND account_id=?2 AND installation_root=?3 AND effective_saves_root=?4").map_err(sqlite)?.query_map(rusqlite::params![scope.server_id,scope.account_id,windows_path_key(&scope.installation_root),windows_path_key(&scope.effective_saves_root)],|r| Ok((r.get(0)?,r.get(1)?))).map_err(sqlite)?.collect::<std::result::Result<_,_>>().map_err(sqlite)
+    }
+    pub fn associate_file(&self, scope: &SaveSyncScope, path: &Path, rom_id: i64) -> Result<()> {
+        validate_scope(scope)?;
+        super::file_slot(path)?;
+        if rom_id <= 0 {
+            return Err(Error::Unsupported("Choose a valid game".into()));
+        }
+        self.connection.execute("INSERT INTO save_file_associations VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(server_id,account_id,installation_root,effective_saves_root,relative_path) DO UPDATE SET rom_id=excluded.rom_id",rusqlite::params![scope.server_id,scope.account_id,windows_path_key(&scope.installation_root),windows_path_key(&scope.effective_saves_root),super::portable_save_path(path)?,rom_id]).map_err(sqlite)?;
+        Ok(())
     }
 
     /// Missing rows mean no consent, with the product's default debounce.
@@ -229,11 +274,38 @@ fn sqlite(error: rusqlite::Error) -> Error {
     Error::Io(std::io::Error::other(error))
 }
 
+pub fn paths_overlap(first: &Path, second: &Path) -> bool {
+    let first = windows_path_key(first);
+    let second = windows_path_key(second);
+    let first = first.trim_end_matches('\\');
+    let second = second.trim_end_matches('\\');
+    first == second
+        || first.starts_with(&format!("{second}\\"))
+        || second.starts_with(&format!("{first}\\"))
+}
+
 use rusqlite::OptionalExtension;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_root_overlap_uses_normalized_component_boundaries() {
+        for (a, b) in [
+            (r"C:\RomM", r"c:\romm\switch"),
+            (r"C:\RomM", r"C:\RomM\..\RomM\save"),
+            (r"C:\", r"c:\anything"),
+            ("/", "/directory"),
+            ("/settings", "/settings/snapshots"),
+        ] {
+            assert!(paths_overlap(Path::new(a), Path::new(b)), "{a} {b}");
+        }
+        assert!(!paths_overlap(
+            Path::new(r"C:\RomM"),
+            Path::new(r"C:\RomM-Saves")
+        ));
+    }
 
     fn scope(server_id: &str, account_id: &str, root: &str) -> SaveSyncScope {
         SaveSyncScope {

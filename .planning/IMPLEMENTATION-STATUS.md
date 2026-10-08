@@ -36,21 +36,59 @@ acceptance. `.scratch/STATE.md` is generated separately and is not edited here.
   regression reproduces the previously stranded generation and duplicate guard.
 - HTTP fixture shutdown now releases held download/upload barriers after a
   failing test, instead of hanging during panic cleanup.
+- Official stable installer discovery, approved HTTPS redirects, streamed
+  temporary downloads, release size/SHA-256 verification, cache validation,
+  pre-launch integrity recheck, interactive wizard tracking and cancellation.
+  Installer cancellation belongs to its wizard; RomMFS never kills a writing
+  installer or removes its partial installation. Reuse setup to verify the
+  selected completed installation; no guessed unattended switches.
+- Ordinary-file save roots, reversible remote relative-path slots, per-file
+  identities/status, companion/nested/extensionless/empty/large-file streams,
+  source save-target associations and explicit unmatched-file mapping.
+  One account-wide inventory request discovers remote mappings; incoming
+  watcher feedback does not upload duplicate revisions. New local files are
+  discovered without waiting for the fallback scan.
+- Versioned broader-scope consent and transactional legacy identity migration;
+  preserves baselines, removal state, queued snapshots and incoming bytes.
+  Windows legacy separators are normalized without changing destination meaning.
+  SRAM-only consent cannot authorize new files. Shared saves/cards, redirected
+  paths and overlapping ROM/settings/auxiliary roots are refused. Paths exceeding
+  RomM's 255-character slot contract are reported, never truncated.
+- Remote-only changes can replace an unchanged synchronized baseline: journal
+  a backup first, deny active Windows writers/deletion, recheck content and
+  publish without clobbering a concurrent target. Two-sided changes and deliberate
+  removals preserve both versions for review; incoming bytes remain exportable.
+- Explicit asynchronous auxiliary materialization using verified firmware and
+  original cheat-file routes. Supported destinations: effective BIOS directory,
+  installed Eden/Citron portable keys and unpacked `.nca` firmware, and effective
+  RetroArch `.cht` directory. Ownership/version intent precedes publication;
+  retries preserve unowned or user/emulator-modified files. Logout/Quit cancel
+  and join the job; partial downloads are never published.
+- Application session owns controller/workers independently of window hiding.
+  Windows tray status/Open/Quit, session-local single-instance ownership,
+  application/taskbar/tray cartridge icon and per-user optional login registration.
+  Ordered hidden startup verifies sign-in, mounts, then resumes existing consent.
+  Failed startup mounts block later background refreshes from starting save sync.
+- Final lifecycle review made save-transfer, artwork and catalogue threads owned
+  and joined during stop/logout/Quit, rather than detached. Deterministic tests
+  cover blocked-transfer shutdown, stale-event cancellation, new-file discovery,
+  failed-startup refresh gating, per-file status and versioned debounce persistence.
 
-## Still unfinished
+## Compatibility limits and remaining validation
 
-- Official installer discovery/download/integrity checks/execution/cancellation.
-  Selecting and setting up an existing fresh installation is implemented.
-- Generalized save-file mapping/identity, streamed large/extensionless/companion
-  saves, remote original-path representation, clean-client reconstruction,
-  journal migration and baseline/conflict-aware replacement. Existing GB-only
-  consent and transfer restrictions remain; new scopes are not silently enabled.
-- External BIOS/keys/firmware/cheat inventory and safe materialization contracts.
-  Generic ROM-file auxiliaries and RetroBat Switch `.nsp` projection are not a
-  claim of dedicated BIOS/cheat support.
-- Application-session/tray lifetime, icons, single-instance enforcement,
-  start-at-login preference and ordered reconnect/mount/sync restoration.
-- Final full-scope review. The reported live HTTP 500 cause is still unknown.
+- Shared saves/cards remain outside the approved release. Known shared-card
+  directories are conservatively excluded; game-specific card-format files in
+  supported game paths are ordinary files, not parsed or converted.
+- Firmware archives and non-RetroArch cheat formats lack supported extraction/
+  destination contracts and get actionable diagnostics. Changed server auxiliary
+  versions preserve the installed bytes; explicitly remove an unchanged owned
+  file before rematerializing the new version. No BIOS/keys are sourced by RomMFS.
+- Slot/path and server/disk limits are explicit compatibility constraints, not
+  silent truncation or emulator-format restrictions.
+- New contracts are source/fixture-backed, not live-validated against the original
+  RomM 5.3.1 instance. The reported live HTTP 500 cause remains unknown; diagnostics
+  and portable failure/retry checks are implemented, not a claimed reproduction.
+- All Windows runtime and human acceptance remains deferred below.
 
 ## Reproducible source contracts
 
@@ -82,6 +120,10 @@ The reference package is `RetroBat-v8.2.1-stable-win64-setup.exe`,
 `afbb060de637fdb1de9b7465276cafb30c8d32f40cb2271b256e52c0de257b2c`.
 Its version is not an installation compatibility gate. Installer execution and
 signature/runtime acceptance remain unverified.
+The official release binary's first 512 KiB contains UTF-16 custom .NET wizard
+strings; the current binary is not the older source repository's Inno/NSIS
+installer. Only this header was inspected, not the whole 1.9 GB package. The
+application discovers current official releases rather than pinning 8.2.1.
 
 ## Validation boundary
 
@@ -101,43 +143,58 @@ Verification commands used on Linux:
 cargo fmt --all --check
 cargo clippy -p rommfs-core -p rommfs-fixture -p rommfs-app -p rommfs-cfapi --no-default-features --all-targets -- -D warnings
 cargo test -p rommfs-core -p rommfs-fixture -p rommfs-app -p rommfs-cfapi --no-default-features -- --test-threads=1
-cargo check -p rommfs-app
+cargo clippy -p rommfs-app --all-targets -- -D warnings
+cargo deny check
+betterleaks dir . --redact
 ```
 
 Cross-target checking used the temporary compiler through target-specific
 `CC`, `AR` and Cargo linker environment variables, with
-`cargo check -p rommfs-core -p rommfs-cfapi -p rommfs-app --no-default-features --target x86_64-pc-windows-gnu --all-targets`.
+`cargo clippy -p rommfs-app --target x86_64-pc-windows-gnu --all-targets -- -D warnings`.
+This includes the full UI, tray adapter, Windows save publication and test code,
+and executable resource compilation. It does not execute native tests.
 
 Watcher tests exhausted this shared Linux host's 128 inotify-instance
 limit (`Too many open files`), causing timeouts, including in a one-thread
 combined run. A probe found 125 visible descriptors already used by unrelated
 processes. The failed logs are retained in
 `/tmp/opencode/rommfs-portable-metadata-concurrent-failed.log` and
-`/tmp/opencode/rommfs-watcher-suite-diagnostics.log`. Subsequent verification uses
-one fresh process per app unit test; results are in
+`/tmp/opencode/rommfs-watcher-suite-diagnostics.log`. The earlier verification used
+one fresh process per app unit test; results were recorded in
 `/tmp/opencode/rommfs-app-isolated-unit-tests.log`. Host limits and unrelated
 processes were left untouched; watcher tests were not skipped. The
 independently reproduced scheduler race above is not presented as proof that it
-caused that resource-exhaustion failure.
+caused that resource-exhaustion failure. The current complete one-thread suite
+passes both previously blocked cases without changing limits/unrelated processes.
 
 Latest outcomes:
 
 | Check | Result |
 | --- | --- |
-| Core, fixture and portable CFAPI tests | 145 passed |
+| Core, fixture and portable CFAPI tests | 154 passed |
 | App controller integration tests | 14 passed |
-| Isolated app unit tests | 61 passed; 2 watcher-dependent assertions failed under inotify exhaustion |
+| App unit tests, including real Linux watchers | 74 passed in a complete one-thread suite |
 | Formatting and diff whitespace | Passed |
 | Clippy, including fixture tests | Passed with warnings denied |
-| Linux GPUI app compilation | Passed |
-| Windows GNU cross-target, headless crates/tests | Passed; no native execution |
+| Linux GPUI app compilation/Clippy | Passed with warnings denied |
+| Windows GNU full UI and test-code cross-target Clippy | Passed with warnings denied; no native execution |
+| Dependency advisories/licenses and secret scan | cargo-deny and betterleaks passed; pre-existing dependency duplication/unused-allowance warnings remain |
 | Local documentation links | Passed |
 
 The two environment-blocked app cases are
 `local_write_while_first_upload_response_is_blocked_is_captured_and_uploaded_next`
 and `real_filesystem_notification_drives_the_agent_without_waiting_for_fallback_scan`.
-They remain unverified in the latest full verification; no test was removed or
-ignored, and the portable suite is **not claimed wholly green** on this host.
+Both pass in the current full suite. No test was removed or ignored. Current
+portable evidence: **242 passed, zero failed or ignored**. Logs:
+`/tmp/opencode/rommfs-full-scope-tests-final.log`,
+`/tmp/opencode/rommfs-full-scope-clippy-final.log`,
+`/tmp/opencode/rommfs-full-scope-ui-final.log`,
+`/tmp/opencode/rommfs-full-scope-windows-final.log`,
+`/tmp/opencode/rommfs-full-scope-deny-final.log`, and
+`/tmp/opencode/rommfs-full-scope-secrets.log`.
+The new-file discovery regression was reproduced failing before its deadline
+handling fix (`rommfs-review-discovery.log`) and passing after it
+(`rommfs-review-discovery-fixed.log`).
 
 All real Windows and human cases remain pending, including CFAPI ACLs,
 delete/rename protection, link privilege/cleanup, frontend/emulator activity

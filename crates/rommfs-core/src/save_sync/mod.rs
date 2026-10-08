@@ -4,9 +4,12 @@
 mod installation;
 mod journal;
 mod mapping;
+mod ordinary_files;
+pub use ordinary_files::{ensure_distinct, SaveFilePlan, SaveFileRules};
 mod path;
 mod preview;
 mod profile;
+pub(crate) use profile::resolve_auxiliary_root;
 pub(crate) use profile::resolve_retrobat_paths;
 mod scheduler;
 mod settings;
@@ -35,9 +38,30 @@ pub use preview::{
 };
 pub use profile::{resolve_retrobat_gb_profile, RetroBatGbProfile};
 pub use scheduler::{DueSnapshot, ObserveResult, RestoreReport, SaveSyncScheduler};
-pub use settings::{ConsentSettings, SaveSyncScope, SaveSyncSettingsStore, DEFAULT_DEBOUNCE_SECS};
+pub use settings::{
+    paths_overlap, ConsentSettings, SaveSyncScope, SaveSyncSettingsStore, DEFAULT_DEBOUNCE_SECS,
+};
 
 pub fn sha256_content_hash(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
+
+pub fn hash_save_content(reader: &mut impl std::io::Read) -> crate::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(format!("sha256:{:x}", hash.finalize()))
+}
+mod file_identity;
+pub use file_identity::{
+    file_slot, path_from_file_slot, portable_save_path, save_file_key, FILE_SLOT_PREFIX,
+    GENERIC_FILE_PROFILE,
+};
