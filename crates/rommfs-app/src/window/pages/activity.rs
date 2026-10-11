@@ -36,7 +36,7 @@ pub fn render(
         .w_full()
         .gap_4()
         .child(page_heading("Activity"))
-        .when_some(attention_section(view, cx), |this, section| {
+        .when_some(attention_section(view, window, cx), |this, section| {
             this.child(section)
         })
         .child(operations_section(view, cx))
@@ -69,6 +69,7 @@ fn retry_button(
 
 fn attention_section(
     view: &RommfsWindow,
+    window: &mut Window,
     cx: &mut Context<RommfsWindow>,
 ) -> Option<impl IntoElement> {
     let state = &view.state;
@@ -103,17 +104,32 @@ fn attention_section(
             Some(error) => format!("Mount failed: {error}"),
             None => "Mount failed".to_string(),
         };
-        let retry = state
+        let target = state
             .mount_path
             .clone()
-            .or_else(|| state.configured_mount_root.clone())
-            .map(|path| {
-                retry_button("retry-mount", cx, move |view, _| {
-                    view.controller
-                        .send(Command::StartMount { path: path.clone() });
+            .or_else(|| state.configured_mount_root.clone());
+        let retry = target.clone().map(|path| {
+            retry_button("retry-mount", cx, move |view, _| {
+                view.controller
+                    .send(Command::StartMount { path: path.clone() });
+            })
+        });
+        // §6: the failure keeps expandable details — the target path the
+        // one-line summary doesn't carry.
+        rows.push(
+            v_flex()
+                .gap_1()
+                .child(attention_row(message, retry, cx))
+                .when_some(target, |this, path| {
+                    this.child(details_disclosure(
+                        "attention-mount-details",
+                        format!("Mount target: {path}"),
+                        window,
+                        cx,
+                    ))
                 })
-            });
-        rows.push(attention_row(message, retry, cx).into_any_element());
+                .into_any_element(),
+        );
     }
     let failed_downloads = state
         .downloads
