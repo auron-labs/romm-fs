@@ -1,0 +1,2 @@
+- interface is super human unfriendly. seems like everything is just randomly placed, and the wording doesn't make sense
+- can't "setup retrobat" even on a new installation
