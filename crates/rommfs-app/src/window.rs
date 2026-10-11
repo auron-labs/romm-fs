@@ -194,7 +194,12 @@ struct RommfsWindow {
     settings_install_select: Entity<SelectState<Vec<SharedString>>>,
     completed_open: bool,
     mapping_open: bool,
+    /// Settings > Advanced disclosure (save-change delay).
     advanced_open: bool,
+    /// Settings > optional RetroBat setup & support files disclosure.
+    optional_setup_open: bool,
+    /// Settings > "Use a different save folder" disclosure.
+    custom_saves_open: bool,
     // --- Save review page state (window/pages/save_review.rs) ---
     /// Search box filtering the review table by name, file, or target path.
     #[allow(dead_code)] // read by pages/save_review.rs (UI-PLAN task 4)
@@ -388,13 +393,17 @@ impl RommfsWindow {
             debounce_input,
             debounce_input_applied: rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string(),
             debounce_error: None,
-            active_view: 3,
+            // Fresh installs start on the guided setup view (UI-PLAN §3);
+            // the first connection event re-routes to Overview.
+            active_view: 4,
             password_sign_in: false,
             integration_choice: 0,
             settings_install_select,
             completed_open: false,
             mapping_open: false,
             advanced_open: false,
+            optional_setup_open: false,
+            custom_saves_open: false,
             save_review_search,
             save_review_page: 0,
             save_review_expanded: None,
@@ -442,7 +451,13 @@ impl RommfsWindow {
                 }
                 AppEvent::PairingReady { url, .. } => cx.open_url(url),
                 AppEvent::Connected => self.active_view = 0,
-                AppEvent::SignedOut => self.active_view = 3,
+                // SignedOut with no remembered account is the unconfigured
+                // state — guided setup, not the full settings page.
+                AppEvent::SignedOut => self.active_view = 4,
+                // A remembered account that needs re-auth IS configured —
+                // send it to Overview where the sign-in action lives
+                // (existing config must never replay onboarding).
+                AppEvent::SignInRequired { .. } => self.active_view = 0,
                 AppEvent::ConnectionRestored { server, mount_root } => {
                     self.url_input
                         .update(cx, |input, cx| input.set_value(server.clone(), window, cx));
@@ -1045,18 +1060,229 @@ impl RommfsWindow {
             .child(self.render_log(window, cx))
     }
 
+    /// Settings in the plan's order (UI-PLAN §Settings organization):
+    /// everyday settings first — connection, folders, background — then
+    /// disclosures for optional setup and advanced tuning.
     fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let locked = self.state.retrobat_setup_running
+            || self.state.auxiliary_running
+            || matches!(self.state.mount, MountState::Mounted | MountState::Mounting);
         v_flex()
             .gap_6()
             .child(page_heading("Settings"))
-            .child(self.render_connection(window, cx))
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(section_heading("Connection"))
+                    .child(self.render_connection(window, cx)),
+            )
             .child(Separator::horizontal())
-            .child(self.render_integration(cx))
+            .child(self.render_folders_section(locked, window, cx))
+            .child(Separator::horizontal())
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(section_heading("Background operation"))
+                    .child(self.render_background_panel(cx)),
+            )
+            .child(Separator::horizontal())
+            .child(
+                Collapsible::new()
+                    .open(self.optional_setup_open)
+                    .child(self.disclosure_row(
+                        "optional-setup-disclosure",
+                        "RetroBat setup & support files",
+                        self.optional_setup_open,
+                        |view| view.optional_setup_open = !view.optional_setup_open,
+                        window,
+                        cx,
+                    ))
+                    .content(
+                        v_flex()
+                            .gap_3()
+                            .pt_2()
+                            .child(section_heading("RetroBat"))
+                            .child(self.retrobat_setup_panel(locked, cx))
+                            .child(Separator::horizontal())
+                            .child(section_heading("Support files"))
+                            .child(self.support_files_panel(locked, cx)),
+                    ),
+            )
+            .child(Separator::horizontal())
+            .child(
+                Collapsible::new()
+                    .open(self.advanced_open)
+                    .child(self.disclosure_row(
+                        "settings-advanced-disclosure",
+                        "Advanced",
+                        self.advanced_open,
+                        |view| view.advanced_open = !view.advanced_open,
+                        window,
+                        cx,
+                    ))
+                    .content(self.render_advanced_detail(window, cx)),
+            )
+    }
+
+    /// Folders: the games folder once, the layout choice, and the custom
+    /// save-data folder behind its own disclosure (UI-PLAN §Settings).
+    fn render_folders_section(
+        &mut self,
+        locked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .child(section_heading("Folders"))
+            .child(field_column(
+                "Games folder",
+                Input::new(&self.mount_input).w_full(),
+                cx,
+            ))
+            .child(self.layout_radio(locked, cx))
+            .when(self.integration_choice == 1, |this| {
+                this.child(self.retrobat_install_row(cx))
+            })
+            .when_some(
+                self.state
+                    .save_sync_effective_saves_root
+                    .clone()
+                    .or_else(|| self.state.save_sync_selected_root.clone()),
+                |this, root| {
+                    this.child(muted_xs(format!("Save data is kept in {root}"), cx))
+                },
+            )
+            .child(
+                Collapsible::new()
+                    .open(self.custom_saves_open)
+                    .child(self.disclosure_row(
+                        "custom-saves-disclosure",
+                        "Use a different save folder",
+                        self.custom_saves_open,
+                        |view| view.custom_saves_open = !view.custom_saves_open,
+                        window,
+                        cx,
+                    ))
+                    .content(
+                        v_flex()
+                            .gap_2()
+                            .pt_2()
+                            .child(field_column(
+                                "Save-data folder",
+                                Input::new(&self.save_folder_input).w_full(),
+                                cx,
+                            ))
+                            .child(
+                                Button::new("choose-save-folder")
+                                    .label("Use save folder")
+                                    .outline()
+                                    .disabled(self.state.conn != ConnState::Connected)
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.controller.send(Command::SelectSaveFolder {
+                                            path: PathBuf::from(
+                                                view.save_folder_input
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim(),
+                                            ),
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(muted_xs(
+                                "Select saves only, not an emulator's entire portable folder. All file formats and companions are supported. Shared saves and memory cards remain excluded.",
+                                cx,
+                            )),
+                    ),
+            )
+    }
+
+    /// First-run setup for an unconfigured install (UI-PLAN §3): connect to
+    /// RomM, then choose the games folder. Optional integrations stay in
+    /// Settings — they are never prerequisites here.
+    fn render_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let locked = self.state.retrobat_setup_running
+            || self.state.auxiliary_running
+            || matches!(self.state.mount, MountState::Mounted | MountState::Mounting);
+        let mounted = self.state.mount == MountState::Mounted;
+        let mounting = self.state.mount == MountState::Mounting;
+        let (mount_text, mount_kind) = self.mount_status(cx);
+        v_flex()
+            .gap_6()
+            .child(page_heading("Set up RomMFS"))
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(section_heading("1. Connect to RomM"))
+                    .child(self.render_connection(window, cx)),
+            )
+            .child(Separator::horizontal())
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(section_heading("2. Choose the games folder"))
+                    .child(field_column(
+                        "Games folder",
+                        Input::new(&self.mount_input).w_full(),
+                        cx,
+                    ))
+                    .child(self.layout_radio(locked, cx))
+                    .when(self.integration_choice == 1, |this| {
+                        this.child(self.retrobat_install_row(cx))
+                    })
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                Button::new("setup-start-folder")
+                                    .label(if mounted {
+                                        "Folder is running"
+                                    } else {
+                                        "Start games folder"
+                                    })
+                                    .primary()
+                                    .disabled(mounted || mounting)
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.on_start_mount(cx)),
+                                    ),
+                            )
+                            .child(status_marker(mount_kind, mount_text, cx)),
+                    )
+                    .when(mounting, |this| match self.state.mount_progress.clone() {
+                        Some((stage, completed, total, elapsed)) => this.child(operation_progress(
+                            "setup-mount-progress",
+                            &stage,
+                            completed,
+                            total,
+                            elapsed,
+                            cx,
+                        )),
+                        None => this.child(Progress::new("setup-mount-progress").value(0.)),
+                    })
+                    .when_some(self.state.mount_error.clone(), |this, error| {
+                        this.child(error_line(error, cx))
+                    })
+                    .when_some(self.render_foreign_remediation(cx), |this, block| {
+                        this.child(block)
+                    })
+                    .child(self.nav_button(
+                        "setup-advanced",
+                        "More options in Settings",
+                        3,
+                        false,
+                        cx,
+                    )),
+            )
     }
 
     /// Only the controls meaningful for the *current* auth state render —
     /// a signed-in session never sits beside its own sign-in buttons
     /// (UI-PLAN screenshot finding), and failures keep their real reason.
+    /// The account block: real server/account when signed in, sign-in
+    /// controls only when the state calls for them. The identity never
+    /// falls back to a raw database id (UI-PLAN §Settings > Connection).
     fn render_connection(
         &mut self,
         _window: &mut Window,
@@ -1065,19 +1291,27 @@ impl RommfsWindow {
         let conn = self.state.conn;
         let connecting = conn == ConnState::Connecting;
         let connected = conn == ConnState::Connected;
-        let server = self.url_input.read(cx).value();
+        // The server that actually answered — a remembered session may
+        // never have typed into the url field this launch.
+        let server = self
+            .state
+            .connected_server
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.url_input.read(cx).value().to_string());
         let user = self.user_input.read(cx).value();
-        let summary = if user.is_empty() {
-            server.to_string()
+        let summary = if server.is_empty() {
+            "Signed in".to_string()
+        } else if user.is_empty() {
+            format!("Signed in to {server}")
         } else {
-            format!("{server} · {user}")
+            format!("Signed in to {server} · {user}")
         };
         v_flex().gap_3()
-            .child(section_heading("RomM connection"))
             .when(!connected, |this| this
                 .child(field_column("Server URL", Input::new(&self.url_input).w_full(), cx)))
             .when(connected, |this| this
-                .child(muted(format!("Signed in to {summary}"), cx))
+                .child(muted(summary.clone(), cx))
                 .child(h_flex().gap_2()
                     .child(Button::new("change-server").label("Change server").outline()
                         .on_click(cx.listener(|view, _, _, cx| {
@@ -1108,104 +1342,284 @@ impl RommfsWindow {
             .when_some(self.state.conn_error.clone(), |this,error| this.child(error_line(error,cx)))
     }
 
-    fn render_integration(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let locked = self.state.retrobat_setup_running
-            || self.state.auxiliary_running
-            || matches!(self.state.mount, MountState::Mounted | MountState::Mounting);
-        v_flex().gap_3()
-            .child(section_heading("Background operation"))
-            .child(Button::new("start-at-login").label(if self.state.start_at_login { "Disable start at login" } else { "Enable start at login" })
-                .disabled(!cfg!(windows) || (!self.state.start_at_login && self.state.conn != ConnState::Connected))
-                .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::SetStartAtLogin { enabled: !view.state.start_at_login }); cx.notify(); })))
-            .child(muted(format!("{} Login startup reconnects and mounts before resuming previously authorized save sync.", close_behavior_copy(self.tray_hides)),cx))
-            .when_some(self.state.startup_error.clone(),|this,error| this.child(error_line(error,cx)))
+    /// Generic-folders vs RetroBat — the same choice in Settings > Folders
+    /// and the first-run folder step.
+    fn layout_radio(&mut self, locked: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
             .child(section_heading("Library layout"))
-            .child(RadioGroup::horizontal("library-layout").children(["Generic folders", "RetroBat"])
-                .selected_index(Some(self.integration_choice)).disabled(locked)
-                .on_change(cx.listener(|view,index,_,cx| {
-                    view.integration_choice = *index;
-                    // The layout applies on selection — no separate Apply step.
-                    // Generic applies unconditionally; RetroBat applies once an
-                    // installation is known, otherwise the picker below is the
-                    // apply trigger.
-                    if *index == 0 {
-                        let retrobat_root = view.state.retrobat_root.as_deref().map(PathBuf::from);
-                        view.controller.send(Command::SetIntegration { mode: IntegrationMode::Generic, retrobat_root });
-                    } else if let Some(root) = view.settings_install_root(cx) {
-                        view.controller.send(Command::SetIntegration { mode: IntegrationMode::RetroBat, retrobat_root: Some(root) });
-                    }
-                    cx.notify();
-                })))
-            .when(self.integration_choice == 1, |this| this
-                .child(h_flex().gap_2()
-                    .child(Button::new("download-retrobat").label("Download official installer")
-                        .disabled(self.state.installer_running)
-                        .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::DownloadRetroBatInstaller); cx.notify(); })))
-                    .child(Button::new("launch-retrobat-installer").label("Launch installer…")
-                        .disabled(!self.state.installer_ready || self.state.installer_running)
-                        .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::LaunchRetroBatInstaller); cx.notify(); })))
-                    .when(self.state.installer_running, |this| this.child(Button::new("cancel-retrobat-installer").label("Cancel download")
-                        .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::CancelRetroBatInstaller); cx.notify(); })))))
-                .when_some(self.state.installer_detail.clone(), |this,detail| this.child(muted(detail,cx)))
-                .when_some(self.state.installer_error.clone(), |this,error| this.child(error_line(error,cx)))
-                .when_some(self.state.installer_progress.1, |this,total| this.child(Progress::new("installer-progress").value(if total == 0 { 0. } else { 100. * self.state.installer_progress.0 as f32 / total as f32 })))
-                .child(h_flex().gap_3().items_center()
+            .child(
+                RadioGroup::horizontal("library-layout")
+                    .children(["Generic folders", "RetroBat"])
+                    .selected_index(Some(self.integration_choice))
+                    .disabled(locked)
+                    .on_change(cx.listener(|view, index, _, cx| {
+                        view.integration_choice = *index;
+                        // The layout applies on selection — no separate Apply step.
+                        // Generic applies unconditionally; RetroBat applies once an
+                        // installation is known, otherwise the picker below is the
+                        // apply trigger.
+                        if *index == 0 {
+                            let retrobat_root =
+                                view.state.retrobat_root.as_deref().map(PathBuf::from);
+                            view.controller.send(Command::SetIntegration {
+                                mode: IntegrationMode::Generic,
+                                retrobat_root,
+                            });
+                        } else if let Some(root) = view.settings_install_root(cx) {
+                            view.controller.send(Command::SetIntegration {
+                                mode: IntegrationMode::RetroBat,
+                                retrobat_root: Some(root),
+                            });
+                        }
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// RetroBat installation picker — shared by Settings > Folders and the
+    /// first-run folder step.
+    fn retrobat_install_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
                     .child(div().w_40().flex_shrink_0().child("RetroBat installation"))
-                    .child(div().flex_1().min_w_0().child(
-                        Select::new(&self.settings_install_select)
-                            .w_full()
-                            .accessibility_label("RetroBat installation")
-                            .placeholder("Select a RetroBat installation…")))
-                    .child(Button::new("settings-install-browse").label("Browse…").outline()
-                        .on_click(cx.listener(|view,_,_,cx| view.browse_settings_install(cx)))))
-                .child(muted("Requires a fresh installation configured through RomMFS setup. Its ROM directory must be empty or already managed by RomMFS.",cx))
-                .child(field_column("Managed ROM folder", Input::new(&self.mount_input).w_full(), cx))
-                .child(muted("Setup links RetroBat's ROM folder to this folder and configures Switch saves. Stop RetroBat and its emulators first. Unowned ROM files are never moved or removed.",cx))
-                .child(h_flex().gap_2()
-                    .child(Button::new("setup-retrobat").label("Set up RetroBat")
-                        .disabled(locked || self.state.conn != ConnState::Connected || self.settings_install_root(cx).is_none())
-                        .on_click(cx.listener(|view,_,_,cx| {
-                            if let Some(installation) = view.settings_install_root(cx) {
-                                view.controller.send(Command::SetupRetroBat {
-                                    installation,
-                                    managed_root: PathBuf::from(view.mount_input.read(cx).value().trim()),
-                                    remove_known: false,
-                                });
-                            }
-                            cx.notify();
-                        })))
-                    .when(self.state.retrobat_setup_removable > 0, |this| this
-                        .child(Button::new("setup-retrobat-remove-known")
-                            .label(format!("Remove {} known files/links and retry", self.state.retrobat_setup_removable))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Select::new(&self.settings_install_select)
+                                .w_full()
+                                .accessibility_label("RetroBat installation")
+                                .placeholder("Select a RetroBat installation…"),
+                        ),
+                    )
+                    .child(
+                        Button::new("settings-install-browse")
+                            .label("Browse…")
                             .outline()
-                            .disabled(locked || self.state.conn != ConnState::Connected || self.settings_install_root(cx).is_none())
-                            .on_click(cx.listener(|view,_,_,cx| {
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.browse_settings_install(cx)
+                            })),
+                    ),
+            )
+            .child(muted(
+                "Requires a fresh installation configured through RomMFS setup. Its ROM directory must be empty or already managed by RomMFS.",
+                cx,
+            ))
+    }
+
+    /// The focused RetroBat setup panel (UI-PLAN §RetroBat setup): the
+    /// installer download, the link action and its result, and the
+    /// foreign-item remediation — optional, never a prerequisite.
+    fn retrobat_setup_panel(&mut self, locked: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("download-retrobat")
+                            .label("Download official installer")
+                            .disabled(self.state.installer_running)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.controller.send(Command::DownloadRetroBatInstaller);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("launch-retrobat-installer")
+                            .label("Launch installer…")
+                            .disabled(!self.state.installer_ready || self.state.installer_running)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.controller.send(Command::LaunchRetroBatInstaller);
+                                cx.notify();
+                            })),
+                    )
+                    .when(self.state.installer_running, |this| {
+                        this.child(
+                            Button::new("cancel-retrobat-installer")
+                                .label("Cancel download")
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.controller.send(Command::CancelRetroBatInstaller);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .when_some(self.state.installer_detail.clone(), |this, detail| {
+                this.child(muted(detail, cx))
+            })
+            .when_some(self.state.installer_error.clone(), |this, error| {
+                this.child(error_line(error, cx))
+            })
+            .when_some(self.state.installer_progress.1, |this, total| {
+                this.child(Progress::new("installer-progress").value(if total == 0 {
+                    0.
+                } else {
+                    100. * self.state.installer_progress.0 as f32 / total as f32
+                }))
+            })
+            .child(muted(
+                "Setup links RetroBat's ROM folder to the games folder and configures Switch saves. Stop RetroBat and its emulators first. Unowned ROM files are never moved or removed.",
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("setup-retrobat")
+                            .label("Set up RetroBat")
+                            .disabled(
+                                locked
+                                    || self.state.conn != ConnState::Connected
+                                    || self.settings_install_root(cx).is_none(),
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
                                 if let Some(installation) = view.settings_install_root(cx) {
                                     view.controller.send(Command::SetupRetroBat {
                                         installation,
-                                        managed_root: PathBuf::from(view.mount_input.read(cx).value().trim()),
-                                        remove_known: true,
+                                        managed_root: PathBuf::from(
+                                            view.mount_input.read(cx).value().trim(),
+                                        ),
+                                        remove_known: false,
                                     });
                                 }
                                 cx.notify();
-                            }))))))
-            .child(Button::new("materialize-auxiliary").label("Install library BIOS, keys and cheats")
-                .disabled(locked || self.state.conn != ConnState::Connected)
-                .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::MaterializeAuxiliary); cx.notify(); })))
-            .child(Button::new("cancel-auxiliary").label("Cancel auxiliary download")
-                .disabled(!self.state.auxiliary_running)
-                .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::CancelAuxiliary); cx.notify(); })))
-            .child(muted("Downloads user-library BIOS, individual Switch firmware/keys, and RetroArch .cht cheats. No archives are extracted, no unowned or modified file is overwritten, and these files are never save data. Stop emulators before continuing.",cx))
-            .when_some(self.state.auxiliary_detail.clone(), |this,detail| this.child(muted(detail,cx)))
-            .when_some(self.state.auxiliary_error.clone(), |this,error| this.child(error_line(error,cx)))
-            .when(locked, |this| this.child(muted("Stop the mount before changing its layout.",cx)))
-            .when_some(self.state.integration_notice.clone(), |this,note| this.child(muted(note,cx)))
-            .when_some(self.state.integration_error.clone(), |this,error| this.child(error_line(error,cx)))
-            .when_some(self.render_foreign_remediation(cx), |this, block| this.child(block))
-            .when_some(self.state.retrobat_setup_detail.clone(), |this,detail| this.child(muted(detail,cx)))
-            .when_some(self.state.retrobat_setup_error.clone(), |this,error| this.child(error_line(error,cx)))
-            .when_some(self.state.frontend_metadata_detail.clone(), |this,detail| this.child(muted(detail,cx)))
-            .when_some(self.state.frontend_metadata_error.clone(), |this,error| this.child(error_line(error,cx)))
+                            })),
+                    )
+                    .when(self.state.retrobat_setup_removable > 0, |this| {
+                        this.child(
+                            Button::new("setup-retrobat-remove-known")
+                                .label(format!(
+                                    "Remove {} known files/links and retry",
+                                    self.state.retrobat_setup_removable
+                                ))
+                                .outline()
+                                .disabled(
+                                    locked
+                                        || self.state.conn != ConnState::Connected
+                                        || self.settings_install_root(cx).is_none(),
+                                )
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    if let Some(installation) = view.settings_install_root(cx) {
+                                        view.controller.send(Command::SetupRetroBat {
+                                            installation,
+                                            managed_root: PathBuf::from(
+                                                view.mount_input.read(cx).value().trim(),
+                                            ),
+                                            remove_known: true,
+                                        });
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .when(locked, |this| {
+                this.child(muted(
+                    "Stop the mount before changing its layout.",
+                    cx,
+                ))
+            })
+            .when_some(self.state.integration_notice.clone(), |this, note| {
+                this.child(muted(note, cx))
+            })
+            .when_some(self.state.integration_error.clone(), |this, error| {
+                this.child(error_line(error, cx))
+            })
+            .when_some(self.render_foreign_remediation(cx), |this, block| {
+                this.child(block)
+            })
+            .when_some(self.state.retrobat_setup_detail.clone(), |this, detail| {
+                this.child(muted(detail, cx))
+            })
+            .when_some(self.state.retrobat_setup_error.clone(), |this, error| {
+                this.child(error_line(error, cx))
+            })
+    }
+
+    /// Optional support-file downloads (BIOS/firmware/keys/cheats) — the
+    /// auxiliary pipeline with its own progress and errors, never save data.
+    fn support_files_panel(&mut self, locked: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("materialize-auxiliary")
+                            .label("Install library BIOS, keys and cheats")
+                            .disabled(locked || self.state.conn != ConnState::Connected)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.controller.send(Command::MaterializeAuxiliary);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("cancel-auxiliary")
+                            .label("Cancel")
+                            .disabled(!self.state.auxiliary_running)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.controller.send(Command::CancelAuxiliary);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(muted(
+                "Downloads user-library BIOS, individual Switch firmware/keys, and RetroArch .cht cheats. No archives are extracted, no unowned or modified file is overwritten, and these files are never save data. Stop emulators before continuing.",
+                cx,
+            ))
+            .when_some(self.state.auxiliary_detail.clone(), |this, detail| {
+                this.child(muted(detail, cx))
+            })
+            .when_some(self.state.auxiliary_error.clone(), |this, error| {
+                this.child(error_line(error, cx))
+            })
+            .when_some(
+                self.state.frontend_metadata_detail.clone(),
+                |this, detail| this.child(muted(detail, cx)),
+            )
+            .when_some(
+                self.state.frontend_metadata_error.clone(),
+                |this, error| this.child(error_line(error, cx)),
+            )
+    }
+
+    /// Start-at-login plus the honest close/quit description.
+    fn render_background_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(
+                Button::new("start-at-login")
+                    .label(if self.state.start_at_login {
+                        "Disable start at login"
+                    } else {
+                        "Enable start at login"
+                    })
+                    .disabled(
+                        !cfg!(windows)
+                            || (!self.state.start_at_login
+                                && self.state.conn != ConnState::Connected),
+                    )
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.controller.send(Command::SetStartAtLogin {
+                            enabled: !view.state.start_at_login,
+                        });
+                        cx.notify();
+                    })),
+            )
+            .child(muted(
+                format!(
+                    "{} Login startup reconnects and mounts before resuming previously authorized save sync.",
+                    close_behavior_copy(self.tray_hides)
+                ),
+                cx,
+            ))
+            .when_some(self.state.startup_error.clone(), |this, error| {
+                this.child(error_line(error, cx))
+            })
     }
 
     /// Foreign entries reported under a refused mount/setup root: the classified
@@ -1566,8 +1980,8 @@ impl RommfsWindow {
                 h_flex()
                     .gap_3()
                     .items_end()
-                    .child(div().w_32().child(field_column(
-                        "Debounce (seconds)",
+                    .child(div().w_40().child(field_column(
+                        "Wait after a save changes (seconds)",
                         Input::new(&self.debounce_input).w_full().small(),
                         cx,
                     )))
@@ -2270,6 +2684,10 @@ impl Render for RommfsWindow {
             2 => page(
                 "activity-view",
                 pages::activity::render(self, window, cx).into_any_element(),
+            ),
+            4 => page(
+                "setup-view",
+                self.render_setup(window, cx).into_any_element(),
             ),
             _ => page(
                 "settings-view",
