@@ -1738,6 +1738,22 @@ impl RommfsWindow {
                     cx,
                 ))
             })
+            .when(
+                !locked
+                    && (self.state.conn != ConnState::Connected
+                        || self.settings_install_root(cx).is_none()),
+                |this| {
+                    // §6: the disabled setup action explains why.
+                    this.child(muted_xs(
+                        if self.state.conn != ConnState::Connected {
+                            "Connect to RomM first."
+                        } else {
+                            "Choose a RetroBat installation above."
+                        },
+                        cx,
+                    ))
+                },
+            )
             .when_some(self.state.integration_notice.clone(), |this, note| {
                 this.child(muted(note, cx))
             })
@@ -1772,15 +1788,31 @@ impl RommfsWindow {
                                 cx.notify();
                             })),
                     )
-                    .child(
-                        Button::new("cancel-auxiliary")
-                            .label("Cancel")
-                            .disabled(!self.state.auxiliary_running)
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.controller.send(Command::CancelAuxiliary);
-                                cx.notify();
-                            })),
-                    ),
+                    .when(self.state.auxiliary_running, |this| {
+                        // §1: Cancel appears only while the operation runs.
+                        this.child(
+                            Button::new("cancel-auxiliary")
+                                .label("Cancel")
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.controller.send(Command::CancelAuxiliary);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .when(
+                locked || self.state.conn != ConnState::Connected,
+                |this| {
+                    // §6: a disabled action carries its reason next to it.
+                    this.child(muted_xs(
+                        if locked {
+                            "Unavailable while the games folder or setup is running — stop it first."
+                        } else {
+                            "Connect to RomM first."
+                        },
+                        cx,
+                    ))
+                },
             )
             .child(muted(
                 "Downloads user-library BIOS, individual Switch firmware/keys, and RetroArch .cht cheats. No archives are extracted, no unowned or modified file is overwritten, and these files are never save data. Stop emulators before continuing.",
