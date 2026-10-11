@@ -278,7 +278,7 @@ mod tests {
         let target = root.join(relative);
         fs::write(&target, b"SRAM bytes").unwrap();
 
-        let reader = open_save_read(&root, relative).unwrap();
+        let reader = open_save_read_for(&root, relative, false).unwrap();
         assert!(OpenOptions::new().write(true).open(&target).is_err());
         assert!(fs::remove_file(&target).is_err());
         drop(reader);

@@ -60,6 +60,83 @@ pub enum MountState {
     Failed,
 }
 
+/// The derived games-folder summary the whole UI shares (UI-PLAN §3): a folder
+/// is "ready" only after a real MountStarted — never inferred from the
+/// persisted enabled setting or the existence of a directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderSummary {
+    /// No completed folder setup for this server yet.
+    SetupNeeded,
+    /// A folder is configured but the provider is stopped.
+    Stopped,
+    /// A start operation is running.
+    Starting,
+    /// Provider active and folder usable.
+    Ready,
+    /// The last start failed (reason in `mount_error`).
+    Failed,
+}
+
+impl FolderSummary {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SetupNeeded => "Set up your games folder",
+            Self::Stopped => "Games folder stopped",
+            Self::Starting => "Starting games folder…",
+            Self::Ready => "Games folder ready",
+            Self::Failed => "Couldn't start the games folder",
+        }
+    }
+}
+
+/// The derived save-sync summary the whole UI shares (UI-PLAN §5): configured,
+/// enabled, running, and successfully checked stay distinct — unknown state
+/// and zero linked files are never presented as "up to date".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveSyncSummary {
+    /// Signed out or the server rejected the session.
+    AuthRequired,
+    /// The RomM connection itself failed.
+    Offline,
+    /// The user has not enabled sync — no implied protection.
+    Off,
+    /// The source configuration is invalid or incomplete.
+    NeedsSetup,
+    /// Enabled but no completed check exists yet.
+    Checking,
+    /// A check ran but no eligible files are linked to games.
+    NoLinkedFiles,
+    /// Still reconciling known links.
+    Reconciling,
+    /// Transfers are pending or running.
+    Syncing,
+    /// The current operation failed or items need review.
+    NeedsAttention,
+    /// The worker paused syncing (for example on network errors).
+    Paused,
+    /// Linked files checked with no work pending. Unlinked files keep a
+    /// separate count — they do not downgrade the summary.
+    UpToDate,
+}
+
+impl SaveSyncSummary {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AuthRequired => "Sign-in required",
+            Self::Offline => "RomM unreachable",
+            Self::Off => "Save sync off",
+            Self::NeedsSetup => "Save sync needs setup",
+            Self::Checking => "Checking saves…",
+            Self::NoLinkedFiles => "No files ready to sync",
+            Self::Reconciling => "Checking saves…",
+            Self::Syncing => "Syncing saves…",
+            Self::NeedsAttention => "Save sync needs attention",
+            Self::Paused => "Save sync paused",
+            Self::UpToDate => "Linked saves are up to date",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DownloadView {
     pub file_id: u64,
@@ -90,6 +167,8 @@ pub struct UiState {
     pub startup_error: Option<String>,
     pub save_file_games: Vec<(i64, String)>,
     pub save_file_unmatched: Vec<UnmatchedFile>,
+    pub auxiliary_detail: Option<String>,
+    pub auxiliary_error: Option<String>,
     pub installer_running: bool,
     pub installer_ready: bool,
     pub installer_progress: (u64, Option<u64>),
@@ -133,6 +212,11 @@ pub struct UiState {
     pub save_sync_documented_saves_root: Option<String>,
     pub save_sync_effective_saves_root: Option<String>,
     pub save_sync_profile_version: Option<String>,
+    /// Server the active session connected to (from ConnectionRestored).
+    pub connected_server: Option<String>,
+    /// The persisted games-folder root for this server, when known —
+    /// distinguishes "never set up" from "configured but stopped".
+    pub configured_mount_root: Option<String>,
     pub save_sync_account_id: Option<i64>,
     pub save_sync_mapped_targets: usize,
     pub save_sync_catalogue_unmapped: usize,
@@ -162,6 +246,8 @@ impl UiState {
         Self {
             start_at_login: false,
             auxiliary_running: false,
+            auxiliary_detail: None,
+            auxiliary_error: None,
             startup_error: None,
             save_file_games: Vec::new(),
             save_file_unmatched: Vec::new(),
@@ -197,6 +283,8 @@ impl UiState {
             catalogue_pending_remount: false,
             catalogue_operation_id: 0,
             catalogue: None,
+            connected_server: None,
+            configured_mount_root: None,
             save_sync_candidates: Vec::new(),
             save_sync_skipped: 0,
             save_sync_selected_root: None,
@@ -247,10 +335,12 @@ impl UiState {
                 detail,
                 error,
             } => {
+                // Auxiliary support-file downloads are their own operation:
+                // their status must not masquerade as (or overwrite) RetroBat
+                // setup state.
                 self.auxiliary_running = *running;
-                self.retrobat_setup_running = *running;
-                self.retrobat_setup_detail = Some(detail.clone());
-                self.retrobat_setup_error = error.clone();
+                self.auxiliary_detail = Some(detail.clone());
+                self.auxiliary_error = error.clone();
             }
             AppEvent::StartupPreference { enabled, error } => {
                 self.start_at_login = *enabled;
@@ -329,7 +419,24 @@ impl UiState {
                     None
                 };
             }
-            AppEvent::ConnectionRestored { .. } => {}
+            AppEvent::ConnectionRestored {
+                server, mount_root, ..
+            } => {
+                self.connected_server = Some(server.clone());
+                if mount_root.is_some() {
+                    self.configured_mount_root = mount_root.clone();
+                }
+            }
+            AppEvent::MountRootConfigured { server, mount_root } => {
+                self.connected_server = Some(server.clone());
+                self.configured_mount_root = Some(mount_root.clone());
+                // Without a live mount the applied path is the current one:
+                // the folder display, Start and Retry must all follow the
+                // edit. A running mount keeps its real path until it stops.
+                if !matches!(self.mount, MountState::Mounted | MountState::Mounting) {
+                    self.mount_path = Some(mount_root.clone());
+                }
+            }
             AppEvent::SignedOut => {
                 self.conn = ConnState::Idle;
                 self.conn_error = None;
@@ -339,6 +446,14 @@ impl UiState {
                 self.catalogue_progress = None;
                 self.downloads.clear();
                 self.pairing_code = None;
+                self.connected_server = None;
+                self.configured_mount_root = None;
+                // The mount belonged to the session that just ended — its
+                // path must never present as the next session's folder.
+                self.mount = MountState::NotMounted;
+                self.mount_path = None;
+                self.mount_error = None;
+                self.mount_progress = None;
             }
             AppEvent::PairingReady { user_code, .. } => {
                 self.pairing_code = Some(user_code.clone());
@@ -369,6 +484,12 @@ impl UiState {
                 self.save_sync_transfers.clear();
                 self.save_sync_queue = None;
                 self.save_sync_authentication_required = false;
+                // A new connection attempt may target a different server —
+                // the old session's host and folder config are not evidence
+                // of anything until ConnectionRestored confirms them.
+                self.connected_server = None;
+                self.configured_mount_root = None;
+                self.mount_path = None;
                 self.save_sync_export_errors.clear();
                 self.save_sync_export_feedback.clear();
                 self.save_sync_enabled = false;
@@ -392,9 +513,13 @@ impl UiState {
                 self.conn = ConnState::Failed;
                 self.conn_error = Some(reason.clone());
             }
-            AppEvent::SignInRequired => {
+            AppEvent::SignInRequired { reason } => {
                 self.conn = ConnState::SignInRequired;
-                self.conn_error = Some("sign-in required".to_string());
+                self.conn_error = Some(
+                    reason
+                        .clone()
+                        .unwrap_or_else(|| "sign-in required".to_string()),
+                );
             }
 
             AppEvent::CatalogueProgress {
@@ -683,6 +808,63 @@ impl UiState {
         self.prune_downloads();
     }
 
+    /// Whether the games folder is usable right now, derived only from real
+    /// mount events — never from connection, configuration, or sync state.
+    pub fn folder_summary(&self) -> FolderSummary {
+        match self.mount {
+            MountState::Mounted => FolderSummary::Ready,
+            MountState::Mounting => FolderSummary::Starting,
+            MountState::Failed => FolderSummary::Failed,
+            MountState::NotMounted => {
+                if self.mount_path.is_some() || self.configured_mount_root.is_some() {
+                    FolderSummary::Stopped
+                } else {
+                    FolderSummary::SetupNeeded
+                }
+            }
+        }
+    }
+
+    /// The one derived save-sync status (UI-PLAN §5 table). Zero eligible
+    /// files is not "up to date"; an unlinked-file count does not downgrade
+    /// an otherwise healthy linked set.
+    pub fn save_sync_summary(&self) -> SaveSyncSummary {
+        if self.conn == ConnState::SignInRequired || self.save_sync_authentication_required {
+            return SaveSyncSummary::AuthRequired;
+        }
+        if self.conn == ConnState::Failed {
+            return SaveSyncSummary::Offline;
+        }
+        if !self.save_sync_enabled {
+            return SaveSyncSummary::Off;
+        }
+        if !self.save_sync_available {
+            return SaveSyncSummary::NeedsSetup;
+        }
+        let Some(queue) = self.save_sync_queue.as_ref() else {
+            return SaveSyncSummary::Checking;
+        };
+        if queue.actor_failed || queue.failure.is_some() || self.save_sync_failure.is_some() {
+            return SaveSyncSummary::NeedsAttention;
+        }
+        if queue.network_paused {
+            return SaveSyncSummary::Paused;
+        }
+        if queue.mapped_games == 0 {
+            return SaveSyncSummary::NoLinkedFiles;
+        }
+        if queue.reconciled_games < queue.mapped_games {
+            return SaveSyncSummary::Reconciling;
+        }
+        if queue.pending_outbound > 0 {
+            return SaveSyncSummary::Syncing;
+        }
+        if queue.attention_games > 0 || queue.pending_incoming > 0 {
+            return SaveSyncSummary::NeedsAttention;
+        }
+        SaveSyncSummary::UpToDate
+    }
+
     /// Mark a mount request pending immediately so a second UI click cannot
     /// enqueue another start before the worker's MountStarting event arrives.
     pub fn request_mount(&mut self, path: String) {
@@ -788,6 +970,11 @@ pub enum Command {
         url: String,
         username: String,
         password: String,
+    },
+    /// Apply the games-folder path typed in Settings to the session's
+    /// remembered config — validation stays with StartMount.
+    SetMountRoot {
+        path: String,
     },
     StartMount {
         path: String,
@@ -1765,6 +1952,16 @@ impl Worker {
             .map(|identity| identity.account_id.to_string());
         self.save_sync_identity = identity;
         self.sink.emit(AppEvent::Connected);
+        // Connecting cleared the remembered host/folder facts when this
+        // sign-in began; now that the session is authenticated, republish
+        // its stored config or a configured user lands on folder setup.
+        self.sink.emit(AppEvent::ConnectionRestored {
+            server: url.to_string(),
+            mount_root: self
+                .preferences
+                .as_ref()
+                .and_then(|p| p.mount_root.as_ref().map(|r| r.display().to_string())),
+        });
         self.log(
             Level::Info,
             "connect",
@@ -1782,7 +1979,9 @@ impl Worker {
             }
             Err(error) => {
                 if error.needs_sign_in() {
-                    self.sink.emit(AppEvent::SignInRequired);
+                    self.sink.emit(AppEvent::SignInRequired {
+                        reason: Some(error.to_string()),
+                    });
                 } else {
                     self.sink.emit(AppEvent::CatalogueFailed {
                         reason: error.to_string(),
@@ -1945,6 +2144,11 @@ impl Worker {
             let Some(preferences) = settings.load()? else {
                 return Ok(());
             };
+            // Connecting clears the previous session's host/folder facts;
+            // emit it BEFORE ConnectionRestored or the just-restored
+            // configured_mount_root is wiped and a configured user renders
+            // as "Set up your games folder" (UI-PLAN §3/§4).
+            self.sink.emit(AppEvent::Connecting);
             self.sink.emit(AppEvent::ConnectionRestored {
                 server: preferences.server.clone(),
                 mount_root: preferences
@@ -1973,7 +2177,6 @@ impl Worker {
                     "stored session belongs to another account".into(),
                 ));
             }
-            self.sink.emit(AppEvent::Connecting);
             self.startup_restoring =
                 std::env::args().any(|arg| arg == "--startup") && preferences.start_at_login;
             self.startup_requires_mount = self.startup_restoring;
@@ -2174,7 +2377,9 @@ impl Worker {
                     if error.needs_sign_in() {
                         self.stop_save_sync_agent();
                         self.stop_mount();
-                        self.sink.emit(AppEvent::SignInRequired);
+                        self.sink.emit(AppEvent::SignInRequired {
+                            reason: Some(error.to_string()),
+                        });
                     }
                     self.log(Level::Error, "metadata", error.to_string());
                     self.metadata_status(
@@ -2572,7 +2777,9 @@ impl Worker {
         if error.needs_sign_in() {
             self.stop_save_sync_agent();
             self.stop_mount();
-            self.sink.emit(AppEvent::SignInRequired);
+            self.sink.emit(AppEvent::SignInRequired {
+                reason: Some(error.to_string()),
+            });
         }
         self.sink.emit(AppEvent::CatalogueFailed {
             reason: error.to_string(),
@@ -2596,7 +2803,9 @@ impl Worker {
 
     fn fail_connect(&self, e: &Error) {
         if e.needs_sign_in() {
-            self.sink.emit(AppEvent::SignInRequired);
+            self.sink.emit(AppEvent::SignInRequired {
+                reason: Some(e.to_string()),
+            });
         } else {
             self.sink.emit(AppEvent::ConnectFailed {
                 reason: e.to_string(),
@@ -2663,6 +2872,32 @@ impl Worker {
         });
     }
 
+    /// Apply the Settings games-folder edit to this session's remembered
+    /// config. Validation stays with start_mount — applying only records
+    /// the chosen folder so every screen uses it.
+    fn set_mount_root(&mut self, path: &str) {
+        let path = path.trim();
+        let Some(preferences) = &mut self.preferences else {
+            self.log(
+                Level::Warn,
+                "settings",
+                "Games folder change ignored: no remembered session",
+            );
+            return;
+        };
+        preferences.mount_root = Some(PathBuf::from(path));
+        let server = preferences.server.clone();
+        if let Some(settings) = &self.connection_settings {
+            if let Err(error) = settings.save(preferences) {
+                self.log(Level::Warn, "settings", error.to_string());
+            }
+        }
+        self.sink.emit(AppEvent::MountRootConfigured {
+            server,
+            mount_root: path.to_string(),
+        });
+    }
+
     fn start_mount(&mut self, path: &str) {
         let path = path.trim();
         if self.auxiliary_job.is_some() {
@@ -2707,7 +2942,9 @@ impl Worker {
             return;
         };
         if !client.has_token() && self.catalogue.is_some() {
-            self.sink.emit(AppEvent::SignInRequired);
+            self.sink.emit(AppEvent::SignInRequired {
+                reason: Some("sign in before mounting the cached library".into()),
+            });
             self.fail_mount(
                 "check authentication",
                 path,
@@ -2780,7 +3017,9 @@ impl Worker {
                     self.refresh_save_sync();
                 }
                 Err(e) if e.needs_sign_in() => {
-                    self.sink.emit(AppEvent::SignInRequired);
+                    self.sink.emit(AppEvent::SignInRequired {
+                        reason: Some(e.to_string()),
+                    });
                     self.fail_mount("load catalogue", path, &e);
                     self.refresh_save_sync();
                     return;
@@ -3101,6 +3340,7 @@ fn worker_loop_with_interval_from(
                 username,
                 password,
             } => worker.connect(url, username, password),
+            Command::SetMountRoot { path } => worker.set_mount_root(path),
             Command::StartMount { path } => worker.start_mount(path),
             Command::StopMount => worker.stop_mount(),
             Command::RefreshCatalogue => worker.refresh_catalogue(),
@@ -3143,6 +3383,7 @@ fn worker_loop_with_interval_from(
                     reason: format!("internal error: {msg}"),
                 }),
                 Command::StopMount => {}
+                Command::SetMountRoot { .. } => {}
                 Command::SetupRetroBat { .. } => worker.sink.emit(AppEvent::RetroBatSetup {
                     running: false,
                     detail: "RetroBat setup stopped".into(),
@@ -3952,7 +4193,10 @@ mod tests {
             Ok(AppEvent::SaveSyncSessionChanged { session_id: 1 })
         ));
         assert!(matches!(events.try_recv(), Ok(AppEvent::Connecting)));
-        assert!(matches!(events.try_recv(), Ok(AppEvent::SignInRequired)));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AppEvent::SignInRequired { .. })
+        ));
     }
 
     #[test]
@@ -4945,5 +5189,225 @@ mod tests {
             elapsed_ms: 100,
         });
         assert!(events.try_recv().is_err());
+    }
+
+    /// A remembered account's folder config must survive the reconnect:
+    /// `Connecting` clears per-session facts, so it has to be emitted before
+    /// `ConnectionRestored` or a configured user renders as
+    /// "Set up your games folder" (UI-PLAN §3/§4).
+    #[test]
+    fn restore_keeps_the_configured_folder_visible() {
+        let directory = tempfile::tempdir().unwrap();
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.connection_settings =
+            Some(ConnectionSettings::open(&directory.path().join("connection.db")).unwrap());
+        worker
+            .connection_settings
+            .as_ref()
+            .unwrap()
+            .save(&ConnectionPreferences {
+                server: "https://romm.example".into(),
+                account_id: 42,
+                device_identifier: "id".into(),
+                mount_root: Some(directory.path().join("roms")),
+                integration: IntegrationMode::Generic,
+                retrobat_root: None,
+                start_at_login: false,
+                save_root: None,
+            })
+            .unwrap();
+
+        worker.restore_connection();
+
+        let collected: Vec<_> = events.try_iter().collect();
+        let connecting_at = collected
+            .iter()
+            .position(|e| matches!(e, AppEvent::Connecting))
+            .expect("restore emits Connecting");
+        let restored_at = collected
+            .iter()
+            .position(|e| matches!(e, AppEvent::ConnectionRestored { .. }))
+            .expect("restore emits ConnectionRestored");
+        assert!(
+            connecting_at < restored_at,
+            "Connecting must precede ConnectionRestored — it clears the restored config"
+        );
+        let mut state = UiState::new(16);
+        for event in &collected {
+            state.apply(event);
+        }
+        assert_eq!(
+            state.folder_summary(),
+            FolderSummary::Stopped,
+            "a configured-but-stopped folder must never read as unconfigured"
+        );
+    }
+
+    /// A mount path is session state: after signing out or starting a new
+    /// connection it must never present as the next session's configured
+    /// folder (PR-review regression: A's path offered as B's Start target).
+    #[test]
+    fn mount_path_is_scoped_to_its_session() {
+        let mut state = UiState::new(16);
+        for event in [
+            AppEvent::ConnectionRestored {
+                server: "https://a.example".into(),
+                mount_root: Some("/srv/a".into()),
+            },
+            AppEvent::MountStarted {
+                path: "/srv/a".into(),
+            },
+            AppEvent::MountStopped,
+        ] {
+            state.apply(&event);
+        }
+        assert_eq!(state.folder_summary(), FolderSummary::Stopped);
+
+        state.apply(&AppEvent::SignedOut);
+
+        assert!(state.mount_path.is_none());
+        assert_eq!(
+            state.folder_summary(),
+            FolderSummary::SetupNeeded,
+            "server A's mount path must not become the next session's folder"
+        );
+
+        // A path stashed by a mount attempt dies with that session too.
+        state.mount_path = Some("/srv/a".into());
+        state.apply(&AppEvent::Connecting);
+        assert!(state.mount_path.is_none());
+        assert_eq!(state.folder_summary(), FolderSummary::SetupNeeded);
+    }
+
+    /// restore -> authentication failure -> successful reauthentication:
+    /// the second connection attempt wipes the folder facts, so the
+    /// accepted session must republish its stored config or a configured
+    /// user is sent back to folder setup (PR-review regression).
+    #[test]
+    fn reauthentication_republishes_the_remembered_folder() {
+        use rommfs_fixture::contract;
+        let directory = tempfile::tempdir().unwrap();
+        let fx = FixtureServer::start();
+        fx.on(
+            "POST",
+            "/api/token",
+            ResponseSpec::Json {
+                status: 200,
+                body: contract::token_ok(),
+            },
+        );
+        fx.on(
+            "GET",
+            "/api/users/me",
+            ResponseSpec::Json {
+                status: 200,
+                body: serde_json::json!({"id":42,"oauth_scopes":["me.read","assets.read","assets.write"]}).to_string(),
+            },
+        );
+        let mount_root = directory.path().join("roms");
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.connection_settings =
+            Some(ConnectionSettings::open(&directory.path().join("connection.db")).unwrap());
+        worker
+            .connection_settings
+            .as_ref()
+            .unwrap()
+            .save(&ConnectionPreferences {
+                server: fx.url().into(),
+                account_id: 42,
+                device_identifier: "id".into(),
+                mount_root: Some(mount_root.clone()),
+                integration: IntegrationMode::Generic,
+                retrobat_root: None,
+                start_at_login: false,
+                save_root: None,
+            })
+            .unwrap();
+
+        // Restore publishes the stored folder, then fails authentication
+        // (no credential in the store for this fixture server).
+        worker.restore_connection();
+        // The user signs in again; the Connecting event clears the folder
+        // facts, and accepting the session must restore them.
+        worker.connect(fx.url(), "user", "password");
+
+        let mut state = UiState::new(16);
+        for event in events.try_iter() {
+            state.apply(&event);
+        }
+        assert_eq!(
+            state.configured_mount_root.as_deref(),
+            Some(mount_root.display().to_string().as_str()),
+            "reauthentication must restore the remembered folder to the UI"
+        );
+        assert_eq!(state.folder_summary(), FolderSummary::Stopped);
+    }
+
+    /// A Settings games-folder edit applies to the session's remembered
+    /// config and reaches every dependent screen: the configured root,
+    /// the Start/Retry path, and the persisted preference for the next
+    /// launch (PR-review regression: edits were silently ignored).
+    #[test]
+    fn games_folder_apply_updates_the_session_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.connection_settings =
+            Some(ConnectionSettings::open(&directory.path().join("connection.db")).unwrap());
+        worker.preferences = Some(ConnectionPreferences {
+            server: "https://romm.example".into(),
+            account_id: 42,
+            device_identifier: "id".into(),
+            mount_root: Some(directory.path().join("old")),
+            integration: IntegrationMode::Generic,
+            retrobat_root: None,
+            start_at_login: false,
+            save_root: None,
+        });
+
+        worker.set_mount_root("  /new/roms  ");
+
+        assert_eq!(
+            worker.preferences.as_ref().unwrap().mount_root,
+            Some(PathBuf::from("/new/roms")),
+            "the edit is stored as the session's mount root"
+        );
+        assert_eq!(
+            worker
+                .connection_settings
+                .as_ref()
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap()
+                .mount_root,
+            Some(PathBuf::from("/new/roms")),
+            "the applied folder is persisted for the next launch"
+        );
+        let mut state = UiState::new(16);
+        for event in events.try_iter() {
+            state.apply(&event);
+        }
+        assert_eq!(state.configured_mount_root.as_deref(), Some("/new/roms"));
+        assert_eq!(
+            state.mount_path.as_deref(),
+            Some("/new/roms"),
+            "a stopped folder's Start/Retry path must follow the applied edit"
+        );
+        assert_eq!(state.folder_summary(), FolderSummary::Stopped);
+
+        // A live mount keeps its real path — the applied folder is the
+        // next start's target.
+        state.apply(&AppEvent::MountStarted {
+            path: "/live".into(),
+        });
+        state.apply(&AppEvent::MountRootConfigured {
+            server: "s".into(),
+            mount_root: "/newer".into(),
+        });
+        assert_eq!(state.mount_path.as_deref(), Some("/live"));
+        assert_eq!(state.configured_mount_root.as_deref(), Some("/newer"));
     }
 }

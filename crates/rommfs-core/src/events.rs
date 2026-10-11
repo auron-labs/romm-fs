@@ -144,6 +144,13 @@ pub enum AppEvent {
         server: String,
         mount_root: Option<String>,
     },
+    /// The games folder configured in Settings was applied to the active
+    /// session — every dependent screen uses this path until a live mount
+    /// or a later apply says otherwise.
+    MountRootConfigured {
+        server: String,
+        mount_root: String,
+    },
     IntegrationUpdated {
         mode: crate::connection_settings::IntegrationMode,
         retrobat_root: Option<String>,
@@ -155,7 +162,12 @@ pub enum AppEvent {
     ConnectFailed {
         reason: String,
     },
-    SignInRequired,
+    /// Authentication is required (again). `reason` preserves the real cause —
+    /// rejected credentials, an expired/rejected token, or a revoked pairing —
+    /// so the UI shows why, never a bare "sign-in required" placeholder.
+    SignInRequired {
+        reason: Option<String>,
+    },
 
     /// Actual counts and timings for one catalogue operation.
     CatalogueProgress {

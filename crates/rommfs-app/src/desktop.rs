@@ -2,7 +2,7 @@
 use rommfs_core::{Error, Result};
 #[cfg(any(windows, test))]
 use std::path::Path;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "ui"))]
 pub mod tray;
 
 #[cfg(any(windows, test))]

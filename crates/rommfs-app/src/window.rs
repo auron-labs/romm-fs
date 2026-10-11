@@ -6,7 +6,9 @@
 //! keyboard activation, and focus traversal come from the component
 //! library; the view composes sections and forwards `Command`s.
 
-use crate::controller::{Command, ConnState, Controller, MountState, UiState};
+use crate::controller::{
+    Command, ConnState, Controller, FolderSummary, MountState, SaveSyncSummary, UiState,
+};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
@@ -16,16 +18,17 @@ use gpui_kit::component::{
     label::Label,
     progress::Progress,
     radio::RadioGroup,
-    select::{Select, SelectEvent, SelectState},
+    select::{SearchableVec, Select, SelectEvent, SelectState},
     separator::Separator,
-    tab::{Tab, TabBar},
+    sidebar::{Sidebar, SidebarCollapsible, SidebarMenu, SidebarMenuItem},
+    switch::Switch,
     try_parse_color, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
     StyledExt as _, Theme, ThemeMode,
 };
 use gpui_kit::{
-    actions, div, point, prelude::*, px, size, App, Bounds, ClipboardItem, Context, Entity,
-    Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollHandle, SharedString,
-    Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
+    actions, div, point, prelude::*, px, size, AnyElement, App, Bounds, ClipboardItem, Context,
+    Entity, Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollHandle,
+    SharedString, Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use rommfs_core::connection_settings::IntegrationMode;
 use rommfs_core::events::{AppEvent, ForeignKind, Level, SaveSyncIncomingStatus};
@@ -42,6 +45,8 @@ actions!(
         ActivateControl,
     ]
 );
+
+mod pages;
 
 const LOG_CAP: usize = 500;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -101,9 +106,106 @@ fn error_line(text: impl Into<String>, cx: &App) -> impl IntoElement {
         .child(text.into())
 }
 
+/// "Technical details" disclosure for failure blocks: a quiet toggle plus
+/// the complete diagnostic text in mono. The full path and cause chain
+/// stay reachable even where the summary line is shortened (UI-PLAN §6).
+fn details_disclosure(
+    id: impl Into<SharedString>,
+    detail: String,
+    window: &mut Window,
+    cx: &mut Context<RommfsWindow>,
+) -> impl IntoElement {
+    let id = id.into();
+    let open = window.use_keyed_state(SharedString::from(format!("{id}-open")), cx, |_, _| {
+        std::cell::Cell::new(false)
+    });
+    let is_open = open.read(cx).get();
+    let toggle = open.clone();
+    v_flex()
+        .gap_1()
+        .child(
+            Button::new(id)
+                .ghost()
+                .small()
+                .label(if is_open {
+                    "Hide technical details"
+                } else {
+                    "Technical details"
+                })
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    toggle.update(cx, |open, _| open.set(!open.get()));
+                    cx.notify();
+                })),
+        )
+        .when(is_open, |this| {
+            this.child(
+                div()
+                    .w_full()
+                    .p_2()
+                    .bg(cx.theme().muted)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius)
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_xs()
+                    .child(detail),
+            )
+        })
+}
+
+/// The shared failure presentation (UI-PLAN §6): a title, the real reason
+/// as the explanation, the relevant action, and expandable details —
+/// placed at the top of the section the failure belongs to.
+fn failure_block(
+    id: &'static str,
+    title: &'static str,
+    explanation: String,
+    action: Option<Button>,
+    detail: String,
+    window: &mut Window,
+    cx: &mut Context<RommfsWindow>,
+) -> impl IntoElement {
+    v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(cx.theme().danger)
+                .child(title),
+        )
+        .child(muted(explanation, cx))
+        .when_some(action, |this, button| {
+            this.child(div().pt_1().child(button))
+        })
+        .child(details_disclosure(
+            SharedString::from(format!("{id}-details")),
+            detail,
+            window,
+            cx,
+        ))
+}
+
+/// "start filesystem backend for mount \"…\" failed: <cause>" — keep the
+/// cause as the explanation and the whole chain for the details lane.
+fn failure_explanation(error: &str) -> String {
+    error
+        .split_once(" failed: ")
+        .map(|(_, cause)| cause.to_string())
+        .unwrap_or_else(|| error.to_string())
+}
+
 fn section_heading(text: &'static str) -> impl IntoElement {
     div()
         .text_base()
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(text)
+}
+
+/// ~24px page title (UI-PLAN §2 visual scale).
+fn page_heading(text: &'static str) -> impl IntoElement {
+    div()
+        .text_2xl()
         .font_weight(FontWeight::SEMIBOLD)
         .child(text)
 }
@@ -167,10 +269,10 @@ struct RommfsWindow {
     user_input: Entity<InputState>,
     password_input: Entity<InputState>,
     mount_input: Entity<InputState>,
-    install_select: Entity<SelectState<Vec<SharedString>>>,
+    install_select: Entity<SelectState<SearchableVec<SharedString>>>,
     save_folder_input: Entity<InputState>,
     save_file_input: Entity<InputState>,
-    save_game_select: Entity<SelectState<Vec<SharedString>>>,
+    save_game_select: Entity<SelectState<SearchableVec<SharedString>>>,
     debounce_input: Entity<InputState>,
     debounce_input_applied: String,
     debounce_error: Option<String>,
@@ -179,11 +281,40 @@ struct RommfsWindow {
     integration_choice: usize,
     /// Settings-tab installation picker; fed by the same discovery candidates
     /// as `install_select` but bound to the integration's RetroBat root.
-    settings_install_select: Entity<SelectState<Vec<SharedString>>>,
+    settings_install_select: Entity<SelectState<SearchableVec<SharedString>>>,
     completed_open: bool,
     mapping_open: bool,
+    /// Settings > Advanced disclosure (save-change delay).
     advanced_open: bool,
+    /// Settings > optional RetroBat setup & support files disclosure.
+    optional_setup_open: bool,
+    /// Settings > "Use a different save folder" disclosure.
+    custom_saves_open: bool,
+    // --- Save review page state (window/pages/save_review.rs) ---
+    /// Search box filtering the review table by name, file, or target path.
+    #[allow(dead_code)] // read by pages/save_review.rs (UI-PLAN task 4)
+    save_review_search: Entity<InputState>,
+    /// Zero-based page of the review table.
+    #[allow(dead_code)] // read by pages/save_review.rs
+    save_review_page: usize,
+    /// Row key expanded to its detail block (file id or title key).
+    #[allow(dead_code)] // read by pages/save_review.rs
+    save_review_expanded: Option<SharedString>,
+    // --- Activity page state (window/pages/activity.rs) ---
+    /// Minimum log severity shown: 0 = everything, 1 = warnings+errors,
+    /// 2 = errors only.
+    #[allow(dead_code)] // read by pages/activity.rs (UI-PLAN task 5)
+    activity_min_level: usize,
+    /// Follow the newest log entry; scrolling up unsets it.
+    #[allow(dead_code)] // read by pages/activity.rs
+    activity_follow_log: bool,
+    /// Substring filter for the technical log (UI-PLAN §6 search).
+    #[allow(dead_code)] // read by pages/activity.rs
+    activity_search: Entity<InputState>,
     log_scroll: ScrollHandle,
+    /// True when a system tray exists and closing the window only hides it —
+    /// close-vs-quit copy is derived from this, never assumed (UI-PLAN §3).
+    tray_hides: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -192,6 +323,7 @@ impl RommfsWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
         session: Rc<RefCell<crate::session::ApplicationSession>>,
+        tray_hides: bool,
     ) -> Self {
         let controller = session.borrow().controller();
 
@@ -204,29 +336,61 @@ impl RommfsWindow {
                 .masked(true)
         });
         // Drive roots reject directory creation for standard users on many
-        // systems; the profile directory is always writable.
+        // systems; the profile directory is always writable. Off Windows a
+        // home-relative default keeps the first-start error honest instead
+        // of offering C:\RomM on a Linux box.
+        #[cfg(windows)]
         let default_mount = std::env::var_os("USERPROFILE")
             .map(|profile| std::path::PathBuf::from(profile).join("RomM"))
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "C:\\RomM".to_string());
+        #[cfg(not(windows))]
+        let default_mount = std::env::var_os("HOME")
+            .map(|home| std::path::PathBuf::from(home).join("RomM"))
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "~/RomM".to_string());
         let mount_input = cx.new(|cx| InputState::new(window, cx).default_value(default_mount));
-        let install_select =
-            cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
+        let install_select = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::from(Vec::<SharedString>::new()),
+                None,
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
         let save_folder_input = cx
             .new(|cx| InputState::new(window, cx).placeholder("Folder containing only save data"));
         let save_file_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Relative path, for example switch/user/title/0")
         });
-        let save_game_select =
-            cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
+        let save_game_select = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::from(Vec::<SharedString>::new()),
+                None,
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
         let debounce_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string())
         });
 
-        let settings_install_select =
-            cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
+        let settings_install_select = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::from(Vec::<SharedString>::new()),
+                None,
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+        let save_review_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search saves"));
+        let activity_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search log"));
         let mut subscriptions = Vec::new();
 
         // Enter in a connection field is the section's default commit.
@@ -241,6 +405,30 @@ impl RommfsWindow {
                 },
             ));
         }
+
+        // The save-review table re-filters live and restarts at page one
+        // whenever the query changes.
+        subscriptions.push(cx.subscribe_in(
+            &save_review_search,
+            window,
+            |view, _state, event, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    view.save_review_page = 0;
+                    cx.notify();
+                }
+            },
+        ));
+
+        // Typing in the log search re-filters live.
+        subscriptions.push(cx.subscribe_in(
+            &activity_search,
+            window,
+            |_view, _state, event, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        ));
 
         subscriptions.push(cx.subscribe_in(
             &install_select,
@@ -339,14 +527,25 @@ impl RommfsWindow {
             debounce_input,
             debounce_input_applied: rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string(),
             debounce_error: None,
-            active_view: 3,
+            // Fresh installs start on the guided setup view (UI-PLAN §3);
+            // the first connection event re-routes to Overview.
+            active_view: 4,
             password_sign_in: false,
             integration_choice: 0,
             settings_install_select,
             completed_open: false,
             mapping_open: false,
             advanced_open: false,
+            optional_setup_open: false,
+            custom_saves_open: false,
+            save_review_search,
+            save_review_page: 0,
+            save_review_expanded: None,
+            activity_min_level: 0,
+            activity_follow_log: true,
+            activity_search,
             log_scroll: ScrollHandle::new(),
+            tray_hides,
             _subscriptions: subscriptions,
         };
         let focus = view.url_input.read(cx).focus_handle(cx);
@@ -372,8 +571,9 @@ impl RommfsWindow {
                         .iter()
                         .map(|(id, name)| SharedString::from(format!("{id} · {name}")))
                         .collect::<Vec<_>>();
-                    self.save_game_select
-                        .update(cx, |state, cx| state.set_items(items, window, cx));
+                    self.save_game_select.update(cx, |state, cx| {
+                        state.set_items(SearchableVec::from(items), window, cx)
+                    });
                 }
                 AppEvent::SaveSyncUpdated { .. } | AppEvent::SaveSyncSessionChanged { .. } => {
                     save_sync_updated = true;
@@ -387,7 +587,19 @@ impl RommfsWindow {
                 }
                 AppEvent::PairingReady { url, .. } => cx.open_url(url),
                 AppEvent::Connected => self.active_view = 0,
-                AppEvent::SignedOut => self.active_view = 3,
+                // SignedOut with no remembered account is the unconfigured
+                // state — guided setup, not the full settings page.
+                AppEvent::SignedOut => self.active_view = 4,
+                // A remembered account that needs re-auth IS configured —
+                // send it to Overview where the sign-in action lives
+                // (existing config must never replay onboarding).
+                AppEvent::SignInRequired { .. } => self.active_view = 0,
+                // A remembered account whose server is temporarily down is
+                // still configured — Overview, never guided setup again
+                // (UI-PLAN §4).
+                AppEvent::ConnectFailed { .. } if self.state.connected_server.is_some() => {
+                    self.active_view = 0;
+                }
                 AppEvent::ConnectionRestored { server, mount_root } => {
                     self.url_input
                         .update(cx, |input, cx| input.set_value(server.clone(), window, cx));
@@ -395,6 +607,12 @@ impl RommfsWindow {
                         self.mount_input
                             .update(cx, |input, cx| input.set_value(root.clone(), window, cx));
                     }
+                }
+                // An applied folder normalizes the field it was typed in.
+                AppEvent::MountRootConfigured { mount_root, .. } => {
+                    self.mount_input.update(cx, |input, cx| {
+                        input.set_value(mount_root.clone(), window, cx)
+                    });
                 }
                 AppEvent::SaveSyncSessionChanged { .. } => {
                     if self.debounce_input.read(cx).value() == self.debounce_input_applied {
@@ -459,7 +677,7 @@ impl RommfsWindow {
                     .cloned()
             });
         self.install_select.update(cx, |state, cx| {
-            state.set_items(items, window, cx);
+            state.set_items(SearchableVec::from(items), window, cx);
             match selected {
                 Some(value) => state.set_selected_value(&value, window, cx),
                 None => state.set_selected_index(None, window, cx),
@@ -493,7 +711,7 @@ impl RommfsWindow {
                 .cloned()
         });
         self.settings_install_select.update(cx, |state, cx| {
-            state.set_items(items, window, cx);
+            state.set_items(SearchableVec::from(items), window, cx);
             match selected {
                 Some(value) => state.set_selected_value(&value, window, cx),
                 None => state.set_selected_index(None, window, cx),
@@ -519,10 +737,16 @@ impl RommfsWindow {
     }
 
     fn on_start_mount(&mut self, cx: &mut Context<Self>) {
+        let path = self.mount_input.read(cx).value().to_string();
+        self.start_mount(path, cx);
+    }
+
+    /// Start a mount at an explicit path — shared by the folder field's
+    /// Start action and the per-state actions on Overview (UI-PLAN §3).
+    fn start_mount(&mut self, path: String, cx: &mut Context<Self>) {
         if matches!(self.state.mount, MountState::Mounting | MountState::Mounted) {
             return;
         }
-        let path = self.mount_input.read(cx).value().to_string();
         self.state.request_mount(path.clone());
         cx.notify();
         self.controller.send(Command::StartMount { path });
@@ -572,6 +796,43 @@ impl RommfsWindow {
                 Ok(Err(error)) => {
                     let _ = this.update(cx, |view, _| {
                         view.show_picker_error(format!("RetroBat folder picker failed: {error}"))
+                    });
+                }
+                Err(_) => {
+                    let _ = this.update(cx, |view, _| {
+                        view.show_picker_error("folder picker response was interrupted".into())
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// §4 step 2 offers a folder picker beside the free-text path.
+    fn browse_games_folder(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Select the games folder".into()),
+        });
+        cx.spawn(
+            async move |this: WeakEntity<RommfsWindow>, cx| match paths.await {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        let _ = this.update_in(cx, |view, window, cx| {
+                            let text = path.display().to_string();
+                            view.mount_input.update(cx, |input, cx| {
+                                input.set_value(text, window, cx);
+                            });
+                            cx.notify();
+                        });
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    let _ = this.update(cx, |view, _| {
+                        view.show_picker_error(format!("Games folder picker failed: {error}"))
                     });
                 }
                 Err(_) => {
@@ -726,74 +987,59 @@ impl RommfsWindow {
 
     // --- render helpers ---
 
+    /// The header marker is explicitly the *RomM connection* status — a
+    /// bare "Connected" reads as app-wide health (UI-PLAN §3).
     fn conn_status(&self, cx: &App) -> (SharedString, StatusKind) {
         match self.state.conn {
-            ConnState::Idle => ("Not connected".into(), StatusKind::Muted),
-            ConnState::Connecting => ("Connecting…".into(), StatusKind::Warning),
+            ConnState::Idle => ("RomM · not connected".into(), StatusKind::Muted),
+            ConnState::Connecting => ("RomM · connecting…".into(), StatusKind::Warning),
             ConnState::Connected => {
                 let user = self.user_input.read(cx).value();
                 if user.is_empty() {
-                    ("Connected".into(), StatusKind::Success)
+                    ("RomM · connected".into(), StatusKind::Success)
                 } else {
-                    (format!("Connected · {user}").into(), StatusKind::Success)
+                    (
+                        format!("RomM · connected · {user}").into(),
+                        StatusKind::Success,
+                    )
                 }
             }
-            ConnState::Failed => ("Connection failed".into(), StatusKind::Danger),
-            ConnState::SignInRequired => ("Sign-in required".into(), StatusKind::Danger),
+            ConnState::Failed => ("RomM · connection failed".into(), StatusKind::Danger),
+            ConnState::SignInRequired => ("RomM · sign-in required".into(), StatusKind::Danger),
         }
     }
 
+    /// The folder marker derives from `UiState::folder_summary` — real mount
+    /// events plus persisted config, never the connection state.
     fn mount_status(&self, _cx: &App) -> (SharedString, StatusKind) {
-        match self.state.mount {
-            MountState::NotMounted => ("Not mounted".into(), StatusKind::Muted),
-            MountState::Mounting => ("Mounting…".into(), StatusKind::Warning),
-            MountState::Mounted => ("Mounted".into(), StatusKind::Success),
-            MountState::Failed => ("Mount failed".into(), StatusKind::Danger),
-        }
+        let summary = self.state.folder_summary();
+        let kind = match summary {
+            FolderSummary::SetupNeeded | FolderSummary::Stopped => StatusKind::Muted,
+            FolderSummary::Starting => StatusKind::Warning,
+            FolderSummary::Ready => StatusKind::Success,
+            FolderSummary::Failed => StatusKind::Danger,
+        };
+        (summary.label().into(), kind)
     }
 
+    /// The single derived save-sync status (UI-PLAN §5): zero linked files
+    /// is "No files ready to sync", never "Up to date".
     fn save_sync_status(&self) -> (&'static str, StatusKind) {
-        if self.state.conn == ConnState::SignInRequired
-            || self.state.save_sync_authentication_required
-        {
-            return ("Authentication required", StatusKind::Danger);
-        }
-        if self.state.conn == ConnState::Failed {
-            return ("Offline", StatusKind::Danger);
-        }
-        if !self.state.save_sync_enabled {
-            return ("Disabled", StatusKind::Muted);
-        }
-        if self
-            .state
-            .save_sync_queue
-            .as_ref()
-            .is_some_and(|queue| queue.network_paused)
-        {
-            return ("Paused", StatusKind::Danger);
-        }
-        if !self.state.save_sync_available {
-            return ("Not ready", StatusKind::Danger);
-        }
-        let Some(queue) = self.state.save_sync_queue.as_ref() else {
-            return ("Reconciling", StatusKind::Warning);
+        let summary = self.state.save_sync_summary();
+        let kind = match summary {
+            SaveSyncSummary::AuthRequired
+            | SaveSyncSummary::Offline
+            | SaveSyncSummary::NeedsAttention
+            | SaveSyncSummary::Paused => StatusKind::Danger,
+            SaveSyncSummary::NeedsSetup
+            | SaveSyncSummary::Checking
+            | SaveSyncSummary::NoLinkedFiles
+            | SaveSyncSummary::Reconciling
+            | SaveSyncSummary::Syncing => StatusKind::Warning,
+            SaveSyncSummary::Off => StatusKind::Muted,
+            SaveSyncSummary::UpToDate => StatusKind::Success,
         };
-        if queue.actor_failed {
-            return ("Failed", StatusKind::Danger);
-        }
-        if queue.reconciled_games < queue.mapped_games {
-            return ("Reconciling", StatusKind::Warning);
-        }
-        if queue.attention_games > 0 || queue.pending_incoming > 0 {
-            return ("Review needed", StatusKind::Warning);
-        }
-        if queue.failure.is_some() {
-            return ("Retrying", StatusKind::Warning);
-        }
-        if queue.pending_outbound > 0 {
-            return ("Syncing", StatusKind::Warning);
-        }
-        ("Up to date", StatusKind::Success)
+        (summary.label(), kind)
     }
 
     /// A disclosure row is one interactive control: pointer, Enter, Space,
@@ -849,147 +1095,869 @@ impl RommfsWindow {
             .child(title)
     }
 
-    fn render_header(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The ~190px left navigation: four destinations, and the server host
+    /// plus a labelled RomM connection status pinned at the bottom
+    /// (UI-PLAN §2). Nav clicks reach the view through its WeakEntity.
+    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let weak = cx.weak_entity();
         let (conn_text, conn_kind) = self.conn_status(cx);
-        h_flex()
-            .justify_between()
-            .child(
+        let host = self
+            .state
+            .connected_server
+            .clone()
+            .filter(|server| !server.is_empty())
+            .unwrap_or_else(|| self.url_input.read(cx).value().to_string());
+        let active = self.active_view;
+        let mut menu = SidebarMenu::new();
+        for (index, label) in ["Overview", "Save sync", "Activity", "Settings"]
+            .into_iter()
+            .enumerate()
+        {
+            let weak = weak.clone();
+            menu = menu.child(
+                SidebarMenuItem::new(label)
+                    .active(active == index)
+                    .on_click(move |_, _, cx| {
+                        if weak
+                            .update(cx, |view, _cx| view.active_view = index)
+                            .is_ok()
+                        {
+                            cx.notify(weak.entity_id());
+                        }
+                    }),
+            );
+        }
+        Sidebar::new("app-nav")
+            .w(px(190.))
+            .collapsible(SidebarCollapsible::None)
+            .header(
                 div()
-                    .text_2xl()
-                    .font_weight(FontWeight::BOLD)
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
                     .child("RomMFS"),
             )
-            .child(status_marker(conn_kind, conn_text, cx))
+            .child(menu)
+            .footer(
+                v_flex()
+                    .gap_1()
+                    .child(muted_xs(
+                        if host.is_empty() {
+                            "No server configured".to_string()
+                        } else {
+                            host
+                        },
+                        cx,
+                    ))
+                    .child(status_marker(conn_kind, conn_text, cx)),
+            )
     }
 
+    /// A button that just switches destination — for "go fix this" actions on
+    /// summary cards.
+    fn nav_button(
+        &mut self,
+        id: &'static str,
+        label: &'static str,
+        view: usize,
+        primary: bool,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let button = Button::new(id).label(label);
+        let button = if primary {
+            button.primary()
+        } else {
+            button.outline()
+        };
+        button.on_click(cx.listener(move |this, _, _, cx| {
+            this.active_view = view;
+            cx.notify();
+        }))
+    }
+
+    /// Overview: truthful summaries for the three subsystems, each with the
+    /// action its own state calls for (UI-PLAN §3).
+    fn render_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (conn_text, conn_kind) = self.conn_status(cx);
+        let (sync_text, sync_kind) = self.save_sync_status();
+        let needs_sign_in = self.state.conn == ConnState::SignInRequired;
+        // §3: the connection block appears only for a live problem or
+        // when sign-in is needed — a healthy connection adds no section.
+        let show_connection = needs_sign_in || self.state.conn_error.is_some();
+        let unlinked = self.state.save_sync_catalogue_unmapped;
+        v_flex()
+            .gap_6()
+            .child(page_heading("Overview"))
+            .when(show_connection, |this| {
+                this.child(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .child(section_heading("RomM connection"))
+                                .child(status_marker(conn_kind, conn_text, cx)),
+                        )
+                        .when_some(self.state.conn_error.clone(), |this, error| {
+                            this.child(error_line(error, cx))
+                        })
+                        .child(self.nav_button(
+                            "overview-connection",
+                            if needs_sign_in {
+                                "Sign in"
+                            } else {
+                                "Connection settings"
+                            },
+                            3,
+                            needs_sign_in,
+                            cx,
+                        )),
+                )
+                .child(Separator::horizontal())
+            })
+            .child(self.render_mount(window, cx))
+            .child(Separator::horizontal())
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(section_heading("Save sync"))
+                            .child(status_marker(sync_kind, sync_text, cx)),
+                    )
+                    .when_some(self.state.save_sync_problem.clone(), |this, problem| {
+                        this.child(muted(problem, cx))
+                    })
+                    .when(
+                        self.state.save_sync_summary() == SaveSyncSummary::NoLinkedFiles
+                            && unlinked > 0,
+                        |this| {
+                            this.child(muted(
+                                format!(
+                                    "{} file{} found that aren't linked to a game yet",
+                                    fmt_count(unlinked),
+                                    if unlinked == 1 { "" } else { "s" }
+                                ),
+                                cx,
+                            ))
+                        },
+                    )
+                    .child(self.nav_button("overview-saves", "Review saves", 1, false, cx)),
+            )
+            .child(Separator::horizontal())
+            .child(self.render_overview_retrobat(cx))
+    }
+
+    /// §3 RetroBat summary: installed directory, running/error state, and
+    /// the manage action (the install buttons live in Settings).
+    fn render_overview_retrobat(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (text, kind) = if self.state.retrobat_setup_running {
+            ("Installing…", StatusKind::Warning)
+        } else if self.state.retrobat_setup_error.is_some() {
+            ("Setup failed", StatusKind::Danger)
+        } else if self.state.retrobat_root.is_some() {
+            ("Installed", StatusKind::Success)
+        } else {
+            ("Not set up", StatusKind::Muted)
+        };
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(section_heading("RetroBat"))
+                    .child(status_marker(kind, text, cx)),
+            )
+            .when_some(self.state.retrobat_root.clone(), |this, root| {
+                this.child(muted(root, cx))
+            })
+            .when_some(self.state.retrobat_setup_detail.clone(), |this, detail| {
+                if self.state.retrobat_setup_running {
+                    this.child(muted(detail, cx))
+                } else {
+                    this
+                }
+            })
+            .when_some(self.state.retrobat_setup_error.clone(), |this, error| {
+                this.child(error_line(error, cx))
+            })
+            .child(self.nav_button("overview-retrobat", "RetroBat settings", 3, false, cx))
+    }
+
+    fn render_activity(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_4()
+            .flex_1()
+            .min_h_0()
+            .child(page_heading("Activity"))
+            .child(self.render_downloads(window, cx))
+            .child(self.render_log(window, cx))
+    }
+
+    /// Settings in the plan's order (UI-PLAN §Settings organization):
+    /// everyday settings first — connection, folders, background — then
+    /// disclosures for optional setup and advanced tuning.
+    fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let locked = self.state.retrobat_setup_running
+            || self.state.auxiliary_running
+            || matches!(self.state.mount, MountState::Mounted | MountState::Mounting);
+        v_flex()
+            .gap_6()
+            .child(page_heading("Settings"))
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(section_heading("Connection"))
+                    .child(self.render_connection(window, cx)),
+            )
+            .child(Separator::horizontal())
+            .child(self.render_folders_section(locked, window, cx))
+            .child(Separator::horizontal())
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(section_heading("Background operation"))
+                    .child(self.render_background_panel(cx)),
+            )
+            .child(Separator::horizontal())
+            .child(
+                Collapsible::new()
+                    .open(self.optional_setup_open)
+                    .child(self.disclosure_row(
+                        "optional-setup-disclosure",
+                        "RetroBat setup & support files",
+                        self.optional_setup_open,
+                        |view| view.optional_setup_open = !view.optional_setup_open,
+                        window,
+                        cx,
+                    ))
+                    .content(
+                        v_flex()
+                            .gap_3()
+                            .pt_2()
+                            .child(section_heading("RetroBat"))
+                            .child(self.retrobat_setup_panel(locked, cx))
+                            .child(Separator::horizontal())
+                            .child(section_heading("Support files"))
+                            .child(self.support_files_panel(locked, cx)),
+                    ),
+            )
+            .child(Separator::horizontal())
+            .child(
+                Collapsible::new()
+                    .open(self.advanced_open)
+                    .child(self.disclosure_row(
+                        "settings-advanced-disclosure",
+                        "Advanced",
+                        self.advanced_open,
+                        |view| view.advanced_open = !view.advanced_open,
+                        window,
+                        cx,
+                    ))
+                    .content(self.render_advanced_detail(window, cx)),
+            )
+    }
+
+    /// Folders: the games folder once, the layout choice, and the custom
+    /// save-data folder behind its own disclosure (UI-PLAN §Settings).
+    fn render_folders_section(
+        &mut self,
+        locked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .child(section_heading("Folders"))
+            .child(field_column(
+                "Games folder",
+                Input::new(&self.mount_input).w_full(),
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("apply-games-folder")
+                            .label("Use games folder")
+                            .outline()
+                            .disabled(
+                                locked
+                                    || self.state.conn != ConnState::Connected
+                                    || self.mount_input.read(cx).value().trim().is_empty(),
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                let path =
+                                    view.mount_input.read(cx).value().trim().to_string();
+                                view.controller.send(Command::SetMountRoot { path });
+                                cx.notify();
+                            })),
+                    )
+                    .when(
+                        locked || self.state.conn != ConnState::Connected,
+                        |this| {
+                            // §6: the disabled action explains why.
+                            this.child(muted_xs(
+                                if locked {
+                                    "Stop the games folder to change its location."
+                                } else {
+                                    "Connect to RomM first."
+                                },
+                                cx,
+                            ))
+                        },
+                    ),
+            )
+            .child(self.layout_radio(locked, cx))
+            .when(self.integration_choice == 1, |this| {
+                this.child(self.retrobat_install_row(cx))
+            })
+            .when_some(
+                self.state
+                    .save_sync_effective_saves_root
+                    .clone()
+                    .or_else(|| self.state.save_sync_selected_root.clone()),
+                |this, root| {
+                    this.child(muted_xs(format!("Save data is kept in {root}"), cx))
+                },
+            )
+            .child(
+                Collapsible::new()
+                    .open(self.custom_saves_open)
+                    .child(self.disclosure_row(
+                        "custom-saves-disclosure",
+                        "Use a different save folder",
+                        self.custom_saves_open,
+                        |view| view.custom_saves_open = !view.custom_saves_open,
+                        window,
+                        cx,
+                    ))
+                    .content(
+                        v_flex()
+                            .gap_2()
+                            .pt_2()
+                            .child(field_column(
+                                "Save-data folder",
+                                Input::new(&self.save_folder_input).w_full(),
+                                cx,
+                            ))
+                            .child(
+                                Button::new("choose-save-folder")
+                                    .label("Use save folder")
+                                    .outline()
+                                    .disabled(self.state.conn != ConnState::Connected)
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.controller.send(Command::SelectSaveFolder {
+                                            path: PathBuf::from(
+                                                view.save_folder_input
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim(),
+                                            ),
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(muted_xs(
+                                "Select saves only, not an emulator's entire portable folder. All file formats and companions are supported. Shared saves and memory cards remain excluded.",
+                                cx,
+                            )),
+                    ),
+            )
+    }
+
+    /// First-run setup for an unconfigured install (UI-PLAN §3): connect to
+    /// RomM, then choose the games folder. Optional integrations stay in
+    /// Settings — they are never prerequisites here.
+    fn render_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let locked = self.state.retrobat_setup_running
+            || self.state.auxiliary_running
+            || matches!(self.state.mount, MountState::Mounted | MountState::Mounting);
+        let mounted = self.state.mount == MountState::Mounted;
+        let mounting = self.state.mount == MountState::Mounting;
+        let (mount_text, mount_kind) = self.mount_status(cx);
+        v_flex()
+            .gap_6()
+            .child(page_heading("Set up RomMFS"))
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(section_heading("1. Connect to RomM"))
+                    .child(self.render_connection(window, cx)),
+            )
+            .child(Separator::horizontal())
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(section_heading("2. Choose the games folder"))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_end()
+                            .child(div().flex_1().min_w_0().child(field_column(
+                                "Games folder",
+                                Input::new(&self.mount_input).w_full(),
+                                cx,
+                            )))
+                            .child(
+                                Button::new("setup-browse-folder")
+                                    .label("Browse…")
+                                    .outline()
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.browse_games_folder(cx)),
+                                    ),
+                            ),
+                    )
+                    .child(self.layout_radio(locked, cx))
+                    .when(self.integration_choice == 1, |this| {
+                        this.child(self.retrobat_install_row(cx))
+                    })
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                Button::new("setup-start-folder")
+                                    .label(if mounted {
+                                        "Folder is running"
+                                    } else {
+                                        "Start games folder"
+                                    })
+                                    .primary()
+                                    .disabled(mounted || mounting)
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.on_start_mount(cx)),
+                                    ),
+                            )
+                            .child(status_marker(mount_kind, mount_text, cx)),
+                    )
+                    .when(mounting, |this| match self.state.mount_progress.clone() {
+                        Some((stage, completed, total, elapsed)) => this.child(operation_progress(
+                            "setup-mount-progress",
+                            &stage,
+                            completed,
+                            total,
+                            elapsed,
+                            cx,
+                        )),
+                        None => this.child(Progress::new("setup-mount-progress").value(0.)),
+                    })
+                    .when_some(self.state.mount_error.clone(), |this, error| {
+                        // §6 failure presentation; the Start action above
+                        // is already this section's retry.
+                        this.child(failure_block(
+                            "setup-mount-failure",
+                            "Couldn't start the games folder",
+                            failure_explanation(&error),
+                            None,
+                            error,
+                            window,
+                            cx,
+                        ))
+                    })
+                    .when_some(self.render_foreign_remediation(cx), |this, block| {
+                        this.child(block)
+                    })
+                    .child(self.nav_button(
+                        "setup-advanced",
+                        "More options in Settings",
+                        3,
+                        false,
+                        cx,
+                    )),
+            )
+    }
+
+    /// Only the controls meaningful for the *current* auth state render —
+    /// a signed-in session never sits beside its own sign-in buttons
+    /// (UI-PLAN screenshot finding), and failures keep their real reason.
+    /// The account block: real server/account when signed in, sign-in
+    /// controls only when the state calls for them. The identity never
+    /// falls back to a raw database id (UI-PLAN §Settings > Connection).
     fn render_connection(
         &mut self,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let connecting = self.state.conn == ConnState::Connecting;
+        let conn = self.state.conn;
+        let connecting = conn == ConnState::Connecting;
+        let connected = conn == ConnState::Connected;
+        // The server that actually answered — a remembered session may
+        // never have typed into the url field this launch.
+        let server = self
+            .state
+            .connected_server
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.url_input.read(cx).value().to_string());
+        let user = self.user_input.read(cx).value();
+        let summary = if server.is_empty() {
+            "Signed in".to_string()
+        } else if user.is_empty() {
+            format!("Signed in to {server}")
+        } else {
+            format!("Signed in to {server} · {user}")
+        };
         v_flex().gap_3()
-            .child(section_heading("Connection"))
-            .child(field_column("Server URL", Input::new(&self.url_input).w_full(), cx))
-            .child(h_flex().gap_2()
+            .when(!connected, |this| this
+                .child(field_column("Server URL", Input::new(&self.url_input).w_full(), cx)))
+            .when(connected, |this| this
+                .child(muted(summary.clone(), cx))
+                .child(h_flex().gap_2()
+                    .child(Button::new("change-server").label("Change server").outline()
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.controller.send(Command::Logout); cx.notify();
+                        })))
+                    .child(Button::new("sign-out").label("Sign out")
+                        .on_click(cx.listener(|view, _, _, cx| { view.controller.send(Command::Logout); cx.notify(); })))))
+            .when(connecting, |this| this
+                .child(Button::new("cancel-sign-in").label("Cancel sign-in")
+                    .on_click(cx.listener(|view, _, _, cx| { view.controller.send(Command::CancelPairing); cx.notify(); }))))
+            .when(!connecting && !connected, |this| this
                 .child(Button::new("browser-sign-in").label("Sign in with browser…")
-                    .primary().loading(connecting && !self.password_sign_in).disabled(connecting)
+                    .primary()
                     .on_click(cx.listener(|view, _, _, cx| {
                         view.password_sign_in = false; view.on_connect(cx); cx.notify();
                     })))
-                .child(Button::new("cancel-sign-in").label("Cancel sign-in")
-                    .disabled(!connecting).on_click(cx.listener(|view, _, _, cx| { view.controller.send(Command::CancelPairing); cx.notify(); })))
-                .child(Button::new("sign-out").label("Sign out")
-                    .disabled(self.state.conn != ConnState::Connected).on_click(cx.listener(|view, _, _, cx| { view.controller.send(Command::Logout); cx.notify(); }))))
+                .child(Collapsible::new().open(self.password_sign_in)
+                    .child(Button::new("password-sign-in-options").ghost().label(if self.password_sign_in { "Hide password sign-in" } else { "Use password instead" })
+                        .on_click(cx.listener(|view,_,_,cx| { view.password_sign_in = !view.password_sign_in; cx.notify(); })))
+                    .content(v_flex().gap_3()
+                        .child(h_flex().gap_3().items_stretch()
+                            .child(div().flex_1().min_w_0().child(field_column("Username", Input::new(&self.user_input).w_full(), cx)))
+                            .child(div().flex_1().min_w_0().child(field_column("Password", Input::new(&self.password_input).w_full().content_type(InputContentType::Password).mask_toggle(), cx))))
+                        .child(Button::new("connect").label("Connect with password")
+                            .on_click(cx.listener(|view,_,_,cx| view.on_connect(cx))))
+                        .child(muted("Password sign-in is not remembered. Browser sign-in uses Windows Credential Manager.", cx)))))
             .when_some(self.state.pairing_code.clone(), |this, code| this.child(muted(format!("Approve RomMFS in your browser · code {code}"), cx)))
-            .child(Collapsible::new().open(self.password_sign_in)
-                .child(Button::new("password-sign-in-options").ghost().label(if self.password_sign_in { "Hide password sign-in" } else { "Use password instead" })
-                    .disabled(connecting).on_click(cx.listener(|view,_,_,cx| { view.password_sign_in = !view.password_sign_in; cx.notify(); })))
-                .content(v_flex().gap_3()
-                    .child(h_flex().gap_3().items_stretch()
-                        .child(div().flex_1().min_w_0().child(field_column("Username", Input::new(&self.user_input).w_full(), cx)))
-                        .child(div().flex_1().min_w_0().child(field_column("Password", Input::new(&self.password_input).w_full().content_type(InputContentType::Password).mask_toggle(), cx))))
-                    .child(Button::new("connect").label("Connect with password").disabled(connecting)
-                        .on_click(cx.listener(|view,_,_,cx| view.on_connect(cx))))
-                    .child(muted("Password sign-in is not remembered. Browser sign-in uses Windows Credential Manager.", cx))))
             .when_some(self.state.conn_error.clone(), |this,error| this.child(error_line(error,cx)))
     }
 
-    fn render_integration(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let locked = self.state.retrobat_setup_running
-            || matches!(self.state.mount, MountState::Mounted | MountState::Mounting);
-        v_flex().gap_3()
-            .child(section_heading("Background operation"))
-            .child(Button::new("start-at-login").label(if self.state.start_at_login { "Disable start at login" } else { "Enable start at login" })
-                .disabled(!cfg!(windows) || (!self.state.start_at_login && self.state.conn != ConnState::Connected))
-                .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::SetStartAtLogin { enabled: !view.state.start_at_login }); cx.notify(); })))
-            .child(muted("On Windows, closing the window hides RomMFS in the tray. Use tray Quit to stop background work. Login startup reconnects and mounts before resuming previously authorized save sync.",cx))
-            .when_some(self.state.startup_error.clone(),|this,error| this.child(error_line(error,cx)))
+    /// Generic-folders vs RetroBat — the same choice in Settings > Folders
+    /// and the first-run folder step.
+    fn layout_radio(&mut self, locked: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
             .child(section_heading("Library layout"))
-            .child(RadioGroup::horizontal("library-layout").children(["Generic folders", "RetroBat"])
-                .selected_index(Some(self.integration_choice)).disabled(locked)
-                .on_change(cx.listener(|view,index,_,cx| {
-                    view.integration_choice = *index;
-                    // The layout applies on selection — no separate Apply step.
-                    // Generic applies unconditionally; RetroBat applies once an
-                    // installation is known, otherwise the picker below is the
-                    // apply trigger.
-                    if *index == 0 {
-                        let retrobat_root = view.state.retrobat_root.as_deref().map(PathBuf::from);
-                        view.controller.send(Command::SetIntegration { mode: IntegrationMode::Generic, retrobat_root });
-                    } else if let Some(root) = view.settings_install_root(cx) {
-                        view.controller.send(Command::SetIntegration { mode: IntegrationMode::RetroBat, retrobat_root: Some(root) });
-                    }
-                    cx.notify();
-                })))
-            .when(self.integration_choice == 1, |this| this
-                .child(h_flex().gap_2()
-                    .child(Button::new("download-retrobat").label("Download official installer")
-                        .disabled(self.state.installer_running)
-                        .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::DownloadRetroBatInstaller); cx.notify(); })))
-                    .child(Button::new("launch-retrobat-installer").label("Launch installer…")
-                        .disabled(!self.state.installer_ready || self.state.installer_running)
-                        .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::LaunchRetroBatInstaller); cx.notify(); })))
-                    .when(self.state.installer_running, |this| this.child(Button::new("cancel-retrobat-installer").label("Cancel download")
-                        .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::CancelRetroBatInstaller); cx.notify(); })))))
-                .when_some(self.state.installer_detail.clone(), |this,detail| this.child(muted(detail,cx)))
-                .when_some(self.state.installer_error.clone(), |this,error| this.child(error_line(error,cx)))
-                .when_some(self.state.installer_progress.1, |this,total| this.child(Progress::new("installer-progress").value(if total == 0 { 0. } else { 100. * self.state.installer_progress.0 as f32 / total as f32 })))
-                .child(h_flex().gap_3().items_center()
+            .child(
+                RadioGroup::horizontal("library-layout")
+                    .children(["Generic folders", "RetroBat"])
+                    .selected_index(Some(self.integration_choice))
+                    .disabled(locked)
+                    .on_change(cx.listener(|view, index, _, cx| {
+                        view.integration_choice = *index;
+                        // The layout applies on selection — no separate Apply step.
+                        // Generic applies unconditionally; RetroBat applies once an
+                        // installation is known, otherwise the picker below is the
+                        // apply trigger.
+                        if *index == 0 {
+                            let retrobat_root =
+                                view.state.retrobat_root.as_deref().map(PathBuf::from);
+                            view.controller.send(Command::SetIntegration {
+                                mode: IntegrationMode::Generic,
+                                retrobat_root,
+                            });
+                        } else if let Some(root) = view.settings_install_root(cx) {
+                            view.controller.send(Command::SetIntegration {
+                                mode: IntegrationMode::RetroBat,
+                                retrobat_root: Some(root),
+                            });
+                        }
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// RetroBat installation picker — shared by Settings > Folders and the
+    /// first-run folder step.
+    fn retrobat_install_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
                     .child(div().w_40().flex_shrink_0().child("RetroBat installation"))
-                    .child(div().flex_1().min_w_0().child(
-                        Select::new(&self.settings_install_select)
-                            .w_full()
-                            .accessibility_label("RetroBat installation")
-                            .placeholder("Select a RetroBat installation…")))
-                    .child(Button::new("settings-install-browse").label("Browse…").outline()
-                        .on_click(cx.listener(|view,_,_,cx| view.browse_settings_install(cx)))))
-                .child(muted("Requires a fresh installation configured through RomMFS setup. Its ROM directory must be empty or already managed by RomMFS.",cx))
-                .child(field_column("Managed ROM folder", Input::new(&self.mount_input).w_full(), cx))
-                .child(muted("Setup links RetroBat's ROM folder to this folder and configures Switch saves. Stop RetroBat and its emulators first. Unowned ROM files are never moved or removed.",cx))
-                .child(h_flex().gap_2()
-                    .child(Button::new("setup-retrobat").label("Set up RetroBat")
-                        .disabled(locked || self.state.conn != ConnState::Connected || self.settings_install_root(cx).is_none())
-                        .on_click(cx.listener(|view,_,_,cx| {
-                            if let Some(installation) = view.settings_install_root(cx) {
-                                view.controller.send(Command::SetupRetroBat {
-                                    installation,
-                                    managed_root: PathBuf::from(view.mount_input.read(cx).value().trim()),
-                                    remove_known: false,
-                                });
-                            }
-                            cx.notify();
-                        })))
-                    .when(self.state.retrobat_setup_removable > 0, |this| this
-                        .child(Button::new("setup-retrobat-remove-known")
-                            .label(format!("Remove {} known files/links and retry", self.state.retrobat_setup_removable))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Select::new(&self.settings_install_select)
+                                .w_full()
+                                .accessibility_label("RetroBat installation")
+                                .placeholder("Select a RetroBat installation…"),
+                        ),
+                    )
+                    .child(
+                        Button::new("settings-install-browse")
+                            .label("Browse…")
                             .outline()
-                            .disabled(locked || self.state.conn != ConnState::Connected || self.settings_install_root(cx).is_none())
-                            .on_click(cx.listener(|view,_,_,cx| {
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.browse_settings_install(cx)
+                            })),
+                    ),
+            )
+            .child(muted(
+                "Requires a fresh installation configured through RomMFS setup. Its ROM directory must be empty or already managed by RomMFS.",
+                cx,
+            ))
+    }
+
+    /// The focused RetroBat setup panel (UI-PLAN §RetroBat setup): the
+    /// installer download, the link action and its result, and the
+    /// foreign-item remediation — optional, never a prerequisite.
+    fn retrobat_setup_panel(&mut self, locked: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("download-retrobat")
+                            .label("Download official installer")
+                            .disabled(self.state.installer_running)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.controller.send(Command::DownloadRetroBatInstaller);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("launch-retrobat-installer")
+                            .label("Launch installer…")
+                            .disabled(!self.state.installer_ready || self.state.installer_running)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.controller.send(Command::LaunchRetroBatInstaller);
+                                cx.notify();
+                            })),
+                    )
+                    .when(self.state.installer_running, |this| {
+                        this.child(
+                            Button::new("cancel-retrobat-installer")
+                                .label("Cancel download")
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.controller.send(Command::CancelRetroBatInstaller);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .when_some(self.state.installer_detail.clone(), |this, detail| {
+                this.child(muted(detail, cx))
+            })
+            .when_some(self.state.installer_error.clone(), |this, error| {
+                this.child(error_line(error, cx))
+            })
+            .when_some(self.state.installer_progress.1, |this, total| {
+                this.child(Progress::new("installer-progress").value(if total == 0 {
+                    0.
+                } else {
+                    100. * self.state.installer_progress.0 as f32 / total as f32
+                }))
+            })
+            .child(muted(
+                "Setup links RetroBat's ROM folder to the games folder and configures Switch saves. Stop RetroBat and its emulators first. Unowned ROM files are never moved or removed.",
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("setup-retrobat")
+                            .label("Set up RetroBat")
+                            .disabled(
+                                locked
+                                    || self.state.conn != ConnState::Connected
+                                    || self.settings_install_root(cx).is_none(),
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
                                 if let Some(installation) = view.settings_install_root(cx) {
                                     view.controller.send(Command::SetupRetroBat {
                                         installation,
-                                        managed_root: PathBuf::from(view.mount_input.read(cx).value().trim()),
-                                        remove_known: true,
+                                        managed_root: PathBuf::from(
+                                            view.mount_input.read(cx).value().trim(),
+                                        ),
+                                        remove_known: false,
                                     });
                                 }
                                 cx.notify();
-                            }))))))
-            .child(Button::new("materialize-auxiliary").label("Install library BIOS, keys and cheats")
-                .disabled(locked || self.state.conn != ConnState::Connected)
-                .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::MaterializeAuxiliary); cx.notify(); })))
-            .child(Button::new("cancel-auxiliary").label("Cancel auxiliary download")
-                .disabled(!self.state.auxiliary_running)
-                .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::CancelAuxiliary); cx.notify(); })))
-            .child(muted("Downloads user-library BIOS, individual Switch firmware/keys, and RetroArch .cht cheats. No archives are extracted, no unowned or modified file is overwritten, and these files are never save data. Stop emulators before continuing.",cx))
-            .when(locked, |this| this.child(muted("Stop the mount before changing its layout.",cx)))
-            .when_some(self.state.integration_notice.clone(), |this,note| this.child(muted(note,cx)))
-            .when_some(self.state.integration_error.clone(), |this,error| this.child(error_line(error,cx)))
-            .when_some(self.render_foreign_remediation(cx), |this, block| this.child(block))
-            .when_some(self.state.retrobat_setup_detail.clone(), |this,detail| this.child(muted(detail,cx)))
-            .when_some(self.state.retrobat_setup_error.clone(), |this,error| this.child(error_line(error,cx)))
-            .when_some(self.state.frontend_metadata_detail.clone(), |this,detail| this.child(muted(detail,cx)))
-            .when_some(self.state.frontend_metadata_error.clone(), |this,error| this.child(error_line(error,cx)))
+                            })),
+                    )
+                    .when(self.state.retrobat_setup_removable > 0, |this| {
+                        this.child(
+                            Button::new("setup-retrobat-remove-known")
+                                .label(format!(
+                                    "Remove {} known files/links and retry",
+                                    self.state.retrobat_setup_removable
+                                ))
+                                .outline()
+                                .disabled(
+                                    locked
+                                        || self.state.conn != ConnState::Connected
+                                        || self.settings_install_root(cx).is_none(),
+                                )
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    if let Some(installation) = view.settings_install_root(cx) {
+                                        view.controller.send(Command::SetupRetroBat {
+                                            installation,
+                                            managed_root: PathBuf::from(
+                                                view.mount_input.read(cx).value().trim(),
+                                            ),
+                                            remove_known: true,
+                                        });
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .when(locked, |this| {
+                this.child(muted(
+                    "Stop the mount before changing its layout.",
+                    cx,
+                ))
+            })
+            .when(
+                !locked
+                    && (self.state.conn != ConnState::Connected
+                        || self.settings_install_root(cx).is_none()),
+                |this| {
+                    // §6: the disabled setup action explains why.
+                    this.child(muted_xs(
+                        if self.state.conn != ConnState::Connected {
+                            "Connect to RomM first."
+                        } else {
+                            "Choose a RetroBat installation above."
+                        },
+                        cx,
+                    ))
+                },
+            )
+            .when_some(self.state.integration_notice.clone(), |this, note| {
+                this.child(muted(note, cx))
+            })
+            .when_some(self.state.integration_error.clone(), |this, error| {
+                this.child(error_line(error, cx))
+            })
+            .when_some(self.render_foreign_remediation(cx), |this, block| {
+                this.child(block)
+            })
+            .when_some(self.state.retrobat_setup_detail.clone(), |this, detail| {
+                this.child(muted(detail, cx))
+            })
+            .when_some(self.state.retrobat_setup_error.clone(), |this, error| {
+                this.child(error_line(error, cx))
+            })
+    }
+
+    /// Optional support-file downloads (BIOS/firmware/keys/cheats) — the
+    /// auxiliary pipeline with its own progress and errors, never save data.
+    fn support_files_panel(&mut self, locked: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("materialize-auxiliary")
+                            .label("Install library BIOS, keys and cheats")
+                            .disabled(locked || self.state.conn != ConnState::Connected)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.controller.send(Command::MaterializeAuxiliary);
+                                cx.notify();
+                            })),
+                    )
+                    .when(self.state.auxiliary_running, |this| {
+                        // §1: Cancel appears only while the operation runs.
+                        this.child(
+                            Button::new("cancel-auxiliary")
+                                .label("Cancel")
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.controller.send(Command::CancelAuxiliary);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .when(
+                locked || self.state.conn != ConnState::Connected,
+                |this| {
+                    // §6: a disabled action carries its reason next to it.
+                    this.child(muted_xs(
+                        if locked {
+                            "Unavailable while the games folder or setup is running — stop it first."
+                        } else {
+                            "Connect to RomM first."
+                        },
+                        cx,
+                    ))
+                },
+            )
+            .child(muted(
+                "Downloads user-library BIOS, individual Switch firmware/keys, and RetroArch .cht cheats. No archives are extracted, no unowned or modified file is overwritten, and these files are never save data. Stop emulators before continuing.",
+                cx,
+            ))
+            .when_some(self.state.auxiliary_detail.clone(), |this, detail| {
+                this.child(muted(detail, cx))
+            })
+            .when_some(self.state.auxiliary_error.clone(), |this, error| {
+                this.child(error_line(error, cx))
+            })
+            .when_some(
+                self.state.frontend_metadata_detail.clone(),
+                |this, detail| this.child(muted(detail, cx)),
+            )
+            .when_some(
+                self.state.frontend_metadata_error.clone(),
+                |this, error| this.child(error_line(error, cx)),
+            )
+    }
+
+    /// Start-at-login plus the honest close/quit description.
+    fn render_background_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let login_supported = cfg!(windows);
+        let needs_connect = !self.state.start_at_login && self.state.conn != ConnState::Connected;
+        let login_disabled = !login_supported || needs_connect;
+        let login_reason = if !login_supported {
+            "Start at login is available on Windows only."
+        } else if needs_connect {
+            "Connect to RomM with a remembered sign-in first."
+        } else {
+            ""
+        };
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(
+                        Switch::new("start-at-login")
+                            .checked(self.state.start_at_login)
+                            .label("Start at login")
+                            .disabled(login_disabled)
+                            .on_change(cx.listener(move |view, checked, _, cx| {
+                                if login_disabled {
+                                    return;
+                                }
+                                view.controller.send(Command::SetStartAtLogin {
+                                    enabled: *checked,
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .when(login_disabled, |this| {
+                        this.child(muted_xs(login_reason, cx))
+                    }),
+            )
+            .child(muted(
+                format!(
+                    "{} Login startup reconnects and mounts before resuming previously authorized save sync.",
+                    close_behavior_copy(self.tray_hides)
+                ),
+                cx,
+            ))
+            .when_some(self.state.startup_error.clone(), |this, error| {
+                this.child(error_line(error, cx))
+            })
     }
 
     /// Foreign entries reported under a refused mount/setup root: the classified
@@ -1066,46 +2034,113 @@ impl RommfsWindow {
         Some(list)
     }
 
-    fn render_mount(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mounted = self.state.mount == MountState::Mounted;
-        let mounting = self.state.mount == MountState::Mounting;
+    /// The §3 games-folder section: human-readable state, the configured
+    /// folder, the one action the current state calls for, and the library
+    /// summary. Start is never shown beside a permanently disabled Stop;
+    /// while ready, Stop and Refresh library are secondary actions.
+    fn render_mount(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let summary = self.state.folder_summary();
         let (mount_text, mount_kind) = self.mount_status(cx);
+        let configured = self
+            .state
+            .mount_path
+            .clone()
+            .or_else(|| self.state.configured_mount_root.clone());
+        let ready = summary == FolderSummary::Ready;
+        let connected = self.state.conn == ConnState::Connected;
+
+        // The primary action this state offers (UI-PLAN §3 truth table).
+        let primary: Option<Button> = match summary {
+            FolderSummary::SetupNeeded => {
+                Some(self.nav_button("overview-setup-folder", "Set up games folder", 4, true, cx))
+            }
+            FolderSummary::Stopped => configured.clone().map(|path| {
+                Button::new("start-mount")
+                    .label("Start games folder")
+                    .primary()
+                    .on_click(cx.listener(move |view, _, _, cx| view.start_mount(path.clone(), cx)))
+            }),
+            FolderSummary::Ready => configured.clone().map(|path| {
+                Button::new("open-mount")
+                    .label("Open games folder")
+                    .primary()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.reveal_path(&PathBuf::from(path.clone()));
+                    }))
+            }),
+            // Failed renders no row action — the Retry lives inside the
+            // failure block next to its reason (UI-PLAN §6).
+            FolderSummary::Failed | FolderSummary::Starting => None,
+        };
+
         v_flex()
             .gap_2()
             .child(
                 h_flex()
                     .justify_between()
-                    .child(section_heading("ROM mount"))
+                    .child(section_heading("Games folder"))
                     .child(status_marker(mount_kind, mount_text, cx)),
             )
+            .when_some(configured, |this, path| {
+                this.child(muted(path, cx))
+            })
             .child(
                 h_flex()
-                    .gap_3()
+                    .gap_2()
                     .items_center()
-                    .child(div().w_40().flex_shrink_0().child("Mount folder"))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&self.mount_input).w_full()),
-                    )
-                    .child(
-                        Button::new("start-mount")
-                            .label("Start")
-                            .outline()
-                            .disabled(mounted || mounting)
-                            .on_click(cx.listener(|view, _, _, cx| view.on_start_mount(cx))),
-                    )
-                    .child(
-                        Button::new("stop-mount")
-                            .label("Stop")
-                            .primary()
-                            .disabled(!mounted)
-                            .on_click(cx.listener(|view, _, _, cx| view.on_stop_mount(cx))),
-                    ),
+                    .when_some(primary, |this, button| this.child(button))
+                    .when(ready, |this| {
+                        this.child(
+                            Button::new("stop-mount")
+                                .label("Stop games folder")
+                                .outline()
+                                .on_click(
+                                    cx.listener(|view, _, _, cx| view.on_stop_mount(cx)),
+                                ),
+                        )
+                    })
+                    .when(connected, |this| {
+                        this.child(
+                            Button::new("refresh-catalogue")
+                                .label("Refresh library")
+                                .outline()
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.controller.send(Command::RefreshCatalogue);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
+            .when(ready, |this| {
+                this.child(muted_xs(
+                    "Stopping detaches the folder — games stay on the server and files already downloaded are kept, but the folder can't be opened until it starts again.",
+                    cx,
+                ))
+            })
             .when_some(self.state.mount_error.clone(), |this, error| {
-                this.child(error_line(error, cx))
+                let retry = self
+                    .state
+                    .mount_path
+                    .clone()
+                    .or_else(|| self.state.configured_mount_root.clone())
+                    .map(|path| {
+                        Button::new("retry-mount")
+                            .label("Retry")
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.start_mount(path.clone(), cx)
+                            }))
+                    });
+                this.child(failure_block(
+                    "mount-failure",
+                    "Couldn't start the games folder",
+                    failure_explanation(&error),
+                    retry,
+                    error,
+                    window,
+                    cx,
+                ))
             })
             .when_some(self.render_foreign_remediation(cx), |this, block| {
                 this.child(block)
@@ -1121,15 +2156,6 @@ impl RommfsWindow {
                     cx,
                 ))
             })
-            .child(
-                Button::new("refresh-catalogue")
-                    .label("Refresh library")
-                    .disabled(self.state.conn != ConnState::Connected)
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.controller.send(Command::RefreshCatalogue);
-                        cx.notify();
-                    })),
-            )
             .when_some(self.state.catalogue_refreshed_at, |this, timestamp| {
                 this.child(muted(
                     format!("Last complete catalogue: {}", relative_time(timestamp)),
@@ -1144,10 +2170,12 @@ impl RommfsWindow {
             })
             .when_some(
                 self.state.catalogue_progress.clone(),
-                |this, (stage, completed, total, elapsed)| {
+                |this, (_stage, completed, total, elapsed)| {
+                    // §3 copy: the refresh is "Updating game list…" — the
+                    // internal stage name stays in the technical log.
                     this.child(operation_progress(
                         "catalogue-progress",
-                        &stage,
+                        "Updating game list…",
                         completed,
                         total,
                         elapsed,
@@ -1155,19 +2183,25 @@ impl RommfsWindow {
                     ))
                 },
             )
-            .when(mounting, |this| match self.state.mount_progress.clone() {
-                Some((stage, completed, total, elapsed)) => this.child(operation_progress(
-                    "mount-progress",
-                    &stage,
-                    completed,
-                    total,
-                    elapsed,
-                    cx,
-                )),
-                None => this.child(Progress::new("mount-progress").loading(true).small()),
-            })
+            .when(
+                summary == FolderSummary::Starting,
+                |this| match self.state.mount_progress.clone() {
+                    Some((stage, completed, total, elapsed)) => this.child(operation_progress(
+                        "mount-progress",
+                        &stage,
+                        completed,
+                        total,
+                        elapsed,
+                        cx,
+                    )),
+                    None => this.child(Progress::new("mount-progress").loading(true).small()),
+                },
+            )
             .child(muted(
-                "Read-only files download when opened. Closing RomMFS stops the mount.",
+                format!(
+                    "Game files download when an application opens them. {}",
+                    close_behavior_copy(self.tray_hides)
+                ),
                 cx,
             ))
     }
@@ -1342,13 +2376,20 @@ impl RommfsWindow {
                 "Changed files upload automatically. Remote-only changes replace an unchanged synchronized baseline; simultaneous changes and active files are kept for review. Local deletion never deletes remote saves.",
                 cx,
             ))
-            .child(muted_xs("Sync continues while RomMFS runs, including in the tray.", cx))
+            .child(muted_xs(
+                if self.tray_hides {
+                    "Sync continues while RomMFS runs, including in the tray."
+                } else {
+                    "Sync continues while RomMFS runs."
+                },
+                cx,
+            ))
             .child(
                 h_flex()
                     .gap_3()
                     .items_end()
-                    .child(div().w_32().child(field_column(
-                        "Debounce (seconds)",
+                    .child(div().w_40().child(field_column(
+                        "Wait after a save changes (seconds)",
                         Input::new(&self.debounce_input).w_full().small(),
                         cx,
                     )))
@@ -1899,7 +2940,7 @@ impl RommfsWindow {
                                 self.state
                                     .log
                                     .lines()
-                                    .map(|line| render_log_line(line, cx).into_any_element())
+                                    .map(|line| render_log_line(line, 1, cx).into_any_element())
                                     .collect()
                             }),
                     )
@@ -1953,7 +2994,11 @@ fn format_log_line(line: &rommfs_core::events::LogLine) -> String {
     }
 }
 
-fn render_log_line(line: &rommfs_core::events::LogLine, cx: &App) -> impl IntoElement {
+fn render_log_line(
+    line: &rommfs_core::events::LogLine,
+    count: usize,
+    cx: &App,
+) -> impl IntoElement {
     let time = div()
         .text_color(cx.theme().muted_foreground)
         .child(fmt_time(line.unix_secs));
@@ -1965,6 +3010,11 @@ fn render_log_line(line: &rommfs_core::events::LogLine, cx: &App) -> impl IntoEl
         line.message.clone()
     } else {
         format!("[{}] {}", line.op, line.message)
+    };
+    let body = if count > 1 {
+        format!("{body} (×{count})")
+    } else {
+        body
     };
     h_flex()
         .gap_2()
@@ -2027,72 +3077,48 @@ fn existing_save_inventory_summary(preview: Option<&ExistingSavePreview>) -> Str
 }
 
 impl Render for RommfsWindow {
+    /// The four-destination shell (UI-PLAN §2): persistent left nav, one
+    /// changing detail region, content kept to a readable ~960px measure.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content = match self.active_view {
-            0 => div()
-                .id("library-view")
+        let page = |id: &'static str, body: AnyElement| {
+            div()
+                .id(id)
                 .flex_1()
+                .min_w_0()
                 .min_h_0()
                 .overflow_y_scrollbar()
-                .child(v_flex().p_6().gap_4().child(self.render_mount(window, cx)))
-                .into_any_element(),
-            1 => div()
-                .id("save-sync-view")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scrollbar()
-                .child(
-                    v_flex()
-                        .p_6()
-                        .gap_4()
-                        .child(self.render_save_sync(window, cx)),
-                )
-                .into_any_element(),
-            2 => v_flex()
-                .flex_1()
-                .min_h_0()
-                .p_6()
-                .gap_4()
-                .child(self.render_downloads(window, cx))
-                .child(self.render_log(window, cx))
-                .into_any_element(),
-            _ => div()
-                .id("settings-view")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scrollbar()
-                .child(
-                    v_flex()
-                        .p_6()
-                        .gap_6()
-                        .child(self.render_connection(window, cx))
-                        .child(Separator::horizontal())
-                        .child(self.render_integration(cx)),
-                )
-                .into_any_element(),
+                .child(v_flex().p_6().w_full().max_w(px(960.)).child(body))
         };
-        v_flex()
+        let content = match self.active_view {
+            0 => page(
+                "overview-view",
+                pages::overview::render(self, window, cx).into_any_element(),
+            ),
+            1 => page(
+                "save-sync-view",
+                pages::save_review::render(self, window, cx).into_any_element(),
+            ),
+            2 => page(
+                "activity-view",
+                pages::activity::render(self, window, cx).into_any_element(),
+            ),
+            4 => page(
+                "setup-view",
+                self.render_setup(window, cx).into_any_element(),
+            ),
+            _ => page(
+                "settings-view",
+                pages::settings::render(self, window, cx).into_any_element(),
+            ),
+        };
+        h_flex()
             .size_full()
             .min_w_0()
             .min_h_0()
-            .gap_2()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .text_sm()
-            .child(div().px_6().pt_4().child(self.render_header(window, cx)))
-            .child(
-                TabBar::new("application-views")
-                    .selected_index(self.active_view)
-                    .on_click(cx.listener(|view, index, _, cx| {
-                        view.active_view = *index;
-                        cx.notify();
-                    }))
-                    .child(Tab::new().label("Library / Mount"))
-                    .child(Tab::new().label("Save sync"))
-                    .child(Tab::new().label("Activity"))
-                    .child(Tab::new().label("Settings")),
-            )
-            .child(Separator::horizontal())
+            .child(self.render_sidebar(cx))
             .child(content)
     }
 }
@@ -2161,6 +3187,17 @@ fn apply_rommfs_theme(theme: &mut Theme) {
     theme.info = color("#60a5fa");
 }
 
+/// One truthful sentence about what closing the window does — repeated
+/// wherever mount/background copy mentions it, so close-vs-quit can never
+/// contradict the real tray behaviour (UI-PLAN §3).
+fn close_behavior_copy(tray_hides: bool) -> &'static str {
+    if tray_hides {
+        "Closing the window hides RomMFS to the tray; the games folder and sync keep running. Quit from the tray menu to stop them."
+    } else {
+        "Closing RomMFS stops the games folder and all background work."
+    }
+}
+
 /// Launch the GPUI app; blocks until the window closes. Closing stops the
 /// worker session and mount (PRD: no tray/background process).
 pub fn run() {
@@ -2215,6 +3252,10 @@ pub fn run() {
                     None
                 }
             };
+            #[cfg(windows)]
+            let tray_hides = tray.is_some();
+            #[cfg(not(windows))]
+            let tray_hides = false;
 
             let bounds = Bounds::centered(None, size(px(1160.0), px(920.0)), cx);
             let view_session = session.clone();
@@ -2285,7 +3326,7 @@ pub fn run() {
                     }
                     #[cfg(not(windows))]
                     let _instance = instance;
-                    cx.new(|cx| RommfsWindow::new(window, cx, view_session))
+                    cx.new(|cx| RommfsWindow::new(window, cx, view_session, tray_hides))
                 },
             )
             .expect("failed to open window");

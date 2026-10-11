@@ -1,5 +1,7 @@
+#[cfg(unix)]
+use rommfs_core::retrobat::verify_setup_link;
 use rommfs_core::retrobat::{
-    configure_switch_saves, setup_roms_link, switch_save_setting, verify_setup_link, RomsConflicts,
+    configure_switch_saves, setup_roms_link, switch_save_setting, RomsConflicts,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
