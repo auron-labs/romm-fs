@@ -595,10 +595,16 @@ impl RommfsWindow {
     }
 
     fn on_start_mount(&mut self, cx: &mut Context<Self>) {
+        let path = self.mount_input.read(cx).value().to_string();
+        self.start_mount(path, cx);
+    }
+
+    /// Start a mount at an explicit path — shared by the folder field's
+    /// Start action and the per-state actions on Overview (UI-PLAN §3).
+    fn start_mount(&mut self, path: String, cx: &mut Context<Self>) {
         if matches!(self.state.mount, MountState::Mounting | MountState::Mounted) {
             return;
         }
-        let path = self.mount_input.read(cx).value().to_string();
         self.state.request_mount(path.clone());
         cx.notify();
         self.controller.send(Command::StartMount { path });
@@ -1702,10 +1708,57 @@ impl RommfsWindow {
         Some(list)
     }
 
+    /// The §3 games-folder section: human-readable state, the configured
+    /// folder, the one action the current state calls for, and the library
+    /// summary. Start is never shown beside a permanently disabled Stop;
+    /// while ready, Stop and Refresh library are secondary actions.
     fn render_mount(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mounted = self.state.mount == MountState::Mounted;
-        let mounting = self.state.mount == MountState::Mounting;
+        let summary = self.state.folder_summary();
         let (mount_text, mount_kind) = self.mount_status(cx);
+        let configured = self
+            .state
+            .mount_path
+            .clone()
+            .or_else(|| self.state.configured_mount_root.clone());
+        let ready = summary == FolderSummary::Ready;
+        let connected = self.state.conn == ConnState::Connected;
+
+        // The primary action this state offers (UI-PLAN §3 truth table).
+        let primary: Option<Button> = match summary {
+            FolderSummary::SetupNeeded => Some(self.nav_button(
+                "overview-setup-folder",
+                "Set up games folder",
+                4,
+                true,
+                cx,
+            )),
+            FolderSummary::Stopped => configured.clone().map(|path| {
+                Button::new("start-mount")
+                    .label("Start games folder")
+                    .primary()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.start_mount(path.clone(), cx)
+                    }))
+            }),
+            FolderSummary::Ready => configured.clone().map(|path| {
+                Button::new("open-mount")
+                    .label("Open games folder")
+                    .primary()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.reveal_path(&PathBuf::from(path.clone()));
+                    }))
+            }),
+            FolderSummary::Failed => configured.clone().map(|path| {
+                Button::new("retry-mount")
+                    .label("Retry")
+                    .primary()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.start_mount(path.clone(), cx)
+                    }))
+            }),
+            FolderSummary::Starting => None,
+        };
+
         v_flex()
             .gap_2()
             .child(
@@ -1714,32 +1767,42 @@ impl RommfsWindow {
                     .child(section_heading("Games folder"))
                     .child(status_marker(mount_kind, mount_text, cx)),
             )
+            .when_some(configured, |this, path| {
+                this.child(muted(path, cx))
+            })
             .child(
                 h_flex()
-                    .gap_3()
+                    .gap_2()
                     .items_center()
-                    .child(div().w_40().flex_shrink_0().child("Mount folder"))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&self.mount_input).w_full()),
-                    )
-                    .child(
-                        Button::new("start-mount")
-                            .label("Start")
-                            .outline()
-                            .disabled(mounted || mounting)
-                            .on_click(cx.listener(|view, _, _, cx| view.on_start_mount(cx))),
-                    )
-                    .child(
-                        Button::new("stop-mount")
-                            .label("Stop")
-                            .primary()
-                            .disabled(!mounted)
-                            .on_click(cx.listener(|view, _, _, cx| view.on_stop_mount(cx))),
-                    ),
+                    .when_some(primary, |this, button| this.child(button))
+                    .when(ready, |this| {
+                        this.child(
+                            Button::new("stop-mount")
+                                .label("Stop games folder")
+                                .outline()
+                                .on_click(
+                                    cx.listener(|view, _, _, cx| view.on_stop_mount(cx)),
+                                ),
+                        )
+                    })
+                    .when(connected, |this| {
+                        this.child(
+                            Button::new("refresh-catalogue")
+                                .label("Refresh library")
+                                .outline()
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.controller.send(Command::RefreshCatalogue);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
+            .when(ready, |this| {
+                this.child(muted_xs(
+                    "Stopping detaches the folder — games stay on the server and files already downloaded are kept, but the folder can't be opened until it starts again.",
+                    cx,
+                ))
+            })
             .when_some(self.state.mount_error.clone(), |this, error| {
                 this.child(error_line(error, cx))
             })
@@ -1757,15 +1820,6 @@ impl RommfsWindow {
                     cx,
                 ))
             })
-            .child(
-                Button::new("refresh-catalogue")
-                    .label("Refresh library")
-                    .disabled(self.state.conn != ConnState::Connected)
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.controller.send(Command::RefreshCatalogue);
-                        cx.notify();
-                    })),
-            )
             .when_some(self.state.catalogue_refreshed_at, |this, timestamp| {
                 this.child(muted(
                     format!("Last complete catalogue: {}", relative_time(timestamp)),
@@ -1791,17 +1845,20 @@ impl RommfsWindow {
                     ))
                 },
             )
-            .when(mounting, |this| match self.state.mount_progress.clone() {
-                Some((stage, completed, total, elapsed)) => this.child(operation_progress(
-                    "mount-progress",
-                    &stage,
-                    completed,
-                    total,
-                    elapsed,
-                    cx,
-                )),
-                None => this.child(Progress::new("mount-progress").loading(true).small()),
-            })
+            .when(
+                summary == FolderSummary::Starting,
+                |this| match self.state.mount_progress.clone() {
+                    Some((stage, completed, total, elapsed)) => this.child(operation_progress(
+                        "mount-progress",
+                        &stage,
+                        completed,
+                        total,
+                        elapsed,
+                        cx,
+                    )),
+                    None => this.child(Progress::new("mount-progress").loading(true).small()),
+                },
+            )
             .child(muted(
                 format!(
                     "Game files download when an application opens them. {}",
