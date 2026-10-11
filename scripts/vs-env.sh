@@ -8,19 +8,24 @@
 #
 # MSVC's link.exe is prepended to PATH so it wins over Git's (which cargo
 # would otherwise pick up and fail with /link vs /LTCG confusion).
+# NOTE: `sort` resolves to C:\Windows\system32\sort.exe on Git Bash (no GNU
+# flags), so version discovery uses `ls -v` instead.
 
-set -e
-
-MSVC_ROOT="$(
-    ls -d /c/BuildTools/VC/Tools/MSVC/*/ 2>/dev/null | sort -V | tail -1 | sed 's:/$::'
-)"
-[ -n "$MSVC_ROOT" ] || { echo "vs-env.sh: no MSVC under C:\\BuildTools" >&2; return 1; }
+MSVC_ROOT="$(ls -dv /c/BuildTools/VC/Tools/MSVC/*/ 2>/dev/null | tail -1)"
+MSVC_ROOT="${MSVC_ROOT%/}"
+if [ -z "$MSVC_ROOT" ]; then
+    echo "vs-env.sh: no MSVC under C:\\BuildTools" >&2
+    return 1
+fi
 
 SDK_ROOT='/c/Program Files (x86)/Windows Kits/10'
-SDK_VER="$(
-    ls -d "$SDK_ROOT/Include/"*/ 2>/dev/null | xargs -n1 basename 2>/dev/null | sort -V | tail -1
-)"
-[ -n "$SDK_VER" ] || { echo "vs-env.sh: no Windows SDK under $SDK_ROOT" >&2; return 1; }
+SDK_DIR="$(ls -dv "$SDK_ROOT/Include/"*/ 2>/dev/null | tail -1)"
+SDK_VER="${SDK_DIR%/}"
+SDK_VER="${SDK_VER##*/}"
+if [ -z "$SDK_VER" ]; then
+    echo "vs-env.sh: no Windows SDK under $SDK_ROOT" >&2
+    return 1
+fi
 
 MSVC_WIN="$(cygpath -w "$MSVC_ROOT")"
 SDK_WIN="$(cygpath -w "$SDK_ROOT")"
