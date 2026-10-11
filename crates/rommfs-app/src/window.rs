@@ -2888,7 +2888,7 @@ impl RommfsWindow {
                                 self.state
                                     .log
                                     .lines()
-                                    .map(|line| render_log_line(line, cx).into_any_element())
+                                    .map(|line| render_log_line(line, 1, cx).into_any_element())
                                     .collect()
                             }),
                     )
@@ -2942,7 +2942,11 @@ fn format_log_line(line: &rommfs_core::events::LogLine) -> String {
     }
 }
 
-fn render_log_line(line: &rommfs_core::events::LogLine, cx: &App) -> impl IntoElement {
+fn render_log_line(
+    line: &rommfs_core::events::LogLine,
+    count: usize,
+    cx: &App,
+) -> impl IntoElement {
     let time = div()
         .text_color(cx.theme().muted_foreground)
         .child(fmt_time(line.unix_secs));
@@ -2954,6 +2958,11 @@ fn render_log_line(line: &rommfs_core::events::LogLine, cx: &App) -> impl IntoEl
         line.message.clone()
     } else {
         format!("[{}] {}", line.op, line.message)
+    };
+    let body = if count > 1 {
+        format!("{body} (×{count})")
+    } else {
+        body
     };
     h_flex()
         .gap_2()

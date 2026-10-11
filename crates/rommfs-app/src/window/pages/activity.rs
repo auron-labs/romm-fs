@@ -562,17 +562,34 @@ fn log_section(
     let min_level = view.activity_min_level;
     let needle = view.activity_search.read(cx).value().to_lowercase();
     let log_empty = view.state.log.lines().next().is_none();
-    let lines: Vec<AnyElement> = view
-        .state
-        .log
-        .lines()
-        .filter(|line| level_visible(line.level, min_level))
-        .filter(|line| {
-            needle.is_empty()
-                || line.message.to_lowercase().contains(&needle)
-                || line.op.to_lowercase().contains(&needle)
-        })
-        .map(|line| render_log_line(line, cx).into_any_element())
+    // §6: repeated diagnostics collapse into one entry keyed by the
+    // stable reason (level + op + message) with an occurrence count,
+    // instead of flooding the log.
+    let mut runs: Vec<(&rommfs_core::events::LogLine, usize)> = Vec::new();
+    for line in view.state.log.lines() {
+        if !level_visible(line.level, min_level) {
+            continue;
+        }
+        if !needle.is_empty()
+            && !line.message.to_lowercase().contains(&needle)
+            && !line.op.to_lowercase().contains(&needle)
+        {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((last, count))
+                if last.level == line.level
+                    && last.op == line.op
+                    && last.message == line.message =>
+            {
+                *count += 1;
+            }
+            _ => runs.push((line, 1)),
+        }
+    }
+    let lines: Vec<AnyElement> = runs
+        .into_iter()
+        .map(|(line, count)| render_log_line(line, count, cx).into_any_element())
         .collect();
     let empty_text = if log_empty {
         "No activity yet"
