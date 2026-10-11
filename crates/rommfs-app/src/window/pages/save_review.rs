@@ -428,6 +428,53 @@ impl RommfsWindow {
                         } else {
                             dir.to_string()
                         };
+                        // §5: the dir-level action lists the actual files
+                        // its selection produces (the same-dir, mappable
+                        // scope of AssociateSaveFolder).
+                        let affected: Vec<String> = self
+                            .state
+                            .save_file_unmatched
+                            .iter()
+                            .filter(|file| {
+                                file.mappable
+                                    && file
+                                        .path
+                                        .parent()
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_default()
+                                        == *dir
+                            })
+                            .map(|file| file.path.display().to_string())
+                            .collect();
+                        detail = detail.child(
+                            v_flex()
+                                .gap_1()
+                                .child(muted_xs(
+                                    format!(
+                                        "Files this covers in {dir_display}:"
+                                    ),
+                                    cx,
+                                ))
+                                .children(
+                                    affected
+                                        .iter()
+                                        .take(8)
+                                        .map(|path| {
+                                            div()
+                                                .text_xs()
+                                                .font_family(
+                                                    cx.theme().mono_font_family.clone(),
+                                                )
+                                                .child(path.clone())
+                                        }),
+                                )
+                                .when(affected.len() > 8, |this| {
+                                    this.child(muted_xs(
+                                        format!("…and {} more", affected.len() - 8),
+                                        cx,
+                                    ))
+                                }),
+                        );
                         actions = actions.child(
                             Button::new(format!("save-review-map-dir-{}", row.key))
                                 .label(format!("Map {} files in {}", dir_mappable, dir_display))
