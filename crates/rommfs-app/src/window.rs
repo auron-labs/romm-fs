@@ -310,6 +310,9 @@ struct RommfsWindow {
     /// Follow the newest log entry; scrolling up unsets it.
     #[allow(dead_code)] // read by pages/activity.rs
     activity_follow_log: bool,
+    /// Substring filter for the technical log (UI-PLAN §6 search).
+    #[allow(dead_code)] // read by pages/activity.rs
+    activity_search: Entity<InputState>,
     log_scroll: ScrollHandle,
     /// True when a system tray exists and closing the window only hides it —
     /// close-vs-quit copy is derived from this, never assumed (UI-PLAN §3).
@@ -368,6 +371,8 @@ impl RommfsWindow {
             cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
         let save_review_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search saves"));
+        let activity_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search log"));
         let mut subscriptions = Vec::new();
 
         // Enter in a connection field is the section's default commit.
@@ -391,6 +396,17 @@ impl RommfsWindow {
             |view, _state, event, _window, cx| {
                 if matches!(event, InputEvent::Change) {
                     view.save_review_page = 0;
+                    cx.notify();
+                }
+            },
+        ));
+
+        // Typing in the log search re-filters live.
+        subscriptions.push(cx.subscribe_in(
+            &activity_search,
+            window,
+            |_view, _state, event, _window, cx| {
+                if matches!(event, InputEvent::Change) {
                     cx.notify();
                 }
             },
@@ -509,6 +525,7 @@ impl RommfsWindow {
             save_review_expanded: None,
             activity_min_level: 0,
             activity_follow_log: true,
+            activity_search,
             log_scroll: ScrollHandle::new(),
             tray_hides,
             _subscriptions: subscriptions,

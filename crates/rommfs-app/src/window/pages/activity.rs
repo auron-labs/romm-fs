@@ -544,18 +544,26 @@ fn log_section(
     cx: &mut Context<RommfsWindow>,
 ) -> impl IntoElement {
     let min_level = view.activity_min_level;
+    let needle = view.activity_search.read(cx).value().to_lowercase();
     let log_empty = view.state.log.lines().next().is_none();
     let lines: Vec<AnyElement> = view
         .state
         .log
         .lines()
         .filter(|line| level_visible(line.level, min_level))
+        .filter(|line| {
+            needle.is_empty()
+                || line.message.to_lowercase().contains(&needle)
+                || line.op.to_lowercase().contains(&needle)
+        })
         .map(|line| render_log_line(line, cx).into_any_element())
         .collect();
     let empty_text = if log_empty {
         "No activity yet"
-    } else {
+    } else if needle.is_empty() {
         "No log entries at this level"
+    } else {
+        "No log entries match"
     };
 
     v_flex()
@@ -570,6 +578,10 @@ fn log_section(
                     h_flex()
                         .gap_3()
                         .items_center()
+                        .child(
+                            div().w_40()
+                                .child(Input::new(&view.activity_search).small()),
+                        )
                         .child(
                             RadioGroup::horizontal("activity-log-level")
                                 .children(["All", "Warnings+", "Errors"])
