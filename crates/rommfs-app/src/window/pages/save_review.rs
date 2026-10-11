@@ -4,7 +4,7 @@ use std::cell::Cell;
 
 /// Bounded review-table page (UI-PLAN §5): every result stays reachable
 /// through search, filtering, and paging — never behind a truncated dump.
-const REVIEW_PAGE_SIZE: usize = 25;
+const REVIEW_PAGE_SIZE: usize = 50;
 
 /// Per-row status words (UI-PLAN §5). `Incoming` covers remote saves the
 /// journal keeps for explicit review; "Synced" is never claimed — every row
