@@ -765,6 +765,43 @@ impl RommfsWindow {
         .detach();
     }
 
+    /// §4 step 2 offers a folder picker beside the free-text path.
+    fn browse_games_folder(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Select the games folder".into()),
+        });
+        cx.spawn(
+            async move |this: WeakEntity<RommfsWindow>, cx| match paths.await {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        let _ = this.update_in(cx, |view, window, cx| {
+                            let text = path.display().to_string();
+                            view.mount_input.update(cx, |input, cx| {
+                                input.set_value(text, window, cx);
+                            });
+                            cx.notify();
+                        });
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    let _ = this.update(cx, |view, _| {
+                        view.show_picker_error(format!("Games folder picker failed: {error}"))
+                    });
+                }
+                Err(_) => {
+                    let _ = this.update(cx, |view, _| {
+                        view.show_picker_error("folder picker response was interrupted".into())
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
     fn browse_save_sync(&mut self, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -1385,11 +1422,26 @@ impl RommfsWindow {
                 v_flex()
                     .gap_3()
                     .child(section_heading("2. Choose the games folder"))
-                    .child(field_column(
-                        "Games folder",
-                        Input::new(&self.mount_input).w_full(),
-                        cx,
-                    ))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_end()
+                            .child(
+                                div().flex_1().min_w_0().child(field_column(
+                                    "Games folder",
+                                    Input::new(&self.mount_input).w_full(),
+                                    cx,
+                                )),
+                            )
+                            .child(
+                                Button::new("setup-browse-folder")
+                                    .label("Browse…")
+                                    .outline()
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.browse_games_folder(cx)
+                                    })),
+                            ),
+                    )
                     .child(self.layout_radio(locked, cx))
                     .when(self.integration_choice == 1, |this| {
                         this.child(self.retrobat_install_row(cx))
