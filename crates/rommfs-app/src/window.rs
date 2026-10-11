@@ -334,11 +334,19 @@ impl RommfsWindow {
                 .masked(true)
         });
         // Drive roots reject directory creation for standard users on many
-        // systems; the profile directory is always writable.
+        // systems; the profile directory is always writable. Off Windows a
+        // home-relative default keeps the first-start error honest instead
+        // of offering C:\RomM on a Linux box.
+        #[cfg(windows)]
         let default_mount = std::env::var_os("USERPROFILE")
             .map(|profile| std::path::PathBuf::from(profile).join("RomM"))
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "C:\\RomM".to_string());
+        #[cfg(not(windows))]
+        let default_mount = std::env::var_os("HOME")
+            .map(|home| std::path::PathBuf::from(home).join("RomM"))
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "~/RomM".to_string());
         let mount_input = cx.new(|cx| InputState::new(window, cx).default_value(default_mount));
         let install_select =
             cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
