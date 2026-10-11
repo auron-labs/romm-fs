@@ -1937,6 +1937,16 @@ impl Worker {
             .map(|identity| identity.account_id.to_string());
         self.save_sync_identity = identity;
         self.sink.emit(AppEvent::Connected);
+        // Connecting cleared the remembered host/folder facts when this
+        // sign-in began; now that the session is authenticated, republish
+        // its stored config or a configured user lands on folder setup.
+        self.sink.emit(AppEvent::ConnectionRestored {
+            server: url.to_string(),
+            mount_root: self
+                .preferences
+                .as_ref()
+                .and_then(|p| p.mount_root.as_ref().map(|r| r.display().to_string())),
+        });
         self.log(
             Level::Info,
             "connect",
@@ -5225,5 +5235,70 @@ mod tests {
         state.apply(&AppEvent::Connecting);
         assert!(state.mount_path.is_none());
         assert_eq!(state.folder_summary(), FolderSummary::SetupNeeded);
+    }
+
+    /// restore -> authentication failure -> successful reauthentication:
+    /// the second connection attempt wipes the folder facts, so the
+    /// accepted session must republish its stored config or a configured
+    /// user is sent back to folder setup (PR-review regression).
+    #[test]
+    fn reauthentication_republishes_the_remembered_folder() {
+        use rommfs_fixture::contract;
+        let directory = tempfile::tempdir().unwrap();
+        let fx = FixtureServer::start();
+        fx.on(
+            "POST",
+            "/api/token",
+            ResponseSpec::Json {
+                status: 200,
+                body: contract::token_ok(),
+            },
+        );
+        fx.on(
+            "GET",
+            "/api/users/me",
+            ResponseSpec::Json {
+                status: 200,
+                body: serde_json::json!({"id":42,"oauth_scopes":["me.read","assets.read","assets.write"]}).to_string(),
+            },
+        );
+        let mount_root = directory.path().join("roms");
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.connection_settings =
+            Some(ConnectionSettings::open(&directory.path().join("connection.db")).unwrap());
+        worker
+            .connection_settings
+            .as_ref()
+            .unwrap()
+            .save(&ConnectionPreferences {
+                server: fx.url().into(),
+                account_id: 42,
+                device_identifier: "id".into(),
+                mount_root: Some(mount_root.clone()),
+                integration: IntegrationMode::Generic,
+                retrobat_root: None,
+                start_at_login: false,
+                save_root: None,
+            })
+            .unwrap();
+
+        // Restore publishes the stored folder, then fails authentication
+        // (no credential in the store for this fixture server).
+        worker.restore_connection();
+        // The user signs in again; the Connecting event clears the folder
+        // facts, and accepting the session must restore them.
+        worker.connect(fx.url(), "user", "password");
+
+        let mut state = UiState::new(16);
+        for event in events.try_iter() {
+            state.apply(&event);
+        }
+        assert_eq!(
+            state.configured_mount_root.as_deref(),
+            Some(mount_root.display().to_string().as_str()),
+            "reauthentication must restore the remembered folder to the UI"
+        );
+        assert_eq!(state.folder_summary(), FolderSummary::Stopped);
     }
 }
