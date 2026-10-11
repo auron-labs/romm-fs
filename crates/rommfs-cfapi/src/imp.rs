@@ -397,7 +397,6 @@ impl WindowsMount {
             previous.root_security.clone()
         };
         // Persist the original ACL before protecting the root, including crash recovery.
-        let mut previous = previous;
         previous.root_security = manifest.root_security.clone();
         root::write_manifest(&root, &previous)?;
         let inodes = manifest
