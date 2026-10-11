@@ -571,8 +571,9 @@ impl RommfsWindow {
                         .iter()
                         .map(|(id, name)| SharedString::from(format!("{id} · {name}")))
                         .collect::<Vec<_>>();
-                    self.save_game_select
-                        .update(cx, |state, cx| state.set_items(SearchableVec::from(items), window, cx));
+                    self.save_game_select.update(cx, |state, cx| {
+                        state.set_items(SearchableVec::from(items), window, cx)
+                    });
                 }
                 AppEvent::SaveSyncUpdated { .. } | AppEvent::SaveSyncSessionChanged { .. } => {
                     save_sync_updated = true;
