@@ -2101,10 +2101,12 @@ impl RommfsWindow {
             })
             .when_some(
                 self.state.catalogue_progress.clone(),
-                |this, (stage, completed, total, elapsed)| {
+                |this, (_stage, completed, total, elapsed)| {
+                    // §3 copy: the refresh is "Updating game list…" — the
+                    // internal stage name stays in the technical log.
                     this.child(operation_progress(
                         "catalogue-progress",
-                        &stage,
+                        "Updating game list…",
                         completed,
                         total,
                         elapsed,
