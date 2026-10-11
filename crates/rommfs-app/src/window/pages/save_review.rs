@@ -231,10 +231,17 @@ impl RommfsWindow {
             &self.state.save_sync_server_id,
             self.state.save_sync_account_id,
         ) {
-            (Some(server), Some(account)) => format!(
-                "Server: {server} · Account: {} (ID {account})",
-                self.user_input.read(cx).value()
-            ),
+            // The account displays as the signed-in username when it is
+            // known — a remembered session types nothing, and a bare
+            // database id is not an identity (UI-PLAN §4).
+            (Some(server), Some(_)) => {
+                let user = self.user_input.read(cx).value().to_string();
+                if user.is_empty() {
+                    format!("Server: {server} · signed-in account")
+                } else {
+                    format!("Server: {server} · Account: {user}")
+                }
+            }
             _ => "Server and account not verified".into(),
         };
         let profile = self
