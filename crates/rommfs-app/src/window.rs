@@ -195,6 +195,24 @@ struct RommfsWindow {
     completed_open: bool,
     mapping_open: bool,
     advanced_open: bool,
+    // --- Save review page state (window/pages/save_review.rs) ---
+    /// Search box filtering the review table by name, file, or target path.
+    #[allow(dead_code)] // read by pages/save_review.rs (UI-PLAN task 4)
+    save_review_search: Entity<InputState>,
+    /// Zero-based page of the review table.
+    #[allow(dead_code)] // read by pages/save_review.rs
+    save_review_page: usize,
+    /// Row key expanded to its detail block (file id or title key).
+    #[allow(dead_code)] // read by pages/save_review.rs
+    save_review_expanded: Option<SharedString>,
+    // --- Activity page state (window/pages/activity.rs) ---
+    /// Minimum log severity shown: 0 = everything, 1 = warnings+errors,
+    /// 2 = errors only.
+    #[allow(dead_code)] // read by pages/activity.rs (UI-PLAN task 5)
+    activity_min_level: usize,
+    /// Follow the newest log entry; scrolling up unsets it.
+    #[allow(dead_code)] // read by pages/activity.rs
+    activity_follow_log: bool,
     log_scroll: ScrollHandle,
     /// True when a system tray exists and closing the window only hides it —
     /// close-vs-quit copy is derived from this, never assumed (UI-PLAN §3).
@@ -243,6 +261,8 @@ impl RommfsWindow {
 
         let settings_install_select =
             cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
+        let save_review_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search saves"));
         let mut subscriptions = Vec::new();
 
         // Enter in a connection field is the section's default commit.
@@ -362,6 +382,11 @@ impl RommfsWindow {
             completed_open: false,
             mapping_open: false,
             advanced_open: false,
+            save_review_search,
+            save_review_page: 0,
+            save_review_expanded: None,
+            activity_min_level: 0,
+            activity_follow_log: true,
             log_scroll: ScrollHandle::new(),
             tray_hides,
             _subscriptions: subscriptions,
