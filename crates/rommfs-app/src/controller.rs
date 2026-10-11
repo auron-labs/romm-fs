@@ -438,6 +438,12 @@ impl UiState {
                 self.pairing_code = None;
                 self.connected_server = None;
                 self.configured_mount_root = None;
+                // The mount belonged to the session that just ended — its
+                // path must never present as the next session's folder.
+                self.mount = MountState::NotMounted;
+                self.mount_path = None;
+                self.mount_error = None;
+                self.mount_progress = None;
             }
             AppEvent::PairingReady { user_code, .. } => {
                 self.pairing_code = Some(user_code.clone());
@@ -473,6 +479,7 @@ impl UiState {
                 // of anything until ConnectionRestored confirms them.
                 self.connected_server = None;
                 self.configured_mount_root = None;
+                self.mount_path = None;
                 self.save_sync_export_errors.clear();
                 self.save_sync_export_feedback.clear();
                 self.save_sync_enabled = false;
@@ -5182,5 +5189,41 @@ mod tests {
             FolderSummary::Stopped,
             "a configured-but-stopped folder must never read as unconfigured"
         );
+    }
+
+    /// A mount path is session state: after signing out or starting a new
+    /// connection it must never present as the next session's configured
+    /// folder (PR-review regression: A's path offered as B's Start target).
+    #[test]
+    fn mount_path_is_scoped_to_its_session() {
+        let mut state = UiState::new(16);
+        for event in [
+            AppEvent::ConnectionRestored {
+                server: "https://a.example".into(),
+                mount_root: Some("/srv/a".into()),
+            },
+            AppEvent::MountStarted {
+                path: "/srv/a".into(),
+            },
+            AppEvent::MountStopped,
+        ] {
+            state.apply(&event);
+        }
+        assert_eq!(state.folder_summary(), FolderSummary::Stopped);
+
+        state.apply(&AppEvent::SignedOut);
+
+        assert!(state.mount_path.is_none());
+        assert_eq!(
+            state.folder_summary(),
+            FolderSummary::SetupNeeded,
+            "server A's mount path must not become the next session's folder"
+        );
+
+        // A path stashed by a mount attempt dies with that session too.
+        state.mount_path = Some("/srv/a".into());
+        state.apply(&AppEvent::Connecting);
+        assert!(state.mount_path.is_none());
+        assert_eq!(state.folder_summary(), FolderSummary::SetupNeeded);
     }
 }
