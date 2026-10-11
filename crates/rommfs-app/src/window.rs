@@ -6,7 +6,9 @@
 //! keyboard activation, and focus traversal come from the component
 //! library; the view composes sections and forwards `Command`s.
 
-use crate::controller::{Command, ConnState, Controller, MountState, SaveSyncSummary, UiState};
+use crate::controller::{
+    Command, ConnState, Controller, FolderSummary, MountState, SaveSyncSummary, UiState,
+};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
@@ -18,14 +20,14 @@ use gpui_kit::component::{
     radio::RadioGroup,
     select::{Select, SelectEvent, SelectState},
     separator::Separator,
-    tab::{Tab, TabBar},
+    sidebar::{Sidebar, SidebarCollapsible, SidebarMenu, SidebarMenuItem},
     try_parse_color, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
     StyledExt as _, Theme, ThemeMode,
 };
 use gpui_kit::{
-    actions, div, point, prelude::*, px, size, App, Bounds, ClipboardItem, Context, Entity,
-    Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollHandle, SharedString,
-    Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
+    actions, div, point, prelude::*, px, size, AnyElement, App, Bounds, ClipboardItem, Context,
+    Entity, Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollHandle,
+    SharedString, Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use rommfs_core::connection_settings::IntegrationMode;
 use rommfs_core::events::{AppEvent, ForeignKind, Level, SaveSyncIncomingStatus};
@@ -42,6 +44,8 @@ actions!(
         ActivateControl,
     ]
 );
+
+mod pages;
 
 const LOG_CAP: usize = 500;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -104,6 +108,14 @@ fn error_line(text: impl Into<String>, cx: &App) -> impl IntoElement {
 fn section_heading(text: &'static str) -> impl IntoElement {
     div()
         .text_base()
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(text)
+}
+
+/// ~24px page title (UI-PLAN §2 visual scale).
+fn page_heading(text: &'static str) -> impl IntoElement {
+    div()
+        .text_2xl()
         .font_weight(FontWeight::SEMIBOLD)
         .child(text)
 }
@@ -753,13 +765,17 @@ impl RommfsWindow {
         }
     }
 
+    /// The folder marker derives from `UiState::folder_summary` — real mount
+    /// events plus persisted config, never the connection state.
     fn mount_status(&self, _cx: &App) -> (SharedString, StatusKind) {
-        match self.state.mount {
-            MountState::NotMounted => ("Not mounted".into(), StatusKind::Muted),
-            MountState::Mounting => ("Mounting…".into(), StatusKind::Warning),
-            MountState::Mounted => ("Mounted".into(), StatusKind::Success),
-            MountState::Failed => ("Mount failed".into(), StatusKind::Danger),
-        }
+        let summary = self.state.folder_summary();
+        let kind = match summary {
+            FolderSummary::SetupNeeded | FolderSummary::Stopped => StatusKind::Muted,
+            FolderSummary::Starting => StatusKind::Warning,
+            FolderSummary::Ready => StatusKind::Success,
+            FolderSummary::Failed => StatusKind::Danger,
+        };
+        (summary.label().into(), kind)
     }
 
     /// The single derived save-sync status (UI-PLAN §5): zero linked files
@@ -835,17 +851,169 @@ impl RommfsWindow {
             .child(title)
     }
 
-    fn render_header(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The ~190px left navigation: four destinations, and the server host
+    /// plus a labelled RomM connection status pinned at the bottom
+    /// (UI-PLAN §2). Nav clicks reach the view through its WeakEntity.
+    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let weak = cx.weak_entity();
         let (conn_text, conn_kind) = self.conn_status(cx);
-        h_flex()
-            .justify_between()
-            .child(
+        let host = self
+            .state
+            .connected_server
+            .clone()
+            .filter(|server| !server.is_empty())
+            .unwrap_or_else(|| self.url_input.read(cx).value().to_string());
+        let active = self.active_view;
+        let mut menu = SidebarMenu::new();
+        for (index, label) in ["Overview", "Save sync", "Activity", "Settings"]
+            .into_iter()
+            .enumerate()
+        {
+            let weak = weak.clone();
+            menu = menu.child(
+                SidebarMenuItem::new(label)
+                    .active(active == index)
+                    .on_click(move |_, _, cx| {
+                        if weak
+                            .update(cx, |view, _cx| view.active_view = index)
+                            .is_ok()
+                        {
+                            cx.notify(weak.entity_id());
+                        }
+                    }),
+            );
+        }
+        Sidebar::new("app-nav")
+            .w(px(190.))
+            .collapsible(SidebarCollapsible::None)
+            .header(
                 div()
-                    .text_2xl()
-                    .font_weight(FontWeight::BOLD)
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
                     .child("RomMFS"),
             )
-            .child(status_marker(conn_kind, conn_text, cx))
+            .child(menu)
+            .footer(
+                v_flex()
+                    .gap_1()
+                    .child(muted_xs(
+                        if host.is_empty() {
+                            "No server configured".to_string()
+                        } else {
+                            host
+                        },
+                        cx,
+                    ))
+                    .child(status_marker(conn_kind, conn_text, cx)),
+            )
+    }
+
+    /// A button that just switches destination — for "go fix this" actions on
+    /// summary cards.
+    fn nav_button(
+        &mut self,
+        id: &'static str,
+        label: &'static str,
+        view: usize,
+        primary: bool,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let button = Button::new(id).label(label);
+        let button = if primary {
+            button.primary()
+        } else {
+            button.outline()
+        };
+        button.on_click(cx.listener(move |this, _, _, cx| {
+            this.active_view = view;
+            cx.notify();
+        }))
+    }
+
+    /// Overview: truthful summaries for the three subsystems, each with the
+    /// action its own state calls for (UI-PLAN §3).
+    fn render_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (conn_text, conn_kind) = self.conn_status(cx);
+        let (sync_text, sync_kind) = self.save_sync_status();
+        let needs_sign_in = self.state.conn != ConnState::Connected;
+        let unlinked = self.state.save_sync_catalogue_unmapped;
+        v_flex()
+            .gap_6()
+            .child(page_heading("Overview"))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(section_heading("RomM connection"))
+                            .child(status_marker(conn_kind, conn_text, cx)),
+                    )
+                    .when_some(self.state.conn_error.clone(), |this, error| {
+                        this.child(error_line(error, cx))
+                    })
+                    .child(self.nav_button(
+                        "overview-connection",
+                        if needs_sign_in {
+                            "Sign in"
+                        } else {
+                            "Connection settings"
+                        },
+                        3,
+                        needs_sign_in,
+                        cx,
+                    )),
+            )
+            .child(Separator::horizontal())
+            .child(self.render_mount(window, cx))
+            .child(Separator::horizontal())
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(section_heading("Save sync"))
+                            .child(status_marker(sync_kind, sync_text, cx)),
+                    )
+                    .when_some(self.state.save_sync_problem.clone(), |this, problem| {
+                        this.child(muted(problem, cx))
+                    })
+                    .when(
+                        self.state.save_sync_summary() == SaveSyncSummary::NoLinkedFiles
+                            && unlinked > 0,
+                        |this| {
+                            this.child(muted(
+                                format!(
+                                    "{} file{} found that aren't linked to a game yet",
+                                    fmt_count(unlinked),
+                                    if unlinked == 1 { "" } else { "s" }
+                                ),
+                                cx,
+                            ))
+                        },
+                    )
+                    .child(self.nav_button("overview-saves", "Review saves", 1, false, cx)),
+            )
+    }
+
+    fn render_activity(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_4()
+            .flex_1()
+            .min_h_0()
+            .child(page_heading("Activity"))
+            .child(self.render_downloads(window, cx))
+            .child(self.render_log(window, cx))
+    }
+
+    fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_6()
+            .child(page_heading("Settings"))
+            .child(self.render_connection(window, cx))
+            .child(Separator::horizontal())
+            .child(self.render_integration(cx))
     }
 
     /// Only the controls meaningful for the *current* auth state render —
@@ -1085,7 +1253,7 @@ impl RommfsWindow {
             .child(
                 h_flex()
                     .justify_between()
-                    .child(section_heading("ROM mount"))
+                    .child(section_heading("Games folder"))
                     .child(status_marker(mount_kind, mount_text, cx)),
             )
             .child(
@@ -2040,72 +2208,48 @@ fn existing_save_inventory_summary(preview: Option<&ExistingSavePreview>) -> Str
 }
 
 impl Render for RommfsWindow {
+    /// The four-destination shell (UI-PLAN §2): persistent left nav, one
+    /// changing detail region, content kept to a readable ~960px measure.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content = match self.active_view {
-            0 => div()
-                .id("library-view")
+        let page = |id: &'static str, body: AnyElement| {
+            div()
+                .id(id)
                 .flex_1()
+                .min_w_0()
                 .min_h_0()
                 .overflow_y_scrollbar()
-                .child(v_flex().p_6().gap_4().child(self.render_mount(window, cx)))
-                .into_any_element(),
-            1 => div()
-                .id("save-sync-view")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scrollbar()
-                .child(
-                    v_flex()
-                        .p_6()
-                        .gap_4()
-                        .child(self.render_save_sync(window, cx)),
-                )
-                .into_any_element(),
-            2 => v_flex()
-                .flex_1()
-                .min_h_0()
-                .p_6()
-                .gap_4()
-                .child(self.render_downloads(window, cx))
-                .child(self.render_log(window, cx))
-                .into_any_element(),
-            _ => div()
-                .id("settings-view")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scrollbar()
-                .child(
-                    v_flex()
-                        .p_6()
-                        .gap_6()
-                        .child(self.render_connection(window, cx))
-                        .child(Separator::horizontal())
-                        .child(self.render_integration(cx)),
-                )
-                .into_any_element(),
+                .child(v_flex().p_6().w_full().max_w(px(960.)).child(body))
         };
-        v_flex()
+        let content = match self.active_view {
+            0 => page(
+                "overview-view",
+                pages::overview::render(self, window, cx).into_any_element(),
+            ),
+            1 => page(
+                "save-sync-view",
+                v_flex()
+                    .gap_4()
+                    .child(page_heading("Save sync"))
+                    .child(pages::save_review::render(self, window, cx))
+                    .into_any_element(),
+            ),
+            2 => page(
+                "activity-view",
+                pages::activity::render(self, window, cx).into_any_element(),
+            ),
+            _ => page(
+                "settings-view",
+                pages::settings::render(self, window, cx).into_any_element(),
+            ),
+        };
+        h_flex()
             .size_full()
             .min_w_0()
             .min_h_0()
-            .gap_2()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .text_sm()
-            .child(div().px_6().pt_4().child(self.render_header(window, cx)))
-            .child(
-                TabBar::new("application-views")
-                    .selected_index(self.active_view)
-                    .on_click(cx.listener(|view, index, _, cx| {
-                        view.active_view = *index;
-                        cx.notify();
-                    }))
-                    .child(Tab::new().label("Library / Mount"))
-                    .child(Tab::new().label("Save sync"))
-                    .child(Tab::new().label("Activity"))
-                    .child(Tab::new().label("Settings")),
-            )
-            .child(Separator::horizontal())
+            .child(self.render_sidebar(cx))
             .child(content)
     }
 }
