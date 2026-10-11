@@ -1484,7 +1484,17 @@ impl RommfsWindow {
                         None => this.child(Progress::new("setup-mount-progress").value(0.)),
                     })
                     .when_some(self.state.mount_error.clone(), |this, error| {
-                        this.child(error_line(error, cx))
+                        // §6 failure presentation; the Start action above
+                        // is already this section's retry.
+                        this.child(failure_block(
+                            "setup-mount-failure",
+                            "Couldn't start the games folder",
+                            failure_explanation(&error),
+                            None,
+                            error,
+                            window,
+                            cx,
+                        ))
                     })
                     .when_some(self.render_foreign_remediation(cx), |this, block| {
                         this.child(block)
