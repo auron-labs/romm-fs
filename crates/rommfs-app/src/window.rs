@@ -105,6 +105,97 @@ fn error_line(text: impl Into<String>, cx: &App) -> impl IntoElement {
         .child(text.into())
 }
 
+/// "Technical details" disclosure for failure blocks: a quiet toggle plus
+/// the complete diagnostic text in mono. The full path and cause chain
+/// stay reachable even where the summary line is shortened (UI-PLAN §6).
+fn details_disclosure(
+    id: impl Into<SharedString>,
+    detail: String,
+    window: &mut Window,
+    cx: &mut Context<RommfsWindow>,
+) -> impl IntoElement {
+    let id = id.into();
+    let open = window.use_keyed_state(
+        SharedString::from(format!("{id}-open")),
+        cx,
+        |_, _| std::cell::Cell::new(false),
+    );
+    let is_open = open.read(cx).get();
+    let toggle = open.clone();
+    v_flex()
+        .gap_1()
+        .child(
+            Button::new(id)
+                .ghost()
+                .small()
+                .label(if is_open {
+                    "Hide technical details"
+                } else {
+                    "Technical details"
+                })
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    toggle.update(cx, |open, _| open.set(!open.get()));
+                    cx.notify();
+                })),
+        )
+        .when(is_open, |this| {
+            this.child(
+                div()
+                    .w_full()
+                    .p_2()
+                    .bg(cx.theme().muted)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius)
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_xs()
+                    .child(detail),
+            )
+        })
+}
+
+/// The shared failure presentation (UI-PLAN §6): a title, the real reason
+/// as the explanation, the relevant action, and expandable details —
+/// placed at the top of the section the failure belongs to.
+fn failure_block(
+    id: &'static str,
+    title: &'static str,
+    explanation: String,
+    action: Option<Button>,
+    detail: String,
+    window: &mut Window,
+    cx: &mut Context<RommfsWindow>,
+) -> impl IntoElement {
+    v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(cx.theme().danger)
+                .child(title),
+        )
+        .child(muted(explanation, cx))
+        .when_some(action, |this, button| {
+            this.child(div().pt_1().child(button))
+        })
+        .child(details_disclosure(
+            SharedString::from(format!("{id}-details")),
+            detail,
+            window,
+            cx,
+        ))
+}
+
+/// "start filesystem backend for mount \"…\" failed: <cause>" — keep the
+/// cause as the explanation and the whole chain for the details lane.
+fn failure_explanation(error: &str) -> String {
+    error
+        .split_once(" failed: ")
+        .map(|(_, cause)| cause.to_string())
+        .unwrap_or_else(|| error.to_string())
+}
+
 fn section_heading(text: &'static str) -> impl IntoElement {
     div()
         .text_base()
@@ -1712,7 +1803,7 @@ impl RommfsWindow {
     /// folder, the one action the current state calls for, and the library
     /// summary. Start is never shown beside a permanently disabled Stop;
     /// while ready, Stop and Refresh library are secondary actions.
-    fn render_mount(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_mount(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let summary = self.state.folder_summary();
         let (mount_text, mount_kind) = self.mount_status(cx);
         let configured = self
@@ -1748,15 +1839,9 @@ impl RommfsWindow {
                         cx.reveal_path(&PathBuf::from(path.clone()));
                     }))
             }),
-            FolderSummary::Failed => configured.clone().map(|path| {
-                Button::new("retry-mount")
-                    .label("Retry")
-                    .primary()
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.start_mount(path.clone(), cx)
-                    }))
-            }),
-            FolderSummary::Starting => None,
+            // Failed renders no row action — the Retry lives inside the
+            // failure block next to its reason (UI-PLAN §6).
+            FolderSummary::Failed | FolderSummary::Starting => None,
         };
 
         v_flex()
@@ -1804,7 +1889,29 @@ impl RommfsWindow {
                 ))
             })
             .when_some(self.state.mount_error.clone(), |this, error| {
-                this.child(error_line(error, cx))
+                let retry = self
+                    .state
+                    .mount_path
+                    .clone()
+                    .or_else(|| self.state.configured_mount_root.clone())
+                    .map(|path| {
+                        Button::new("retry-mount")
+                            .label("Retry")
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.start_mount(path.clone(), cx)
+                            }))
+                    });
+                this.child(failure_block(
+                    "mount-failure",
+                    "Couldn't start the games folder",
+                    failure_explanation(&error),
+                    retry,
+                    error,
+                    window,
+                    cx,
+                ))
             })
             .when_some(self.render_foreign_remediation(cx), |this, block| {
                 this.child(block)
