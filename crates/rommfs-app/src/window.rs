@@ -116,11 +116,9 @@ fn details_disclosure(
     cx: &mut Context<RommfsWindow>,
 ) -> impl IntoElement {
     let id = id.into();
-    let open = window.use_keyed_state(
-        SharedString::from(format!("{id}-open")),
-        cx,
-        |_, _| std::cell::Cell::new(false),
-    );
+    let open = window.use_keyed_state(SharedString::from(format!("{id}-open")), cx, |_, _| {
+        std::cell::Cell::new(false)
+    });
     let is_open = open.read(cx).get();
     let toggle = open.clone();
     v_flex()
@@ -374,8 +372,7 @@ impl RommfsWindow {
         });
         let save_review_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search saves"));
-        let activity_search =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Search log"));
+        let activity_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search log"));
         let mut subscriptions = Vec::new();
 
         // Enter in a connection field is the section's default commit.
@@ -1249,26 +1246,17 @@ impl RommfsWindow {
             .when_some(self.state.retrobat_root.clone(), |this, root| {
                 this.child(muted(root, cx))
             })
-            .when_some(
-                self.state.retrobat_setup_detail.clone(),
-                |this, detail| {
-                    if self.state.retrobat_setup_running {
-                        this.child(muted(detail, cx))
-                    } else {
-                        this
-                    }
-                },
-            )
+            .when_some(self.state.retrobat_setup_detail.clone(), |this, detail| {
+                if self.state.retrobat_setup_running {
+                    this.child(muted(detail, cx))
+                } else {
+                    this
+                }
+            })
             .when_some(self.state.retrobat_setup_error.clone(), |this, error| {
                 this.child(error_line(error, cx))
             })
-            .child(self.nav_button(
-                "overview-retrobat",
-                "RetroBat settings",
-                3,
-                false,
-                cx,
-            ))
+            .child(self.nav_button("overview-retrobat", "RetroBat settings", 3, false, cx))
     }
 
     fn render_activity(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1447,20 +1435,18 @@ impl RommfsWindow {
                         h_flex()
                             .gap_2()
                             .items_end()
-                            .child(
-                                div().flex_1().min_w_0().child(field_column(
-                                    "Games folder",
-                                    Input::new(&self.mount_input).w_full(),
-                                    cx,
-                                )),
-                            )
+                            .child(div().flex_1().min_w_0().child(field_column(
+                                "Games folder",
+                                Input::new(&self.mount_input).w_full(),
+                                cx,
+                            )))
                             .child(
                                 Button::new("setup-browse-folder")
                                     .label("Browse…")
                                     .outline()
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        view.browse_games_folder(cx)
-                                    })),
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.browse_games_folder(cx)),
+                                    ),
                             ),
                     )
                     .child(self.layout_radio(locked, cx))
@@ -1858,8 +1844,7 @@ impl RommfsWindow {
     /// Start-at-login plus the honest close/quit description.
     fn render_background_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let login_supported = cfg!(windows);
-        let needs_connect =
-            !self.state.start_at_login && self.state.conn != ConnState::Connected;
+        let needs_connect = !self.state.start_at_login && self.state.conn != ConnState::Connected;
         let login_disabled = !login_supported || needs_connect;
         let login_reason = if !login_supported {
             "Start at login is available on Windows only."
@@ -1996,20 +1981,14 @@ impl RommfsWindow {
 
         // The primary action this state offers (UI-PLAN §3 truth table).
         let primary: Option<Button> = match summary {
-            FolderSummary::SetupNeeded => Some(self.nav_button(
-                "overview-setup-folder",
-                "Set up games folder",
-                4,
-                true,
-                cx,
-            )),
+            FolderSummary::SetupNeeded => {
+                Some(self.nav_button("overview-setup-folder", "Set up games folder", 4, true, cx))
+            }
             FolderSummary::Stopped => configured.clone().map(|path| {
                 Button::new("start-mount")
                     .label("Start games folder")
                     .primary()
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.start_mount(path.clone(), cx)
-                    }))
+                    .on_click(cx.listener(move |view, _, _, cx| view.start_mount(path.clone(), cx)))
             }),
             FolderSummary::Ready => configured.clone().map(|path| {
                 Button::new("open-mount")

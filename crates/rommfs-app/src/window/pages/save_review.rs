@@ -449,25 +449,13 @@ impl RommfsWindow {
                         detail = detail.child(
                             v_flex()
                                 .gap_1()
-                                .child(muted_xs(
-                                    format!(
-                                        "Files this covers in {dir_display}:"
-                                    ),
-                                    cx,
-                                ))
-                                .children(
-                                    affected
-                                        .iter()
-                                        .take(8)
-                                        .map(|path| {
-                                            div()
-                                                .text_xs()
-                                                .font_family(
-                                                    cx.theme().mono_font_family.clone(),
-                                                )
-                                                .child(path.clone())
-                                        }),
-                                )
+                                .child(muted_xs(format!("Files this covers in {dir_display}:"), cx))
+                                .children(affected.iter().take(8).map(|path| {
+                                    div()
+                                        .text_xs()
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .child(path.clone())
+                                }))
                                 .when(affected.len() > 8, |this| {
                                     this.child(muted_xs(
                                         format!("…and {} more", affected.len() - 8),

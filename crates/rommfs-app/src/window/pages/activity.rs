@@ -612,7 +612,8 @@ fn log_section(
                         .gap_3()
                         .items_center()
                         .child(
-                            div().w_40()
+                            div()
+                                .w_40()
                                 .child(Input::new(&view.activity_search).small()),
                         )
                         .child(
