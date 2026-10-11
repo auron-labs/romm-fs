@@ -352,23 +352,26 @@ impl RommfsWindow {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "~/RomM".to_string());
         let mount_input = cx.new(|cx| InputState::new(window, cx).default_value(default_mount));
-        let install_select =
-            cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
+        let install_select = cx.new(|cx| {
+            SelectState::new(Vec::<SharedString>::new(), None, window, cx).searchable(true)
+        });
         let save_folder_input = cx
             .new(|cx| InputState::new(window, cx).placeholder("Folder containing only save data"));
         let save_file_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Relative path, for example switch/user/title/0")
         });
-        let save_game_select =
-            cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
+        let save_game_select = cx.new(|cx| {
+            SelectState::new(Vec::<SharedString>::new(), None, window, cx).searchable(true)
+        });
         let debounce_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string())
         });
 
-        let settings_install_select =
-            cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
+        let settings_install_select = cx.new(|cx| {
+            SelectState::new(Vec::<SharedString>::new(), None, window, cx).searchable(true)
+        });
         let save_review_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search saves"));
         let activity_search =
