@@ -144,6 +144,13 @@ pub enum AppEvent {
         server: String,
         mount_root: Option<String>,
     },
+    /// The games folder configured in Settings was applied to the active
+    /// session — every dependent screen uses this path until a live mount
+    /// or a later apply says otherwise.
+    MountRootConfigured {
+        server: String,
+        mount_root: String,
+    },
     IntegrationUpdated {
         mode: crate::connection_settings::IntegrationMode,
         retrobat_root: Option<String>,

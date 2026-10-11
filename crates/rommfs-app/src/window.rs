@@ -608,6 +608,12 @@ impl RommfsWindow {
                             .update(cx, |input, cx| input.set_value(root.clone(), window, cx));
                     }
                 }
+                // An applied folder normalizes the field it was typed in.
+                AppEvent::MountRootConfigured { mount_root, .. } => {
+                    self.mount_input.update(cx, |input, cx| {
+                        input.set_value(mount_root.clone(), window, cx)
+                    });
+                }
                 AppEvent::SaveSyncSessionChanged { .. } => {
                     if self.debounce_input.read(cx).value() == self.debounce_input_applied {
                         let default = rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS.to_string();
@@ -1368,6 +1374,41 @@ impl RommfsWindow {
                 Input::new(&self.mount_input).w_full(),
                 cx,
             ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("apply-games-folder")
+                            .label("Use games folder")
+                            .outline()
+                            .disabled(
+                                locked
+                                    || self.state.conn != ConnState::Connected
+                                    || self.mount_input.read(cx).value().trim().is_empty(),
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                let path =
+                                    view.mount_input.read(cx).value().trim().to_string();
+                                view.controller.send(Command::SetMountRoot { path });
+                                cx.notify();
+                            })),
+                    )
+                    .when(
+                        locked || self.state.conn != ConnState::Connected,
+                        |this| {
+                            // §6: the disabled action explains why.
+                            this.child(muted_xs(
+                                if locked {
+                                    "Stop the games folder to change its location."
+                                } else {
+                                    "Connect to RomM first."
+                                },
+                                cx,
+                            ))
+                        },
+                    ),
+            )
             .child(self.layout_radio(locked, cx))
             .when(self.integration_choice == 1, |this| {
                 this.child(self.retrobat_install_row(cx))

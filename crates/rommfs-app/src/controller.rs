@@ -427,6 +427,16 @@ impl UiState {
                     self.configured_mount_root = mount_root.clone();
                 }
             }
+            AppEvent::MountRootConfigured { server, mount_root } => {
+                self.connected_server = Some(server.clone());
+                self.configured_mount_root = Some(mount_root.clone());
+                // Without a live mount the applied path is the current one:
+                // the folder display, Start and Retry must all follow the
+                // edit. A running mount keeps its real path until it stops.
+                if !matches!(self.mount, MountState::Mounted | MountState::Mounting) {
+                    self.mount_path = Some(mount_root.clone());
+                }
+            }
             AppEvent::SignedOut => {
                 self.conn = ConnState::Idle;
                 self.conn_error = None;
@@ -960,6 +970,11 @@ pub enum Command {
         url: String,
         username: String,
         password: String,
+    },
+    /// Apply the games-folder path typed in Settings to the session's
+    /// remembered config — validation stays with StartMount.
+    SetMountRoot {
+        path: String,
     },
     StartMount {
         path: String,
@@ -2857,6 +2872,32 @@ impl Worker {
         });
     }
 
+    /// Apply the Settings games-folder edit to this session's remembered
+    /// config. Validation stays with start_mount — applying only records
+    /// the chosen folder so every screen uses it.
+    fn set_mount_root(&mut self, path: &str) {
+        let path = path.trim();
+        let Some(preferences) = &mut self.preferences else {
+            self.log(
+                Level::Warn,
+                "settings",
+                "Games folder change ignored: no remembered session",
+            );
+            return;
+        };
+        preferences.mount_root = Some(PathBuf::from(path));
+        let server = preferences.server.clone();
+        if let Some(settings) = &self.connection_settings {
+            if let Err(error) = settings.save(preferences) {
+                self.log(Level::Warn, "settings", error.to_string());
+            }
+        }
+        self.sink.emit(AppEvent::MountRootConfigured {
+            server,
+            mount_root: path.to_string(),
+        });
+    }
+
     fn start_mount(&mut self, path: &str) {
         let path = path.trim();
         if self.auxiliary_job.is_some() {
@@ -3299,6 +3340,7 @@ fn worker_loop_with_interval_from(
                 username,
                 password,
             } => worker.connect(url, username, password),
+            Command::SetMountRoot { path } => worker.set_mount_root(path),
             Command::StartMount { path } => worker.start_mount(path),
             Command::StopMount => worker.stop_mount(),
             Command::RefreshCatalogue => worker.refresh_catalogue(),
@@ -3341,6 +3383,7 @@ fn worker_loop_with_interval_from(
                     reason: format!("internal error: {msg}"),
                 }),
                 Command::StopMount => {}
+                Command::SetMountRoot { .. } => {}
                 Command::SetupRetroBat { .. } => worker.sink.emit(AppEvent::RetroBatSetup {
                     running: false,
                     detail: "RetroBat setup stopped".into(),
@@ -5300,5 +5343,71 @@ mod tests {
             "reauthentication must restore the remembered folder to the UI"
         );
         assert_eq!(state.folder_summary(), FolderSummary::Stopped);
+    }
+
+    /// A Settings games-folder edit applies to the session's remembered
+    /// config and reaches every dependent screen: the configured root,
+    /// the Start/Retry path, and the persisted preference for the next
+    /// launch (PR-review regression: edits were silently ignored).
+    #[test]
+    fn games_folder_apply_updates_the_session_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.connection_settings =
+            Some(ConnectionSettings::open(&directory.path().join("connection.db")).unwrap());
+        worker.preferences = Some(ConnectionPreferences {
+            server: "https://romm.example".into(),
+            account_id: 42,
+            device_identifier: "id".into(),
+            mount_root: Some(directory.path().join("old")),
+            integration: IntegrationMode::Generic,
+            retrobat_root: None,
+            start_at_login: false,
+            save_root: None,
+        });
+
+        worker.set_mount_root("  /new/roms  ");
+
+        assert_eq!(
+            worker.preferences.as_ref().unwrap().mount_root,
+            Some(PathBuf::from("/new/roms")),
+            "the edit is stored as the session's mount root"
+        );
+        assert_eq!(
+            worker
+                .connection_settings
+                .as_ref()
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap()
+                .mount_root,
+            Some(PathBuf::from("/new/roms")),
+            "the applied folder is persisted for the next launch"
+        );
+        let mut state = UiState::new(16);
+        for event in events.try_iter() {
+            state.apply(&event);
+        }
+        assert_eq!(state.configured_mount_root.as_deref(), Some("/new/roms"));
+        assert_eq!(
+            state.mount_path.as_deref(),
+            Some("/new/roms"),
+            "a stopped folder's Start/Retry path must follow the applied edit"
+        );
+        assert_eq!(state.folder_summary(), FolderSummary::Stopped);
+
+        // A live mount keeps its real path — the applied folder is the
+        // next start's target.
+        state.apply(&AppEvent::MountStarted {
+            path: "/live".into(),
+        });
+        state.apply(&AppEvent::MountRootConfigured {
+            server: "s".into(),
+            mount_root: "/newer".into(),
+        });
+        assert_eq!(state.mount_path.as_deref(), Some("/live"));
+        assert_eq!(state.configured_mount_root.as_deref(), Some("/newer"));
     }
 }
