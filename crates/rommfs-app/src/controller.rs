@@ -2112,6 +2112,11 @@ impl Worker {
             let Some(preferences) = settings.load()? else {
                 return Ok(());
             };
+            // Connecting clears the previous session's host/folder facts;
+            // emit it BEFORE ConnectionRestored or the just-restored
+            // configured_mount_root is wiped and a configured user renders
+            // as "Set up your games folder" (UI-PLAN §3/§4).
+            self.sink.emit(AppEvent::Connecting);
             self.sink.emit(AppEvent::ConnectionRestored {
                 server: preferences.server.clone(),
                 mount_root: preferences
@@ -2140,7 +2145,6 @@ impl Worker {
                     "stored session belongs to another account".into(),
                 ));
             }
-            self.sink.emit(AppEvent::Connecting);
             self.startup_restoring =
                 std::env::args().any(|arg| arg == "--startup") && preferences.start_at_login;
             self.startup_requires_mount = self.startup_restoring;
@@ -5125,5 +5129,58 @@ mod tests {
             elapsed_ms: 100,
         });
         assert!(events.try_recv().is_err());
+    }
+
+    /// A remembered account's folder config must survive the reconnect:
+    /// `Connecting` clears per-session facts, so it has to be emitted before
+    /// `ConnectionRestored` or a configured user renders as
+    /// "Set up your games folder" (UI-PLAN §3/§4).
+    #[test]
+    fn restore_keeps_the_configured_folder_visible() {
+        let directory = tempfile::tempdir().unwrap();
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.connection_settings =
+            Some(ConnectionSettings::open(&directory.path().join("connection.db")).unwrap());
+        worker
+            .connection_settings
+            .as_ref()
+            .unwrap()
+            .save(&ConnectionPreferences {
+                server: "https://romm.example".into(),
+                account_id: 42,
+                device_identifier: "id".into(),
+                mount_root: Some(directory.path().join("roms")),
+                integration: IntegrationMode::Generic,
+                retrobat_root: None,
+                start_at_login: false,
+                save_root: None,
+            })
+            .unwrap();
+
+        worker.restore_connection();
+
+        let collected: Vec<_> = events.try_iter().collect();
+        let connecting_at = collected
+            .iter()
+            .position(|e| matches!(e, AppEvent::Connecting))
+            .expect("restore emits Connecting");
+        let restored_at = collected
+            .iter()
+            .position(|e| matches!(e, AppEvent::ConnectionRestored { .. }))
+            .expect("restore emits ConnectionRestored");
+        assert!(
+            connecting_at < restored_at,
+            "Connecting must precede ConnectionRestored — it clears the restored config"
+        );
+        let mut state = UiState::new(16);
+        for event in &collected {
+            state.apply(event);
+        }
+        assert_eq!(
+            state.folder_summary(),
+            FolderSummary::Stopped,
+            "a configured-but-stopped folder must never read as unconfigured"
+        );
     }
 }
