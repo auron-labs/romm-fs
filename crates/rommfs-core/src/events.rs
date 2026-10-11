@@ -155,7 +155,12 @@ pub enum AppEvent {
     ConnectFailed {
         reason: String,
     },
-    SignInRequired,
+    /// Authentication is required (again). `reason` preserves the real cause —
+    /// rejected credentials, an expired/rejected token, or a revoked pairing —
+    /// so the UI shows why, never a bare "sign-in required" placeholder.
+    SignInRequired {
+        reason: Option<String>,
+    },
 
     /// Actual counts and timings for one catalogue operation.
     CatalogueProgress {

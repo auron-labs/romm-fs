@@ -6,7 +6,7 @@
 //! keyboard activation, and focus traversal come from the component
 //! library; the view composes sections and forwards `Command`s.
 
-use crate::controller::{Command, ConnState, Controller, MountState, UiState};
+use crate::controller::{Command, ConnState, Controller, MountState, SaveSyncSummary, UiState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
@@ -184,6 +184,9 @@ struct RommfsWindow {
     mapping_open: bool,
     advanced_open: bool,
     log_scroll: ScrollHandle,
+    /// True when a system tray exists and closing the window only hides it —
+    /// close-vs-quit copy is derived from this, never assumed (UI-PLAN §3).
+    tray_hides: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -192,6 +195,7 @@ impl RommfsWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
         session: Rc<RefCell<crate::session::ApplicationSession>>,
+        tray_hides: bool,
     ) -> Self {
         let controller = session.borrow().controller();
 
@@ -347,6 +351,7 @@ impl RommfsWindow {
             mapping_open: false,
             advanced_open: false,
             log_scroll: ScrollHandle::new(),
+            tray_hides,
             _subscriptions: subscriptions,
         };
         let focus = view.url_input.read(cx).focus_handle(cx);
@@ -726,20 +731,25 @@ impl RommfsWindow {
 
     // --- render helpers ---
 
+    /// The header marker is explicitly the *RomM connection* status — a
+    /// bare "Connected" reads as app-wide health (UI-PLAN §3).
     fn conn_status(&self, cx: &App) -> (SharedString, StatusKind) {
         match self.state.conn {
-            ConnState::Idle => ("Not connected".into(), StatusKind::Muted),
-            ConnState::Connecting => ("Connecting…".into(), StatusKind::Warning),
+            ConnState::Idle => ("RomM · not connected".into(), StatusKind::Muted),
+            ConnState::Connecting => ("RomM · connecting…".into(), StatusKind::Warning),
             ConnState::Connected => {
                 let user = self.user_input.read(cx).value();
                 if user.is_empty() {
-                    ("Connected".into(), StatusKind::Success)
+                    ("RomM · connected".into(), StatusKind::Success)
                 } else {
-                    (format!("Connected · {user}").into(), StatusKind::Success)
+                    (
+                        format!("RomM · connected · {user}").into(),
+                        StatusKind::Success,
+                    )
                 }
             }
-            ConnState::Failed => ("Connection failed".into(), StatusKind::Danger),
-            ConnState::SignInRequired => ("Sign-in required".into(), StatusKind::Danger),
+            ConnState::Failed => ("RomM · connection failed".into(), StatusKind::Danger),
+            ConnState::SignInRequired => ("RomM · sign-in required".into(), StatusKind::Danger),
         }
     }
 
@@ -752,48 +762,24 @@ impl RommfsWindow {
         }
     }
 
+    /// The single derived save-sync status (UI-PLAN §5): zero linked files
+    /// is "No files ready to sync", never "Up to date".
     fn save_sync_status(&self) -> (&'static str, StatusKind) {
-        if self.state.conn == ConnState::SignInRequired
-            || self.state.save_sync_authentication_required
-        {
-            return ("Authentication required", StatusKind::Danger);
-        }
-        if self.state.conn == ConnState::Failed {
-            return ("Offline", StatusKind::Danger);
-        }
-        if !self.state.save_sync_enabled {
-            return ("Disabled", StatusKind::Muted);
-        }
-        if self
-            .state
-            .save_sync_queue
-            .as_ref()
-            .is_some_and(|queue| queue.network_paused)
-        {
-            return ("Paused", StatusKind::Danger);
-        }
-        if !self.state.save_sync_available {
-            return ("Not ready", StatusKind::Danger);
-        }
-        let Some(queue) = self.state.save_sync_queue.as_ref() else {
-            return ("Reconciling", StatusKind::Warning);
+        let summary = self.state.save_sync_summary();
+        let kind = match summary {
+            SaveSyncSummary::AuthRequired
+            | SaveSyncSummary::Offline
+            | SaveSyncSummary::NeedsAttention
+            | SaveSyncSummary::Paused => StatusKind::Danger,
+            SaveSyncSummary::NeedsSetup
+            | SaveSyncSummary::Checking
+            | SaveSyncSummary::NoLinkedFiles
+            | SaveSyncSummary::Reconciling
+            | SaveSyncSummary::Syncing => StatusKind::Warning,
+            SaveSyncSummary::Off => StatusKind::Muted,
+            SaveSyncSummary::UpToDate => StatusKind::Success,
         };
-        if queue.actor_failed {
-            return ("Failed", StatusKind::Danger);
-        }
-        if queue.reconciled_games < queue.mapped_games {
-            return ("Reconciling", StatusKind::Warning);
-        }
-        if queue.attention_games > 0 || queue.pending_incoming > 0 {
-            return ("Review needed", StatusKind::Warning);
-        }
-        if queue.failure.is_some() {
-            return ("Retrying", StatusKind::Warning);
-        }
-        if queue.pending_outbound > 0 {
-            return ("Syncing", StatusKind::Warning);
-        }
-        ("Up to date", StatusKind::Success)
+        (summary.label(), kind)
     }
 
     /// A disclosure row is one interactive control: pointer, Enter, Space,
@@ -862,48 +848,70 @@ impl RommfsWindow {
             .child(status_marker(conn_kind, conn_text, cx))
     }
 
+    /// Only the controls meaningful for the *current* auth state render —
+    /// a signed-in session never sits beside its own sign-in buttons
+    /// (UI-PLAN screenshot finding), and failures keep their real reason.
     fn render_connection(
         &mut self,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let connecting = self.state.conn == ConnState::Connecting;
+        let conn = self.state.conn;
+        let connecting = conn == ConnState::Connecting;
+        let connected = conn == ConnState::Connected;
+        let server = self.url_input.read(cx).value();
+        let user = self.user_input.read(cx).value();
+        let summary = if user.is_empty() {
+            server.to_string()
+        } else {
+            format!("{server} · {user}")
+        };
         v_flex().gap_3()
-            .child(section_heading("Connection"))
-            .child(field_column("Server URL", Input::new(&self.url_input).w_full(), cx))
-            .child(h_flex().gap_2()
+            .child(section_heading("RomM connection"))
+            .when(!connected, |this| this
+                .child(field_column("Server URL", Input::new(&self.url_input).w_full(), cx)))
+            .when(connected, |this| this
+                .child(muted(format!("Signed in to {summary}"), cx))
+                .child(h_flex().gap_2()
+                    .child(Button::new("change-server").label("Change server").outline()
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.controller.send(Command::Logout); cx.notify();
+                        })))
+                    .child(Button::new("sign-out").label("Sign out")
+                        .on_click(cx.listener(|view, _, _, cx| { view.controller.send(Command::Logout); cx.notify(); })))))
+            .when(connecting, |this| this
+                .child(Button::new("cancel-sign-in").label("Cancel sign-in")
+                    .on_click(cx.listener(|view, _, _, cx| { view.controller.send(Command::CancelPairing); cx.notify(); }))))
+            .when(!connecting && !connected, |this| this
                 .child(Button::new("browser-sign-in").label("Sign in with browser…")
-                    .primary().loading(connecting && !self.password_sign_in).disabled(connecting)
+                    .primary()
                     .on_click(cx.listener(|view, _, _, cx| {
                         view.password_sign_in = false; view.on_connect(cx); cx.notify();
                     })))
-                .child(Button::new("cancel-sign-in").label("Cancel sign-in")
-                    .disabled(!connecting).on_click(cx.listener(|view, _, _, cx| { view.controller.send(Command::CancelPairing); cx.notify(); })))
-                .child(Button::new("sign-out").label("Sign out")
-                    .disabled(self.state.conn != ConnState::Connected).on_click(cx.listener(|view, _, _, cx| { view.controller.send(Command::Logout); cx.notify(); }))))
+                .child(Collapsible::new().open(self.password_sign_in)
+                    .child(Button::new("password-sign-in-options").ghost().label(if self.password_sign_in { "Hide password sign-in" } else { "Use password instead" })
+                        .on_click(cx.listener(|view,_,_,cx| { view.password_sign_in = !view.password_sign_in; cx.notify(); })))
+                    .content(v_flex().gap_3()
+                        .child(h_flex().gap_3().items_stretch()
+                            .child(div().flex_1().min_w_0().child(field_column("Username", Input::new(&self.user_input).w_full(), cx)))
+                            .child(div().flex_1().min_w_0().child(field_column("Password", Input::new(&self.password_input).w_full().content_type(InputContentType::Password).mask_toggle(), cx))))
+                        .child(Button::new("connect").label("Connect with password")
+                            .on_click(cx.listener(|view,_,_,cx| view.on_connect(cx))))
+                        .child(muted("Password sign-in is not remembered. Browser sign-in uses Windows Credential Manager.", cx)))))
             .when_some(self.state.pairing_code.clone(), |this, code| this.child(muted(format!("Approve RomMFS in your browser · code {code}"), cx)))
-            .child(Collapsible::new().open(self.password_sign_in)
-                .child(Button::new("password-sign-in-options").ghost().label(if self.password_sign_in { "Hide password sign-in" } else { "Use password instead" })
-                    .disabled(connecting).on_click(cx.listener(|view,_,_,cx| { view.password_sign_in = !view.password_sign_in; cx.notify(); })))
-                .content(v_flex().gap_3()
-                    .child(h_flex().gap_3().items_stretch()
-                        .child(div().flex_1().min_w_0().child(field_column("Username", Input::new(&self.user_input).w_full(), cx)))
-                        .child(div().flex_1().min_w_0().child(field_column("Password", Input::new(&self.password_input).w_full().content_type(InputContentType::Password).mask_toggle(), cx))))
-                    .child(Button::new("connect").label("Connect with password").disabled(connecting)
-                        .on_click(cx.listener(|view,_,_,cx| view.on_connect(cx))))
-                    .child(muted("Password sign-in is not remembered. Browser sign-in uses Windows Credential Manager.", cx))))
             .when_some(self.state.conn_error.clone(), |this,error| this.child(error_line(error,cx)))
     }
 
     fn render_integration(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let locked = self.state.retrobat_setup_running
+            || self.state.auxiliary_running
             || matches!(self.state.mount, MountState::Mounted | MountState::Mounting);
         v_flex().gap_3()
             .child(section_heading("Background operation"))
             .child(Button::new("start-at-login").label(if self.state.start_at_login { "Disable start at login" } else { "Enable start at login" })
                 .disabled(!cfg!(windows) || (!self.state.start_at_login && self.state.conn != ConnState::Connected))
                 .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::SetStartAtLogin { enabled: !view.state.start_at_login }); cx.notify(); })))
-            .child(muted("On Windows, closing the window hides RomMFS in the tray. Use tray Quit to stop background work. Login startup reconnects and mounts before resuming previously authorized save sync.",cx))
+            .child(muted(format!("{} Login startup reconnects and mounts before resuming previously authorized save sync.", close_behavior_copy(self.tray_hides)),cx))
             .when_some(self.state.startup_error.clone(),|this,error| this.child(error_line(error,cx)))
             .child(section_heading("Library layout"))
             .child(RadioGroup::horizontal("library-layout").children(["Generic folders", "RetroBat"])
@@ -982,6 +990,8 @@ impl RommfsWindow {
                 .disabled(!self.state.auxiliary_running)
                 .on_click(cx.listener(|view,_,_,cx| { view.controller.send(Command::CancelAuxiliary); cx.notify(); })))
             .child(muted("Downloads user-library BIOS, individual Switch firmware/keys, and RetroArch .cht cheats. No archives are extracted, no unowned or modified file is overwritten, and these files are never save data. Stop emulators before continuing.",cx))
+            .when_some(self.state.auxiliary_detail.clone(), |this,detail| this.child(muted(detail,cx)))
+            .when_some(self.state.auxiliary_error.clone(), |this,error| this.child(error_line(error,cx)))
             .when(locked, |this| this.child(muted("Stop the mount before changing its layout.",cx)))
             .when_some(self.state.integration_notice.clone(), |this,note| this.child(muted(note,cx)))
             .when_some(self.state.integration_error.clone(), |this,error| this.child(error_line(error,cx)))
@@ -1167,7 +1177,10 @@ impl RommfsWindow {
                 None => this.child(Progress::new("mount-progress").loading(true).small()),
             })
             .child(muted(
-                "Read-only files download when opened. Closing RomMFS stops the mount.",
+                format!(
+                    "Game files download when an application opens them. {}",
+                    close_behavior_copy(self.tray_hides)
+                ),
                 cx,
             ))
     }
@@ -2161,6 +2174,17 @@ fn apply_rommfs_theme(theme: &mut Theme) {
     theme.info = color("#60a5fa");
 }
 
+/// One truthful sentence about what closing the window does — repeated
+/// wherever mount/background copy mentions it, so close-vs-quit can never
+/// contradict the real tray behaviour (UI-PLAN §3).
+fn close_behavior_copy(tray_hides: bool) -> &'static str {
+    if tray_hides {
+        "Closing the window hides RomMFS to the tray; the games folder and sync keep running. Quit from the tray menu to stop them."
+    } else {
+        "Closing RomMFS stops the games folder and all background work."
+    }
+}
+
 /// Launch the GPUI app; blocks until the window closes. Closing stops the
 /// worker session and mount (PRD: no tray/background process).
 pub fn run() {
@@ -2215,6 +2239,10 @@ pub fn run() {
                     None
                 }
             };
+            #[cfg(windows)]
+            let tray_hides = tray.is_some();
+            #[cfg(not(windows))]
+            let tray_hides = false;
 
             let bounds = Bounds::centered(None, size(px(1160.0), px(920.0)), cx);
             let view_session = session.clone();
@@ -2285,7 +2313,7 @@ pub fn run() {
                     }
                     #[cfg(not(windows))]
                     let _instance = instance;
-                    cx.new(|cx| RommfsWindow::new(window, cx, view_session))
+                    cx.new(|cx| RommfsWindow::new(window, cx, view_session, tray_hides))
                 },
             )
             .expect("failed to open window");

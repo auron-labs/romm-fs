@@ -60,6 +60,83 @@ pub enum MountState {
     Failed,
 }
 
+/// The derived games-folder summary the whole UI shares (UI-PLAN §3): a folder
+/// is "ready" only after a real MountStarted — never inferred from the
+/// persisted enabled setting or the existence of a directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderSummary {
+    /// No completed folder setup for this server yet.
+    SetupNeeded,
+    /// A folder is configured but the provider is stopped.
+    Stopped,
+    /// A start operation is running.
+    Starting,
+    /// Provider active and folder usable.
+    Ready,
+    /// The last start failed (reason in `mount_error`).
+    Failed,
+}
+
+impl FolderSummary {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SetupNeeded => "Set up your games folder",
+            Self::Stopped => "Games folder stopped",
+            Self::Starting => "Starting games folder…",
+            Self::Ready => "Games folder ready",
+            Self::Failed => "Couldn't start the games folder",
+        }
+    }
+}
+
+/// The derived save-sync summary the whole UI shares (UI-PLAN §5): configured,
+/// enabled, running, and successfully checked stay distinct — unknown state
+/// and zero linked files are never presented as "up to date".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveSyncSummary {
+    /// Signed out or the server rejected the session.
+    AuthRequired,
+    /// The RomM connection itself failed.
+    Offline,
+    /// The user has not enabled sync — no implied protection.
+    Off,
+    /// The source configuration is invalid or incomplete.
+    NeedsSetup,
+    /// Enabled but no completed check exists yet.
+    Checking,
+    /// A check ran but no eligible files are linked to games.
+    NoLinkedFiles,
+    /// Still reconciling known links.
+    Reconciling,
+    /// Transfers are pending or running.
+    Syncing,
+    /// The current operation failed or items need review.
+    NeedsAttention,
+    /// The worker paused syncing (for example on network errors).
+    Paused,
+    /// Linked files checked with no work pending. Unlinked files keep a
+    /// separate count — they do not downgrade the summary.
+    UpToDate,
+}
+
+impl SaveSyncSummary {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AuthRequired => "Sign-in required",
+            Self::Offline => "RomM unreachable",
+            Self::Off => "Save sync off",
+            Self::NeedsSetup => "Save sync needs setup",
+            Self::Checking => "Checking saves…",
+            Self::NoLinkedFiles => "No files ready to sync",
+            Self::Reconciling => "Checking saves…",
+            Self::Syncing => "Syncing saves…",
+            Self::NeedsAttention => "Save sync needs attention",
+            Self::Paused => "Save sync paused",
+            Self::UpToDate => "Linked saves are up to date",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DownloadView {
     pub file_id: u64,
@@ -90,6 +167,8 @@ pub struct UiState {
     pub startup_error: Option<String>,
     pub save_file_games: Vec<(i64, String)>,
     pub save_file_unmatched: Vec<UnmatchedFile>,
+    pub auxiliary_detail: Option<String>,
+    pub auxiliary_error: Option<String>,
     pub installer_running: bool,
     pub installer_ready: bool,
     pub installer_progress: (u64, Option<u64>),
@@ -133,6 +212,11 @@ pub struct UiState {
     pub save_sync_documented_saves_root: Option<String>,
     pub save_sync_effective_saves_root: Option<String>,
     pub save_sync_profile_version: Option<String>,
+    /// Server the active session connected to (from ConnectionRestored).
+    pub connected_server: Option<String>,
+    /// The persisted games-folder root for this server, when known —
+    /// distinguishes "never set up" from "configured but stopped".
+    pub configured_mount_root: Option<String>,
     pub save_sync_account_id: Option<i64>,
     pub save_sync_mapped_targets: usize,
     pub save_sync_catalogue_unmapped: usize,
@@ -162,6 +246,8 @@ impl UiState {
         Self {
             start_at_login: false,
             auxiliary_running: false,
+            auxiliary_detail: None,
+            auxiliary_error: None,
             startup_error: None,
             save_file_games: Vec::new(),
             save_file_unmatched: Vec::new(),
@@ -197,6 +283,8 @@ impl UiState {
             catalogue_pending_remount: false,
             catalogue_operation_id: 0,
             catalogue: None,
+            connected_server: None,
+            configured_mount_root: None,
             save_sync_candidates: Vec::new(),
             save_sync_skipped: 0,
             save_sync_selected_root: None,
@@ -247,10 +335,12 @@ impl UiState {
                 detail,
                 error,
             } => {
+                // Auxiliary support-file downloads are their own operation:
+                // their status must not masquerade as (or overwrite) RetroBat
+                // setup state.
                 self.auxiliary_running = *running;
-                self.retrobat_setup_running = *running;
-                self.retrobat_setup_detail = Some(detail.clone());
-                self.retrobat_setup_error = error.clone();
+                self.auxiliary_detail = Some(detail.clone());
+                self.auxiliary_error = error.clone();
             }
             AppEvent::StartupPreference { enabled, error } => {
                 self.start_at_login = *enabled;
@@ -329,7 +419,14 @@ impl UiState {
                     None
                 };
             }
-            AppEvent::ConnectionRestored { .. } => {}
+            AppEvent::ConnectionRestored {
+                server, mount_root, ..
+            } => {
+                self.connected_server = Some(server.clone());
+                if mount_root.is_some() {
+                    self.configured_mount_root = mount_root.clone();
+                }
+            }
             AppEvent::SignedOut => {
                 self.conn = ConnState::Idle;
                 self.conn_error = None;
@@ -339,6 +436,8 @@ impl UiState {
                 self.catalogue_progress = None;
                 self.downloads.clear();
                 self.pairing_code = None;
+                self.connected_server = None;
+                self.configured_mount_root = None;
             }
             AppEvent::PairingReady { user_code, .. } => {
                 self.pairing_code = Some(user_code.clone());
@@ -369,6 +468,11 @@ impl UiState {
                 self.save_sync_transfers.clear();
                 self.save_sync_queue = None;
                 self.save_sync_authentication_required = false;
+                // A new connection attempt may target a different server —
+                // the old session's host and folder config are not evidence
+                // of anything until ConnectionRestored confirms them.
+                self.connected_server = None;
+                self.configured_mount_root = None;
                 self.save_sync_export_errors.clear();
                 self.save_sync_export_feedback.clear();
                 self.save_sync_enabled = false;
@@ -392,9 +496,13 @@ impl UiState {
                 self.conn = ConnState::Failed;
                 self.conn_error = Some(reason.clone());
             }
-            AppEvent::SignInRequired => {
+            AppEvent::SignInRequired { reason } => {
                 self.conn = ConnState::SignInRequired;
-                self.conn_error = Some("sign-in required".to_string());
+                self.conn_error = Some(
+                    reason
+                        .clone()
+                        .unwrap_or_else(|| "sign-in required".to_string()),
+                );
             }
 
             AppEvent::CatalogueProgress {
@@ -681,6 +789,63 @@ impl UiState {
             AppEvent::Log(line) => self.log.push(line.clone()),
         }
         self.prune_downloads();
+    }
+
+    /// Whether the games folder is usable right now, derived only from real
+    /// mount events — never from connection, configuration, or sync state.
+    pub fn folder_summary(&self) -> FolderSummary {
+        match self.mount {
+            MountState::Mounted => FolderSummary::Ready,
+            MountState::Mounting => FolderSummary::Starting,
+            MountState::Failed => FolderSummary::Failed,
+            MountState::NotMounted => {
+                if self.mount_path.is_some() || self.configured_mount_root.is_some() {
+                    FolderSummary::Stopped
+                } else {
+                    FolderSummary::SetupNeeded
+                }
+            }
+        }
+    }
+
+    /// The one derived save-sync status (UI-PLAN §5 table). Zero eligible
+    /// files is not "up to date"; an unlinked-file count does not downgrade
+    /// an otherwise healthy linked set.
+    pub fn save_sync_summary(&self) -> SaveSyncSummary {
+        if self.conn == ConnState::SignInRequired || self.save_sync_authentication_required {
+            return SaveSyncSummary::AuthRequired;
+        }
+        if self.conn == ConnState::Failed {
+            return SaveSyncSummary::Offline;
+        }
+        if !self.save_sync_enabled {
+            return SaveSyncSummary::Off;
+        }
+        if !self.save_sync_available {
+            return SaveSyncSummary::NeedsSetup;
+        }
+        let Some(queue) = self.save_sync_queue.as_ref() else {
+            return SaveSyncSummary::Checking;
+        };
+        if queue.actor_failed || queue.failure.is_some() || self.save_sync_failure.is_some() {
+            return SaveSyncSummary::NeedsAttention;
+        }
+        if queue.network_paused {
+            return SaveSyncSummary::Paused;
+        }
+        if queue.mapped_games == 0 {
+            return SaveSyncSummary::NoLinkedFiles;
+        }
+        if queue.reconciled_games < queue.mapped_games {
+            return SaveSyncSummary::Reconciling;
+        }
+        if queue.pending_outbound > 0 {
+            return SaveSyncSummary::Syncing;
+        }
+        if queue.attention_games > 0 || queue.pending_incoming > 0 {
+            return SaveSyncSummary::NeedsAttention;
+        }
+        SaveSyncSummary::UpToDate
     }
 
     /// Mark a mount request pending immediately so a second UI click cannot
@@ -1782,7 +1947,9 @@ impl Worker {
             }
             Err(error) => {
                 if error.needs_sign_in() {
-                    self.sink.emit(AppEvent::SignInRequired);
+                    self.sink.emit(AppEvent::SignInRequired {
+                        reason: Some(error.to_string()),
+                    });
                 } else {
                     self.sink.emit(AppEvent::CatalogueFailed {
                         reason: error.to_string(),
@@ -2174,7 +2341,9 @@ impl Worker {
                     if error.needs_sign_in() {
                         self.stop_save_sync_agent();
                         self.stop_mount();
-                        self.sink.emit(AppEvent::SignInRequired);
+                        self.sink.emit(AppEvent::SignInRequired {
+                            reason: Some(error.to_string()),
+                        });
                     }
                     self.log(Level::Error, "metadata", error.to_string());
                     self.metadata_status(
@@ -2572,7 +2741,9 @@ impl Worker {
         if error.needs_sign_in() {
             self.stop_save_sync_agent();
             self.stop_mount();
-            self.sink.emit(AppEvent::SignInRequired);
+            self.sink.emit(AppEvent::SignInRequired {
+                reason: Some(error.to_string()),
+            });
         }
         self.sink.emit(AppEvent::CatalogueFailed {
             reason: error.to_string(),
@@ -2596,7 +2767,9 @@ impl Worker {
 
     fn fail_connect(&self, e: &Error) {
         if e.needs_sign_in() {
-            self.sink.emit(AppEvent::SignInRequired);
+            self.sink.emit(AppEvent::SignInRequired {
+                reason: Some(e.to_string()),
+            });
         } else {
             self.sink.emit(AppEvent::ConnectFailed {
                 reason: e.to_string(),
@@ -2707,7 +2880,9 @@ impl Worker {
             return;
         };
         if !client.has_token() && self.catalogue.is_some() {
-            self.sink.emit(AppEvent::SignInRequired);
+            self.sink.emit(AppEvent::SignInRequired {
+                reason: Some("sign in before mounting the cached library".into()),
+            });
             self.fail_mount(
                 "check authentication",
                 path,
@@ -2780,7 +2955,9 @@ impl Worker {
                     self.refresh_save_sync();
                 }
                 Err(e) if e.needs_sign_in() => {
-                    self.sink.emit(AppEvent::SignInRequired);
+                    self.sink.emit(AppEvent::SignInRequired {
+                        reason: Some(e.to_string()),
+                    });
                     self.fail_mount("load catalogue", path, &e);
                     self.refresh_save_sync();
                     return;
@@ -3952,7 +4129,10 @@ mod tests {
             Ok(AppEvent::SaveSyncSessionChanged { session_id: 1 })
         ));
         assert!(matches!(events.try_recv(), Ok(AppEvent::Connecting)));
-        assert!(matches!(events.try_recv(), Ok(AppEvent::SignInRequired)));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AppEvent::SignInRequired { .. })
+        ));
     }
 
     #[test]
