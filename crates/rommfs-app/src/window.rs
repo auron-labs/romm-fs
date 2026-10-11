@@ -2307,7 +2307,14 @@ impl RommfsWindow {
                 "Changed files upload automatically. Remote-only changes replace an unchanged synchronized baseline; simultaneous changes and active files are kept for review. Local deletion never deletes remote saves.",
                 cx,
             ))
-            .child(muted_xs("Sync continues while RomMFS runs, including in the tray.", cx))
+            .child(muted_xs(
+                if self.tray_hides {
+                    "Sync continues while RomMFS runs, including in the tray."
+                } else {
+                    "Sync continues while RomMFS runs."
+                },
+                cx,
+            ))
             .child(
                 h_flex()
                     .gap_3()
