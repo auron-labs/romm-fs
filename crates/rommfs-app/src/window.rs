@@ -2265,11 +2265,7 @@ impl Render for RommfsWindow {
             ),
             1 => page(
                 "save-sync-view",
-                v_flex()
-                    .gap_4()
-                    .child(page_heading("Save sync"))
-                    .child(pages::save_review::render(self, window, cx))
-                    .into_any_element(),
+                pages::save_review::render(self, window, cx).into_any_element(),
             ),
             2 => page(
                 "activity-view",

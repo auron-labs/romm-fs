@@ -7,5 +7,8 @@ pub fn render(
     window: &mut Window,
     cx: &mut Context<RommfsWindow>,
 ) -> impl IntoElement {
-    view.render_save_sync(window, cx)
+    v_flex()
+        .gap_4()
+        .child(page_heading("Save sync"))
+        .child(view.render_save_sync(window, cx))
 }
