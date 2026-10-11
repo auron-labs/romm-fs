@@ -458,6 +458,12 @@ impl RommfsWindow {
                 // send it to Overview where the sign-in action lives
                 // (existing config must never replay onboarding).
                 AppEvent::SignInRequired { .. } => self.active_view = 0,
+                // A remembered account whose server is temporarily down is
+                // still configured — Overview, never guided setup again
+                // (UI-PLAN §4).
+                AppEvent::ConnectFailed { .. } if self.state.connected_server.is_some() => {
+                    self.active_view = 0;
+                }
                 AppEvent::ConnectionRestored { server, mount_root } => {
                     self.url_input
                         .update(cx, |input, cx| input.set_value(server.clone(), window, cx));
