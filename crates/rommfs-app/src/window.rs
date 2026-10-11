@@ -21,6 +21,7 @@ use gpui_kit::component::{
     select::{Select, SelectEvent, SelectState},
     separator::Separator,
     sidebar::{Sidebar, SidebarCollapsible, SidebarMenu, SidebarMenuItem},
+    switch::Switch,
     try_parse_color, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
     StyledExt as _, Theme, ThemeMode,
 };
@@ -1836,26 +1837,41 @@ impl RommfsWindow {
 
     /// Start-at-login plus the honest close/quit description.
     fn render_background_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let login_supported = cfg!(windows);
+        let needs_connect =
+            !self.state.start_at_login && self.state.conn != ConnState::Connected;
+        let login_disabled = !login_supported || needs_connect;
+        let login_reason = if !login_supported {
+            "Start at login is available on Windows only."
+        } else if needs_connect {
+            "Connect to RomM with a remembered sign-in first."
+        } else {
+            ""
+        };
         v_flex()
             .gap_2()
             .child(
-                Button::new("start-at-login")
-                    .label(if self.state.start_at_login {
-                        "Disable start at login"
-                    } else {
-                        "Enable start at login"
-                    })
-                    .disabled(
-                        !cfg!(windows)
-                            || (!self.state.start_at_login
-                                && self.state.conn != ConnState::Connected),
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(
+                        Switch::new("start-at-login")
+                            .checked(self.state.start_at_login)
+                            .label("Start at login")
+                            .disabled(login_disabled)
+                            .on_change(cx.listener(move |view, checked, _, cx| {
+                                if login_disabled {
+                                    return;
+                                }
+                                view.controller.send(Command::SetStartAtLogin {
+                                    enabled: *checked,
+                                });
+                                cx.notify();
+                            })),
                     )
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.controller.send(Command::SetStartAtLogin {
-                            enabled: !view.state.start_at_login,
-                        });
-                        cx.notify();
-                    })),
+                    .when(login_disabled, |this| {
+                        this.child(muted_xs(login_reason, cx))
+                    }),
             )
             .child(muted(
                 format!(
