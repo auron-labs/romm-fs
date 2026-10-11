@@ -18,7 +18,7 @@ use gpui_kit::component::{
     label::Label,
     progress::Progress,
     radio::RadioGroup,
-    select::{Select, SelectEvent, SelectState},
+    select::{SearchableVec, Select, SelectEvent, SelectState},
     separator::Separator,
     sidebar::{Sidebar, SidebarCollapsible, SidebarMenu, SidebarMenuItem},
     switch::Switch,
@@ -269,10 +269,10 @@ struct RommfsWindow {
     user_input: Entity<InputState>,
     password_input: Entity<InputState>,
     mount_input: Entity<InputState>,
-    install_select: Entity<SelectState<Vec<SharedString>>>,
+    install_select: Entity<SelectState<SearchableVec<SharedString>>>,
     save_folder_input: Entity<InputState>,
     save_file_input: Entity<InputState>,
-    save_game_select: Entity<SelectState<Vec<SharedString>>>,
+    save_game_select: Entity<SelectState<SearchableVec<SharedString>>>,
     debounce_input: Entity<InputState>,
     debounce_input_applied: String,
     debounce_error: Option<String>,
@@ -281,7 +281,7 @@ struct RommfsWindow {
     integration_choice: usize,
     /// Settings-tab installation picker; fed by the same discovery candidates
     /// as `install_select` but bound to the integration's RetroBat root.
-    settings_install_select: Entity<SelectState<Vec<SharedString>>>,
+    settings_install_select: Entity<SelectState<SearchableVec<SharedString>>>,
     completed_open: bool,
     mapping_open: bool,
     /// Settings > Advanced disclosure (save-change delay).
@@ -351,7 +351,13 @@ impl RommfsWindow {
             .unwrap_or_else(|| "~/RomM".to_string());
         let mount_input = cx.new(|cx| InputState::new(window, cx).default_value(default_mount));
         let install_select = cx.new(|cx| {
-            SelectState::new(Vec::<SharedString>::new(), None, window, cx).searchable(true)
+            SelectState::new(
+                SearchableVec::from(Vec::<SharedString>::new()),
+                None,
+                window,
+                cx,
+            )
+            .searchable(true)
         });
         let save_folder_input = cx
             .new(|cx| InputState::new(window, cx).placeholder("Folder containing only save data"));
@@ -360,7 +366,13 @@ impl RommfsWindow {
                 .placeholder("Relative path, for example switch/user/title/0")
         });
         let save_game_select = cx.new(|cx| {
-            SelectState::new(Vec::<SharedString>::new(), None, window, cx).searchable(true)
+            SelectState::new(
+                SearchableVec::from(Vec::<SharedString>::new()),
+                None,
+                window,
+                cx,
+            )
+            .searchable(true)
         });
         let debounce_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -368,7 +380,13 @@ impl RommfsWindow {
         });
 
         let settings_install_select = cx.new(|cx| {
-            SelectState::new(Vec::<SharedString>::new(), None, window, cx).searchable(true)
+            SelectState::new(
+                SearchableVec::from(Vec::<SharedString>::new()),
+                None,
+                window,
+                cx,
+            )
+            .searchable(true)
         });
         let save_review_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search saves"));
@@ -554,7 +572,7 @@ impl RommfsWindow {
                         .map(|(id, name)| SharedString::from(format!("{id} · {name}")))
                         .collect::<Vec<_>>();
                     self.save_game_select
-                        .update(cx, |state, cx| state.set_items(items, window, cx));
+                        .update(cx, |state, cx| state.set_items(SearchableVec::from(items), window, cx));
                 }
                 AppEvent::SaveSyncUpdated { .. } | AppEvent::SaveSyncSessionChanged { .. } => {
                     save_sync_updated = true;
@@ -652,7 +670,7 @@ impl RommfsWindow {
                     .cloned()
             });
         self.install_select.update(cx, |state, cx| {
-            state.set_items(items, window, cx);
+            state.set_items(SearchableVec::from(items), window, cx);
             match selected {
                 Some(value) => state.set_selected_value(&value, window, cx),
                 None => state.set_selected_index(None, window, cx),
@@ -686,7 +704,7 @@ impl RommfsWindow {
                 .cloned()
         });
         self.settings_install_select.update(cx, |state, cx| {
-            state.set_items(items, window, cx);
+            state.set_items(SearchableVec::from(items), window, cx);
             match selected {
                 Some(value) => state.set_selected_value(&value, window, cx),
                 None => state.set_selected_index(None, window, cx),
