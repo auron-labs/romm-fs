@@ -278,6 +278,19 @@ impl RommfsWindow {
             ));
         }
 
+        // The save-review table re-filters live and restarts at page one
+        // whenever the query changes.
+        subscriptions.push(cx.subscribe_in(
+            &save_review_search,
+            window,
+            |view, _state, event, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    view.save_review_page = 0;
+                    cx.notify();
+                }
+            },
+        ));
+
         subscriptions.push(cx.subscribe_in(
             &install_select,
             window,
