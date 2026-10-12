@@ -492,7 +492,10 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 fn normalize_windows_path(path: &Path) -> String {
-    path.to_string_lossy().trim_end_matches('\\').to_lowercase()
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
 }
 
 #[cfg(test)]
