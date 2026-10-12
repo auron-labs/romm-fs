@@ -774,15 +774,6 @@ pub fn render(
     window: &mut Window,
     cx: &mut Context<RommfsWindow>,
 ) -> impl IntoElement {
-    // The pre-rework save-sync helpers and fields still live in window.rs
-    // until its owning session removes them; these references keep the
-    // workspace's -D warnings gate green on this branch meanwhile.
-    let _ = RommfsWindow::render_save_sync;
-    let _ = UnmatchedSaveGroup::default();
-    let _ = view.mapping_open;
-    let _ = view.advanced_open;
-    let _ = &view.save_folder_input;
-
     let has_games = !view.state.save_file_games.is_empty();
     let can_export = view.state.save_sync_effective_saves_root.is_some()
         && view.state.save_sync_account_id.is_some();

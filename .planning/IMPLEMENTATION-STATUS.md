@@ -83,24 +83,29 @@ Its final fixes preserve folder settings across reconnect/reauthentication,
 scope the mount path to its session, and apply Settings edits to the session.
 These are implementation observations; they do not close runtime acceptance.
 
-1. Complete UI-plan task 6 on native Windows 10/11. Start with the build and
-   native CFAPI tests, then mount/list/read/stop using the local demo server.
-   Run the new `UI-*` regression cases in the
-   [Windows guide](../testing/WINDOWS-TESTING.md#test-the-merged-ui-changes),
-   particularly folder apply, offline restore, reauthentication, and account
-   switching. Capture the four screens requested by the plan.
-2. Retest the reported fresh-RetroBat setup problem using a real disposable
-   installation. Record the blocking path/item and link privilege failure
-   separately; verify the new error and retry flow. Then complete real save
-   upload/conflict/export/offline cases, followed by tray and login startup.
-   Zero-filled demo ROMs cannot validate game launch or emulator-created saves.
-3. Fix reproducible failures with focused regression cases and replace pending
-   acceptance entries with dated evidence. Historical portable test counts below
-   describe the earlier implementation run, not this merged branch's runtime.
-4. After behavior is validated, remove superseded UI rendering paths.
-   `window/pages/save_review.rs` and `window/pages/activity.rs` still reference
-   old renderers only to keep them compiled; `window.rs` retains those old flows.
-   Consolidate the active implementations without adding new behavior.
+Status on 2026-10-12 (Windows Server 2022 host, diagnostic evidence):
+
+1. ~~Complete UI-plan task 6 on native Windows 10/11.~~ Done on Server 2022:
+   build + AUTO-*/NATIVE-* selectors green, CFAPI mount/list/read/stop on the
+   local demo server passed, `UI-*` regression cases executed (see ledger
+   below). Windows 10/11 client remains the only substitute check.
+2. ~~Retest the reported fresh-RetroBat setup problem using a real disposable
+   installation~~ Done: SETUP-* retest passed (conflict refusal, idempotent
+   re-run, foreign link, recovery, missing-emulator diagnostics); real save
+   upload/conflict/export/offline cases SAVE-01..07 passed; tray and login
+   startup passed. Zero-filled ROMs still cannot validate game launch or
+   emulator-created saves.
+3. ~~Fix reproducible failures~~ Done: four Windows-only bugs fixed
+   (verified-download staging share-mode collision, FILE_RENAME_INFO
+   marshalling, held-source upload test, 8.3/verbatim and separator path
+   compares). Pending acceptance entries replaced with dated evidence below.
+4. ~~Remove superseded UI rendering paths~~ Done: old `window.rs` renderers
+   and the page keep-alive pins removed; live helpers kept. No new behavior.
+
+Remaining runtime acceptance: Windows 10/11 client run, UI-KEYBOARD, resize
+persistence, RomM-UI revoke leg, real logoff Run-key cycle, installer
+execution, CFAPI ACL denial-matrix cases, Credential Manager/browser
+approval, and the six runtime defects listed in the ledger.
 
 The root [development Compose file](../compose.dev.yaml) and
 [demo generator](../scripts/create-demo-roms.py) provide an isolated local
@@ -129,7 +134,9 @@ scan passed. These checks ran on Linux; native Windows acceptance remains open.
 - New contracts are source/fixture-backed, not live-validated against the original
   RomM 5.3.1 instance. The reported live HTTP 500 cause remains unknown; diagnostics
   and portable failure/retry checks are implemented, not a claimed reproduction.
-- All Windows runtime and human acceptance remains deferred below.
+- Windows runtime acceptance ran on Server 2022 on 2026-10-12 (diagnostic
+  evidence below); the Windows 10/11 client run and the items listed under
+  "Remaining runtime acceptance" stay open.
 
 ## Reproducible source contracts
 
@@ -237,9 +244,47 @@ The new-file discovery regression was reproduced failing before its deadline
 handling fix (`rommfs-review-discovery.log`) and passing after it
 (`rommfs-review-discovery-fixed.log`).
 
-All real Windows and human cases remain pending, including CFAPI ACLs,
-delete/rename protection, link privilege/cleanup, frontend/emulator activity
-guards, installation, browser approval, Credential Manager, actual save paths,
-watchers, tray and Windows login. Procedures are in
-[Windows testing](../testing/WINDOWS-TESTING.md); none are prerequisites for
-continuing Linux implementation.
+## Windows runtime validation ledger (2026-10-12, Server 2022)
+
+Executed on this repo's Windows host; diagnostic evidence only, not a
+Windows 10/11 client substitute. Report:
+`C:\Users\Administrator\rommfs-validation-report-20261012-034702-f0a4c375.md`;
+evidence tree `%TEMP%\rommfs-test-20261012-034702-f0a4c375` (all four
+required captures under `screenshots\`).
+
+- AUTO-*: `cargo fmt --check`, `cargo clippy --workspace --all-targets
+  -D warnings`, `cargo build -p rommfs-app`, headless and full workspace
+  suites — all green; every workspace test binary passed with zero failures
+  (app lib 87, core lib 60, all integration suites).
+- NATIVE-*: `cfapi_native` mount-once read-only mount (one test) plus ten
+  single-test `save_sync`/`save_sync_agent` selectors — all pass.
+- Demo RomM `127.0.0.1:8081` (6 platforms/18 generated ROMs) and harness
+  `127.0.0.1:8080`: sign-in, CFAPI mount at `C:\RomM`, listing downloads
+  nothing, cold/warm reads, stop/unmount — pass.
+- UI-* cases: AUTH-STATES, RESTORE-OFFLINE, FOLDER-APPLY, SESSION-ISOLATION,
+  REFRESH-FAILURE, SYNC-STATES, REVIEW-SCALE (1,855 files / 38 pages),
+  REVIEW-MAPPING, RETROBAT-FAILURE, ACTIVITY — pass. Partial: REAUTH-FOLDER
+  (RomM-UI revoke leg unexercised), RESIZE (relaunch persistence unverified).
+  Not run: UI-KEYBOARD.
+- SAVE-01..07 — all pass with hash-verified bytes: upload, conflict kept both
+  copies, export no-clobber refusals, disabled/restart review persistence,
+  first-install auto-install, offline queue uploaded post-recovery as a new
+  version, tracked deletion left remote intact.
+- SETUP-* disposable-install retest — pass. TRAY and LOGIN — pass
+  (`--startup` Run key registration, hidden authed mount, toggle-off removal).
+- Fixes this run: staging share-mode collision (17-test cluster),
+  FILE_RENAME_INFO NT-path/NUL marshalling, held-source upload test,
+  8.3/verbatim and separator path compares; superseded UI renderers removed.
+- New runtime defects (reported, unfixed): manual `roms` link to the correct
+  managed root still refused (D4, medium); tray-reopened `--startup` window
+  renders an empty sidebar (D5, medium); stale consumed pairing URL on first
+  post-restart sign-in (D1); no auto-reconnect after server recovery (D2);
+  install errors surface raw os errors, not friendly copy (D3); export
+  filename field concatenates typed text (D6).
+
+Still pending on real Windows/human runs: Windows 10/11 client, CFAPI ACL
+denial-matrix, link privilege/cleanup edge cases, frontend/emulator activity
+guards, installer execution, browser approval, Credential Manager, game
+launch and emulator-created saves, watchers under real load. Procedures are
+in [Windows testing](../testing/WINDOWS-TESTING.md); none are prerequisites
+for continuing Linux implementation.

@@ -70,7 +70,10 @@ impl SaveSyncJournal {
         baseline_remote_hash: Option<&str>,
     ) -> Result<IncomingSaveRecord> {
         super::super::ensure_no_reparse_components(path)?;
-        let mut file = super::snapshot::open_private_snapshot(path)?;
+        // The verified download is still held open by the caller (a spooled
+        // NamedTempFile); a read-only share mode would collide with our own
+        // writer on Windows. The staged copy below is hash-verified again.
+        let mut file = open_source_for_staging(path)?;
         let size = file.metadata()?.len();
         let hash = super::snapshot::hash_reader(&mut file)?;
         file.seek(SeekFrom::Start(0))?;
@@ -177,6 +180,9 @@ impl SaveSyncJournal {
             ));
         }
         stage.sync_all()?;
+        // Close the writer before the read-only-share verification open;
+        // Windows reports ERROR_SHARING_VIOLATION while it is still held.
+        drop(stage);
         sync_private_directory(&self.private_root)?;
         if !incoming_path_has_hash(&stage_path, &content_hash)? {
             return Err(Error::Unsupported(
@@ -597,6 +603,25 @@ fn create_private_artifact(path: &Path) -> Result<File> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
+    }
+    Ok(options.open(path)?)
+}
+
+/// Open a verified remote body that may still be held open by its owner (the
+/// caller's download tempfile), unlike private artifacts which must be closed
+/// before verification. Reparse points still open the link itself.
+fn open_source_for_staging(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     Ok(options.open(path)?)
 }

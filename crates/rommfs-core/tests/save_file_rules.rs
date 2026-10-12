@@ -58,12 +58,13 @@ fn scan_associates_multiple_files_by_unique_stem_or_server_target_and_reports_am
     let path = dir.path().join(&too_long);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, []).unwrap();
+    // Component-wise compare: the scanned path renders with '\' on Windows.
     assert!(rules
         .scan(dir.path())
         .unwrap()
         .unmatched
         .iter()
-        .any(|s| s.display().starts_with(&too_long)));
+        .any(|s| s.path.starts_with(Path::new(&too_long))));
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink("/", dir.path().join("switch/redirect")).unwrap();
