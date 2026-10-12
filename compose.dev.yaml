@@ -1,0 +1,56 @@
+# Disposable local RomM server. See testing/WINDOWS-TESTING.md.
+# RomM 5.3.1 does not support SQLite; use its supported MariaDB backend.
+name: rommfs-dev
+
+services:
+  romm:
+    image: rommapp/romm:5.3.1
+    depends_on:
+      romm-db:
+        condition: service_healthy
+    volumes:
+      # Generate ./romm/roms/<platform>/<game>.<ext> before starting Compose.
+      - type: bind
+        source: ./romm/roms
+        target: /romm/library/roms
+        read_only: true
+        bind:
+          create_host_path: false
+      - romm_resources:/romm/resources
+      - romm_assets:/romm/assets
+      - romm_config:/romm/config
+      - romm_redis:/redis-data
+    environment:
+      ROMM_DB_DRIVER: mariadb
+      DB_HOST: romm-db
+      DB_NAME: romm
+      DB_USER: romm
+      DB_PASSWD: rommfs-dev-only
+      # Public development values, suitable only for this loopback-bound stack.
+      ROMM_AUTH_SECRET_KEY: 5c8231846b692fa101f83e062d754ccd8b17ac9550ed34fa77921038bd46e6a2
+      DISABLE_DOWNLOAD_ENDPOINT_AUTH: "false"
+    ports:
+      - '127.0.0.1:${ROMM_DEV_PORT:-8081}:8080'
+
+  romm-db:
+    image: mariadb:11.8
+    volumes:
+      - romm_database:/var/lib/mysql
+    environment:
+      MARIADB_ROOT_PASSWORD: rommfs-dev-root-only
+      MARIADB_DATABASE: romm
+      MARIADB_USER: romm
+      MARIADB_PASSWORD: rommfs-dev-only
+    healthcheck:
+      test: [ "CMD", "healthcheck.sh", "--connect", "--innodb_initialized" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+volumes:
+  romm_database:
+  romm_resources:
+  romm_assets:
+  romm_config:
+  romm_redis:

@@ -48,7 +48,7 @@ cargo run -p rommfs-app
 Enter the server URL and choose **Sign in with browser**. Approve the pairing
 in RomM. Windows remembers the paired secret in Credential Manager; password
 sign-in remains available but is not remembered. Choose a mount root
-(an empty directory, or one RomMFS previously claimed), press **Start**.
+(an empty directory, or one RomMFS previously claimed), press **Start games folder**.
 The ownership marker is stored beside the mount directory as
 `<folder>.rommfs-root`; keep it for subsequent mounts.
 Read-only ROM files appear per platform; reading a file downloads it once
@@ -61,27 +61,43 @@ that copy before removing the private cache. Allow disk space for both copies.
 On Windows, closing the window hides it while mounting and save sync continue.
 The tray offers status, Open and Quit; **Quit** drains workers and stops the mount.
 If the tray cannot be created, closing the visible window quits instead.
-**Settings → Enable start at login** requires remembered browser sign-in and
+**Settings → Start at login** requires remembered browser sign-in and
 launches in the tray, reconnects, mounts, then resumes the same enabled save scope.
 Passwords and tokens are never logged. Logout removes remembered sign-in and
 the login-startup entry, and cancels its active work.
 
 Authentication precedes cached-catalogue restoration. A warm connection uses the
 last complete account-scoped snapshot and schedules one background refresh.
-**Refresh catalogue** also requests fresh metadata. Starting/remounting reuses the
+**Refresh library** also requests fresh metadata. Starting/remounting reuses the
 loaded catalogue rather than fetching it twice. Structural changes take effect
 on the next mount; a failed refresh retains the previous complete snapshot.
 
-The **Activity** view shows transfers and diagnostics. **Settings → Open log
+The **Activity** view shows operations and diagnostics. **Activity → Open log
 folder** opens `%LOCALAPPDATA%\rommfs\logs`. Logs rotate at 2 MiB with three
 archives; relevant paths, IDs and error stages are retained, not sign-in secrets.
 
 ## Test
 
-For an LLM testing on a Windows host, follow the
-[Windows CFAPI and RetroBat testing guide](testing/WINDOWS-TESTING.md).
-It covers automated tests, desktop mounts, live RomM reads, RetroBat save sync,
-cleanup, and evidence reporting.
+Follow the [Windows testing guide](testing/WINDOWS-TESTING.md) for local server
+setup, automated tests, native CFAPI, the merged UI regression cases, live RomM
+reads, RetroBat, save sync, tray/startup, cleanup, and evidence reporting.
+
+For a disposable demo server, run these from the repository root in PowerShell
+with Python 3 and Docker Desktop (Linux containers):
+
+```powershell
+py -3 scripts/create-demo-roms.py
+docker compose -f compose.dev.yaml up -d
+```
+
+Open `http://127.0.0.1:8081`, create a test account, and scan the library in RomM.
+The generator creates 18 zero-filled files under `romm/roms/<platform>/<game>.<ext>`
+with representative sizes (about 130 MiB total). These files cannot run in an
+emulator. Existing matching files are verified; other existing data is preserved.
+Use `python3` instead of `py -3` on Linux/macOS. RomM 5.3.1 does not support
+SQLite, so [compose.dev.yaml](compose.dev.yaml) uses MariaDB. See the guide for
+size/count options, persistence, alternate ports, and reset instructions.
+The strict live test below uses its own committed library on port 8080.
 
 Portable core, fixture, and headless app-controller tests run on Linux,
 macOS, and Windows:

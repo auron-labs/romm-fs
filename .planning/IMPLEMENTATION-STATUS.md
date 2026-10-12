@@ -1,6 +1,6 @@
 # Approved-scope implementation status
 
-Updated 2026-10-08. Scope authority: [approved plan](../.scratch/PLAN.md).
+Updated 2026-10-12. Scope authority: [approved plan](../.scratch/PLAN.md).
 This file records implementation, not release or native
 acceptance. `.scratch/STATE.md` is generated separately and is not edited here.
 
@@ -73,6 +73,47 @@ acceptance. `.scratch/STATE.md` is generated separately and is not edited here.
   and joined during stop/logout/Quit, rather than detached. Deterministic tests
   cover blocked-transfer shutdown, stale-event cancellation, new-file discovery,
   failed-startup refresh gating, per-file status and versioned debounce persistence.
+
+## Next steps after the UI merge
+
+The [UI plan](../.scratch/UI-PLAN.md) landed in merge `6643626`. The branch adds
+Overview, state-specific sign-in and folder actions, reorganized Settings,
+searchable save review with 50-row pages, and Activity operation summaries.
+Its final fixes preserve folder settings across reconnect/reauthentication,
+scope the mount path to its session, and apply Settings edits to the session.
+These are implementation observations; they do not close runtime acceptance.
+
+1. Complete UI-plan task 6 on native Windows 10/11. Start with the build and
+   native CFAPI tests, then mount/list/read/stop using the local demo server.
+   Run the new `UI-*` regression cases in the
+   [Windows guide](../testing/WINDOWS-TESTING.md#test-the-merged-ui-changes),
+   particularly folder apply, offline restore, reauthentication, and account
+   switching. Capture the four screens requested by the plan.
+2. Retest the reported fresh-RetroBat setup problem using a real disposable
+   installation. Record the blocking path/item and link privilege failure
+   separately; verify the new error and retry flow. Then complete real save
+   upload/conflict/export/offline cases, followed by tray and login startup.
+   Zero-filled demo ROMs cannot validate game launch or emulator-created saves.
+3. Fix reproducible failures with focused regression cases and replace pending
+   acceptance entries with dated evidence. Historical portable test counts below
+   describe the earlier implementation run, not this merged branch's runtime.
+4. After behavior is validated, remove superseded UI rendering paths.
+   `window/pages/save_review.rs` and `window/pages/activity.rs` still reference
+   old renderers only to keep them compiled; `window.rs` retains those old flows.
+   Consolidate the active implementations without adding new behavior.
+
+The root [development Compose file](../compose.dev.yaml) and
+[demo generator](../scripts/create-demo-roms.py) provide an isolated local
+RomM library. The committed harness remains the source for the strict native
+`live_romm` test; generated demo games must not be substituted into that test.
+
+Validation on 2026-10-12: the portable headless suite passed **276 tests**, with
+zero failures or ignored tests. The generator passed size/content, rerun,
+custom-count/size, invalid-input, and existing-file preservation checks. An
+isolated Docker run of the development stack scanned all six platforms and
+18 demo games; every authenticated ROM download matched its generated source
+byte for byte. Compose validation/lint and the development-credential secret
+scan passed. These checks ran on Linux; native Windows acceptance remains open.
 
 ## Compatibility limits and remaining validation
 
@@ -167,7 +208,7 @@ independently reproduced scheduler race above is not presented as proof that it
 caused that resource-exhaustion failure. The current complete one-thread suite
 passes both previously blocked cases without changing limits/unrelated processes.
 
-Latest outcomes:
+Implementation outcomes recorded on 2026-10-08:
 
 | Check | Result |
 | --- | --- |

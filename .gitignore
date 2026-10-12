@@ -135,3 +135,6 @@ $RECYCLE.BIN/
 
 !.planning
 !.agents
+
+# Generated local RomM development library.
+/romm/

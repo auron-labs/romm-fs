@@ -1,4 +1,4 @@
-# Test CFAPI and RetroBat on Windows
+# Test RomMFS on Windows
 
 Use this guide to test the current checkout on a native Windows host. It is
 written for an operator with PowerShell, filesystem access, and, for manual
@@ -19,6 +19,139 @@ continuing implementation. [Implementation status](../.planning/IMPLEMENTATION-S
 separates implemented code from deferred runtime acceptance.
 Portable ordinary-file fixtures and the full Windows UI cross-target check are
 not evidence of emulator, tray, installer or native save-lock behavior.
+
+## Start a local demo server
+
+For a quick desktop test, use the root [compose.dev.yaml](../compose.dev.yaml).
+It pins RomM 5.3.1 and MariaDB 11.8, matching the existing harness versions.
+RomM rejects SQLite as a database backend; see its
+[database configuration](https://github.com/rommapp/romm/blob/5.3.1/backend/config/config_manager.py).
+RomMFS's own local SQLite databases are separate from the server database.
+
+Install Docker Desktop with Linux containers and Python 3.10+ on the test host.
+Use native Windows PowerShell in the repository root for the commands below.
+The Python launcher is `py`; on Linux/macOS use `python3` for the same script.
+The generator uses only Python's standard library.
+
+```powershell
+py -3 scripts/create-demo-roms.py
+docker compose -f compose.dev.yaml config --quiet
+docker compose -f compose.dev.yaml up -d
+docker compose -f compose.dev.yaml ps
+```
+
+Open `http://127.0.0.1:8081`. If the page is not ready, inspect
+`docker compose -f compose.dev.yaml logs --tail 100 romm romm-db` and retry once
+startup completes. Finish RomM's first-run setup with a disposable admin account.
+Metadata-provider credentials are unnecessary for these synthetic files; skip
+provider setup and scan the library through the web UI with metadata sources
+disabled. Confirm six platforms and 18 single-file games appear before opening
+RomMFS. Metadata lookup misses do not make these files playable.
+
+The Compose project is `rommfs-dev`, with no fixed container names. Only RomM's
+HTTP port is published, on loopback; MariaDB has no host port. Database passwords
+and the signing key in this file are public development values. Use this stack
+only for disposable local testing. The web account you create is separate from
+the database account. Browser pairing and password sign-in remain enabled;
+download authentication and CSRF protection retain their normal settings.
+
+The generated layout is:
+
+```text
+romm/
+  roms/
+    gb/Demo GB 001.gb
+    gbc/Demo GBC 001.gbc
+    nes/Demo NES 001.nes
+    snes/Demo SNES 001.sfc
+    gba/Demo GBA 001.gba
+    n64/Demo N64 001.z64
+    ...002 and 003 for each platform
+```
+
+Every byte is zero. Sizes are representative test values, not exact dumps of
+named games or valid cartridge headers. These files test scanning, listing,
+downloads, caching, and byte equality; they cannot test emulator gameplay.
+
+| Platform | Extension | Bytes per file |
+| --- | --- | ---: |
+| Game Boy | `.gb` | 32,768 |
+| Game Boy Color | `.gbc` | 1,048,576 |
+| NES | `.nes` | 262,144 |
+| SNES | `.sfc` | 2,097,152 |
+| Game Boy Advance | `.gba` | 8,388,608 |
+| Nintendo 64 | `.z64` | 33,554,432 |
+
+The default set occupies about 130 MiB. The script writes zero bytes in bounded
+chunks. Rerunning verifies and retains matching files. It refuses existing files
+with a different size or nonzero content and does not delete unrelated files.
+After an interrupted write, inspect the reported partial file and remove only
+that generated file before retrying. Changing size options requires a fresh
+output directory or deliberate removal of the old generated files.
+
+Use `--help` for options. For example, a fresh 72-file, 72-MiB catalogue:
+
+```powershell
+py -3 scripts/create-demo-roms.py --root romm-small --games-per-platform 12 --size-mib 1
+```
+
+`--root` names the parent of `roms`; its default is this checkout's `romm`
+directory, regardless of the shell's working directory. Compose always mounts
+`./romm/roms` at `/romm/library/roms`, read-only. A custom output such as
+`romm-small` needs a matching bind-source edit before RomM can serve it.
+The default generated `/romm/` tree is ignored by Git. Custom output paths are
+not automatically ignored. Config, database, resources, Redis data, and uploaded
+saves live in separate named volumes. ROM uploads through the web UI cannot
+write to the read-only demo library; add source files on the host, then rescan.
+
+Build and open the desktop app after completing section 1's prerequisites:
+
+```powershell
+cargo build --locked -p rommfs-app
+.\target\debug\rommfs-app.exe
+```
+
+Connect RomMFS to `http://127.0.0.1:8081`, choose an empty local NTFS games folder,
+select **Generic folders**, and press **Start games folder**. Keep this folder
+separate from the generated source tree. Confirm **Games folder ready**, then
+enumerate without hashing first. Hashing deliberately downloads the selected ROM:
+
+```powershell
+$DemoMount = 'C:\RomMFS-Test\Games' # The folder selected in RomMFS.
+Get-ChildItem -LiteralPath $DemoMount -Recurse
+$SourceRom = Join-Path $PWD 'romm\roms\gb\Demo GB 001.gb'
+$MountedRom = Join-Path $DemoMount 'gb\Demo GB 001.gb'
+$Expected = (Get-FileHash -LiteralPath $SourceRom -Algorithm SHA256).Hash
+$Cold = (Get-FileHash -LiteralPath $MountedRom -Algorithm SHA256).Hash
+$Warm = (Get-FileHash -LiteralPath $MountedRom -Algorithm SHA256).Hash
+if ($Expected -ne $Cold -or $Expected -ne $Warm) { throw 'ROM byte mismatch' }
+```
+
+Check Activity for the first transfer and cache reuse on the repeated read.
+Explorer, antivirus, and other applications can also read placeholders; use
+the native fixture test in section 2 for isolated no-download-on-listing proof.
+
+Use port 8080's committed harness for `ROM-PLACEHOLDERS` in section 3. That test
+compares every ROM against `testing/romm-harness/library`; **do not point it at
+the generated demo library**. Both stacks can run together, with separate
+accounts and state. When switching between them, stop the games folder and use
+a fresh mount root for the different server identity. Never remove an ownership
+marker to reuse a root for another server.
+
+If 8081 is occupied, set `$env:ROMM_DEV_PORT = '8082'` before starting the demo
+stack and use that URL throughout its tests. For offline/recovery cases, use
+`docker compose -f compose.dev.yaml stop romm`, then `start romm`.
+Finish with **Quit** from the RomMFS tray and:
+
+```powershell
+docker compose -f compose.dev.yaml down
+```
+
+This retains the demo ROMs and all server state. For an intentional full reset
+of this disposable server, `docker compose -f compose.dev.yaml down --volumes`
+deletes its accounts, database, uploaded saves, config, and resources together;
+the host ROM files remain. A new server may assign different account/game IDs,
+so recheck identity and consent before reusing a client test scope.
 
 ## 1. Prepare the host and evidence
 
@@ -193,7 +326,7 @@ Run each command from the repository root and record its result independently:
 
 ```powershell
 $null = Invoke-LoggedCommand 'AUTO-FMT' { cargo fmt --all -- --check }
-$null = Invoke-LoggedCommand 'AUTO-HEADLESS' { cargo test --locked -p rommfs-core -p rommfs-fixture -p rommfs-app --no-default-features -- --test-threads=1 }
+$null = Invoke-LoggedCommand 'AUTO-HEADLESS' { cargo test --locked -p rommfs-core -p rommfs-fixture -p rommfs-cfapi -p rommfs-app --no-default-features -- --test-threads=1 }
 $null = Invoke-LoggedCommand 'AUTO-WORKSPACE' { cargo test --locked --workspace -- --test-threads=1 }
 $null = Invoke-LoggedCommand 'AUTO-CLIPPY' { cargo clippy --locked --workspace --all-targets -- -D warnings }
 $null = Invoke-LoggedCommand 'AUTO-BUILD' { cargo build --locked -p rommfs-app }
@@ -220,7 +353,7 @@ $null = Invoke-LoggedCommand 'NATIVE-CANONICAL-PUBLISH' { cargo test --locked -p
 $null = Invoke-LoggedCommand 'NATIVE-CANONICAL-EXPORT' { cargo test --locked -p rommfs-app --no-default-features --lib save_sync_agent::tests::canonicalized_export_parent_accepts_save_export -- --exact --nocapture --test-threads=1 }
 $null = Invoke-LoggedCommand 'NATIVE-NO-CLOBBER-BOUNDARY' { cargo test --locked -p rommfs-app --no-default-features --lib save_sync_agent::files::tests::windows_publication_does_not_replace_a_file_created_at_the_boundary -- --exact --nocapture --test-threads=1 }
 $null = Invoke-LoggedCommand 'NATIVE-FILESYSTEM-WATCHER' { cargo test --locked -p rommfs-app --no-default-features --lib save_sync_agent::tests::real_filesystem_notification_drives_the_agent_without_waiting_for_fallback_scan -- --exact --nocapture --test-threads=1 }
-$null = Invoke-LoggedCommand 'PROFILE-VERSION-MARKERS' { cargo test --locked -p rommfs-core --lib save_sync::profile::tests::accepts_only_verified_retrobat_version_markers -- --exact --nocapture --test-threads=1 }
+$null = Invoke-LoggedCommand 'PROFILE-VERSION-MARKERS' { cargo test --locked -p rommfs-core --lib save_sync::profile::tests::version_markers_are_diagnostics_not_compatibility_gates -- --exact --nocapture --test-threads=1 }
 $null = Invoke-LoggedCommand 'PROFILE-STOCK-821' { cargo test --locked -p rommfs-core --lib save_sync::profile::tests::verifies_stock_821_gambatte_and_resolves_uncreated_saves_root -- --exact --nocapture --test-threads=1 }
 ```
 
@@ -524,17 +657,17 @@ Start `target\debug\rommfs-app.exe` on the interactive desktop. Use the test
 server and a fresh, empty mount folder under a disposable local directory.
 Keep the mount outside RetroBat saves and the evidence folder.
 After `API-PREFLIGHT`, start the app in a clean test profile and mark a fresh
-app-only request-log window immediately before the first **Connect**. Use this
+app-only request-log window immediately before the first sign-in. Use this
 connection for both `UI-MOUNT-CONNECT` and `UI-PROFILE-DEFAULT`; exclude the
 earlier password grant and GET preflight window from all app request counts.
 
 | Case | Action | Expected result |
 | --- | --- | --- |
-| `UI-MOUNT-CONNECT` | Enter the test URL and credentials; press **Connect**. | Connected state and catalogue appear; credentials are absent from logs. |
-| `UI-MOUNT-START` | Enter the empty folder; press **Start**. | Platform folders and ROM filenames appear in Explorer and PowerShell. |
+| `UI-MOUNT-CONNECT` | Enter the test URL and use **Sign in with browser…**, or expand password sign-in and press **Connect with password**. | Connected state and catalogue appear; credentials are absent from logs. |
+| `UI-MOUNT-START` | Enter the empty folder; press **Start games folder**. | Platform folders and ROM filenames appear in Explorer and PowerShell. |
 | `UI-MOUNT-LIST` | Run `Get-ChildItem -LiteralPath '<mount>' -Recurse` before opening a ROM. | Metadata appears. Use native fixture counters from section 2 as proof of no content downloads; Explorer may have other readers. |
 | `UI-MOUNT-READ` | Run `Get-FileHash -LiteralPath '<mounted ROM>' -Algorithm SHA256`; compare with its known source. Repeat. | Hashes match; warm reads do not create a new ROM transfer. Hashing performs a content read. |
-| `UI-MOUNT-STOP` | Press **Stop**, inspect the folder, then **Start** again. | Folder is restored empty; sibling `<folder>.rommfs-root` marker remains; cached bytes are reused. |
+| `UI-MOUNT-STOP` | Press **Stop games folder**, inspect the folder, then **Start games folder** again. | Unmodified owned ROM placeholders are removed; owned frontend metadata and sibling ownership markers remain; cached bytes are reused on the next read. Busy or changed files may defer cleanup. |
 | `UI-MOUNT-CLOSE` | Close the window while mounted, then inspect the folder; reopen from tray and explicitly Quit. | Hiding retains the mount; Quit stops it and preserves owned metadata. If tray creation fails, closing the visible window quits instead. |
 | `UI-MOUNT-LEGACY-ROOT` | Put a sentinel file in a separate disposable folder; record its hash; attempt to mount there. | Mount is refused; sentinel and hash remain unchanged. Never test against a real old ROM/save library. |
 | `UI-MOUNT-OWNERSHIP` | Claim a test folder for server A, stop, then try it for a different server identity. | Ownership mismatch is refused. A configured URL base path is part of server identity. |
@@ -542,13 +675,15 @@ earlier password grant and GET preflight window from all app request counts.
 Replace the quoted placeholders with actual paths. Record errors, screenshots,
 and hashes. Do not remove ownership markers to bypass a rejection. The CFAPI
 backend stores a private copy in `%LOCALAPPDATA%\rommfs\cache\<server>` and an
-NTFS hydrated copy while mounted. Eviction must reclaim both. Clean Stop restores
-an empty root and its original ACL; busy/changed entries defer cleanup. Never
+NTFS hydrated copy while mounted. Eviction must reclaim both. Clean Stop removes
+verified ROM placeholders and restores the original root ACL; frontend metadata
+remains, and busy/changed entries defer cleanup. Never
 remove ownership markers or run recursive cleanup to bypass a refusal.
 
-Configure the disposable RetroBat installation's Game Boy ROM path to the mounted
-`gb` folder using its supported configuration workflow. Record and restore any
-tester-made configuration changes. RomMFS does not configure RetroBat itself.
+For RetroBat layout, use **Settings → RetroBat → Set up RetroBat** with the
+disposable installation and a separate managed games folder. Setup links its
+`roms` directory and makes backed-up frontend settings edits; complete the
+`SETUP-*` cases above. Record any additional tester-made configuration changes.
 For **`RB-LAUNCH`**, launch the actual RetroBat installation and a playable game
 using its real RetroArch/Gambatte. Observe the genuine EmulationStation frontend
 through process discovery and until the selected game actually launches. The
@@ -567,17 +702,18 @@ and visible ROM stem used in the next section.
 Use backed-up, disposable installations A and B. Stop emulators before replacing
 test saves. Copy the actual valid saves and relevant RetroBat/EmulationStation
 configuration files to a safe location outside both installs; record SHA256
-before testing and compare after each case. RomMFS must not edit emulator
-configuration. Keep backups untouched and restore only tester-made changes.
+before testing and compare after each case. Save-sync preview and consent must
+not edit emulator configuration. Explicit RetroBat setup has separate,
+documented settings changes. Keep backups untouched and restore only tester-made changes.
 
 | Case | Action | Expected result |
 | --- | --- | --- |
 | `UI-PROFILE-DEFAULT` | Use the first connection from `UI-MOUNT-CONNECT`, captured in its clean-profile app-only request window, without enabling save sync. | Save sync is off; no app save API requests occur before enabling. Authentication/account verification may still occur. Exclude the separate `API-PREFLIGHT` window. |
 | `UI-PROFILE-DISCOVERY` | Press **Refresh** with a real installation at fixed `X:\RetroBat`, and with an installation elsewhere while the actual RetroBat/EmulationStation is running. Test removable media only if a real removable volume is available. | Valid installations appear once per path; choose explicitly. Record unavailable removable media as `BLOCKED`, not as covered by a fixed-drive or stand-in process test. |
 | `UI-PROFILE-BROWSE` | Use **Browse…** for an installation outside discovered locations. | Native picker selects the intended installation; cancelling preserves selection. |
-| `UI-PROFILE-PREVIEW` | Select A without enabling. | Server, authenticated account, 8.2.1 profile, effective saves folder, mapped targets, supported/skipped existing files, and target paths are shown. |
+| `UI-PROFILE-PREVIEW` | Select A without enabling. | Server, authenticated account, selected installation, effective saves folder, mapped targets, supported/skipped existing files, and target paths are shown. |
 | `UI-PROFILE-READONLY` | Refresh with a missing saves directory in a disposable install. | No saves folder is created. No save contents are opened/hashed by preview and no save API requests occur. Use fixture tests for proof beyond visible effects. |
-| `UI-PROFILE-UNSUPPORTED` | Select an unsupported version or settings/core layout in a disposable install. | Explanation is shown; enabling is refused. Do not relabel a real installation to fake version compatibility. |
+| `UI-PROFILE-UNSUPPORTED` | Select a disposable install with missing required layout/settings. | Capability-specific explanation is shown; enabling is refused. A version string difference alone must not reject a compatible installation. |
 | `UI-PROFILE-SCOPE` | Change account, server, selected installation, or effective saves root. | Prior consent cannot authorize the changed scope. Confirm preview before any new opt-in. |
 | `UI-PROFILE-MISSING` | Close the app; temporarily move the selected disposable install; restart and refresh. | Prior selection remains visible and paused; another installation is not silently selected. Restore it afterward. |
 | `UI-PROFILE-DEBOUNCE` | Apply `0`, `3601`, `1.5`, and nonnumeric text; then apply `5` and restart. | Invalid values are rejected and not saved. Whole seconds 1–3600 are accepted; valid value persists for its scope. |
@@ -588,8 +724,8 @@ configuration. Keep backups untouched and restore only tester-made changes.
 Use screenshots or a short screen recording where focus is visibly indicated;
 save them under `$Evidence\screenshots` and note the action and focus target.
 Start with the initial app state and check the URL field has the expected initial
-focus. Tab and Shift+Tab through URL/credential inputs and the enabled **Connect**,
-**Start**, **Stop**, **Copy**, and save-sync controls/candidates, recording the
+focus. Tab and Shift+Tab through URL/credential inputs and the visible sign-in,
+**Start games folder**, **Stop games folder**, **Copy**, and save-sync controls/candidates, recording the
 actual order. Do not assume disabled controls should be reachable. In a text
 field, Space must insert a space and must not activate a button. For enabled
 actions, verify Enter and Space each invoke the same command once (use separate
@@ -612,6 +748,54 @@ targets or an explicit mapping. Shared saves/cards remain excluded. Use only a
 save-data root; unmatched files are visible, not guessed. Record mapped file
 counts separately from unmatched paths. An unavailable/limit-exceeded scan is
 not a complete zero-file result. Legacy GB-profile tests cover migration only.
+
+### Test the merged UI changes
+
+Run these after the basic mount checks. Use either the generated demo server or
+the committed harness, and record which URL/account/root each case uses. These
+cases cover [UI-PLAN tasks 1–6](../.scratch/UI-PLAN.md#7-implementation-order)
+and the final folder/session fixes in the merged branch. They are acceptance
+targets, not a claim that the current checkout passes them.
+
+| Case | Procedure | Expected result |
+| --- | --- | --- |
+| `UI-AUTH-STATES` | In a fresh profile, begin browser sign-in, cancel, retry, approve, then sign out. Separately exercise password fallback and a rejected password. | Only state-appropriate controls appear; cancellation is available while pending; authenticated account/server replace sign-in controls. Errors are visible without reading logs. |
+| `UI-RESTORE-OFFLINE` | Complete setup using remembered browser sign-in, Quit, stop only the test RomM container, and restart RomMFS. Restore RomM and reconnect. | Configured users remain on Overview; the saved games folder remains visible. An unreachable server does not replay onboarding or imply a ready folder. |
+| `UI-REAUTH-FOLDER` | In RomM, revoke this test client's browser authorization. Restart RomMFS and sign in again to the same account/server. | The remembered folder is republished to Overview/Settings and is used by **Start games folder**. Authentication failure does not erase it. |
+| `UI-FOLDER-APPLY` | Stop the games folder; enter a different empty NTFS folder in Settings and press **Use games folder**. Return to Overview, start, stop, Quit, and reopen with remembered sign-in. | The applied path becomes the next mount target and survives restart. Applying a change while mounted is disabled with an adjacent reason. |
+| `UI-SESSION-ISOLATION` | After using account/server A, sign out and connect to B; use a separate empty mount root for B. | A's folder/status/consent cannot authorize a mount or save operation in B. No stale ready state or old mount target leaks into the new session. |
+| `UI-REFRESH-FAILURE` | With a warm catalogue and working folder, stop the test RomM container and press **Refresh library**. Switch pages, restore the server, then retry. | Refresh failure is visible and scoped to metadata; the existing catalogue remains usable. It does not report successful freshness. Retry does not erase the failure before an outcome, and repeated clicks do not duplicate the job. |
+| `UI-SYNC-STATES` | Compare disabled sync, an invalid source, an empty valid source, only unlinked files, linked files with work pending, a failed operation, and linked files after a successful check. | Overview and Save sync agree. Zero linked files never means everything is synchronized. Unlinked files remain visible while eligible linked files can sync. Save problems do not mark a working games folder broken. |
+| `UI-REVIEW-SCALE` | Create the review dataset below, select it as a custom save folder, and use Review files search, each status filter, and pagination. Search for the last path, then clear the filter while on a later page. | All results are reachable in pages of 50; counts distinguish groups/items from files; filtering cannot leave an invalid empty page or silently change a selected file. |
+| `UI-REVIEW-MAPPING` | Expand one unlinked row, search for a demo game, inspect affected files, and assign it. Repeat for a folder with two files, then a single file in a mixed folder. | The picker actually filters. The chosen game/platform and exact affected paths are clear; only the intended selection is linked. Preview alone does not upload or overwrite. Check mapping effects while sync is disabled, then enable explicitly for transfer testing. |
+| `UI-RETROBAT-FAILURE` | Use a disposable install with a nonempty `roms` path, and exercise a link-permission failure if the host lacks the privilege. Fix only the disposable prerequisite and retry. | The local failure shows its path/cause and useful recovery details, including OS error 1314 when that is the actual failure. Existing content is preserved; no blanket requirement to run the whole app as administrator. Support-file problems stay separate from folder readiness. |
+| `UI-ACTIVITY` | During refresh, hydration, save sync, and available optional setup/download work, switch to Activity. Search/copy the technical log and toggle follow. | Running operations and outcomes remain visible with real units. Repeated diagnostics are grouped with counts while full logs remain available. A setup operation cannot disappear behind a misleading idle-transfer summary. |
+| `UI-RESIZE` | Visit all four pages at 100%, 150%, and 200% display scaling where available, resize the window, and repeat `UI-KEYBOARD`. | Primary actions, errors, paths/details, search, and pagination stay reachable. Focus is visible and returns after pickers/dialogs close. Record actual sizes/scales and any clipping. |
+
+For the large review dataset, use the `$RunId` from section 1. This creates
+1,855 small synthetic files in distinct folders, outside both ROM roots:
+
+```powershell
+$ReviewSaves = Join-Path $env:TEMP "rommfs-review-$RunId"
+New-Item -ItemType Directory -Path $ReviewSaves -ErrorAction Stop | Out-Null
+1..1855 | ForEach-Object {
+    $directory = Join-Path $ReviewSaves ('unmatched-{0:D4}' -f $_)
+    New-Item -ItemType Directory -Path $directory -ErrorAction Stop | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $directory 'progress.dat'), [byte[]]::new(128))
+}
+```
+
+In Settings, expand **Use a different save folder**, enter `$ReviewSaves`, and
+press **Use save folder**. Inspect the preview with sync off. Different parent
+folders exercise group pagination; adding thousands of files to one group would
+not exercise thousands of review rows. Add a second synthetic file to one group
+for the affected-file preview case. Keep the test root until any mapping or
+count mismatch has been investigated. These files support sync UI and byte-level
+transport tests; real emulator save compatibility still requires section 6.
+
+Capture Overview, Save sync, Activity, and an actionable error under
+`$Evidence\screenshots`. Label synthetic-data screenshots and record each case
+as `PASS`, `FAIL`, `BLOCKED`, or `NOT RUN` with its evidence path.
 
 ## 6. Run a live save-sync smoke test
 
@@ -750,7 +934,7 @@ Evidence root:
 | AUTO-* | | | | | |
 | NATIVE-* | | | | | |
 | HARNESS-*/ROM-* | | | | | |
-| UI-MOUNT-* / UI-PROFILE-* | | | | | |
+| UI-MOUNT-* / UI-PROFILE-* / merged UI cases | | | | | |
 | RB-LAUNCH-* | | | | | |
 | API-PREFLIGHT / SAVE-01..SAVE-07 | | | | | |
 
