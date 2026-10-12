@@ -81,10 +81,12 @@ fn uploads_can_be_cancelled_while_waiting_for_headers_or_response_bodies() {
             },
         };
         fx.on("POST", "/api/saves", spec);
-        let source = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(source.path(), b"save bytes").unwrap();
+        // The upload path deliberately opens the snapshot read-only shared,
+        // which fails while a writer still holds it — keep nothing open here.
+        let source_dir = tempfile::tempdir().unwrap();
+        let path = source_dir.path().join("save.srm");
+        std::fs::write(&path, b"save bytes").unwrap();
         let client = RommClient::new(fx.url()).unwrap();
-        let path = source.path().to_path_buf();
         let active = Arc::new(AtomicBool::new(true));
         let worker_active = active.clone();
         let (tx, rx) = mpsc::channel();

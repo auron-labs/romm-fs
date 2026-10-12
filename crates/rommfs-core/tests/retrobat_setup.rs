@@ -72,7 +72,10 @@ fn consented_cleanup_removes_only_stock_and_noise_never_user_files() {
     assert!(install.join("roms/gb/_info.txt").exists());
     // With consent the classified files go and setup completes.
     setup_roms_link(&install, &managed, "s", true).unwrap();
-    assert_eq!(fs::canonicalize(install.join("roms")).unwrap(), managed);
+    assert_eq!(
+        fs::canonicalize(install.join("roms")).unwrap(),
+        fs::canonicalize(&managed).unwrap()
+    );
     assert!(!install.join("roms").join("gb/_info.txt").exists());
     assert!(install.join(".rommfs-setup.json").exists());
 }
@@ -118,7 +121,10 @@ fn setup_accepts_compatible_versions_is_repeatable_and_rejects_wrong_ownership()
     let (install, managed) = installation(dir.path());
     let record = setup_roms_link(&install, &managed, "s", false).unwrap();
     assert_eq!(record.version.as_deref(), Some("9.0.1-compatible"));
-    assert_eq!(fs::canonicalize(install.join("roms")).unwrap(), managed);
+    assert_eq!(
+        fs::canonicalize(install.join("roms")).unwrap(),
+        fs::canonicalize(&managed).unwrap()
+    );
     setup_roms_link(&install, &managed, "s", false).unwrap();
     assert!(setup_roms_link(&install, &managed, "other", false).is_err());
     let other = dir.path().join("other");
@@ -127,7 +133,10 @@ fn setup_accepts_compatible_versions_is_repeatable_and_rejects_wrong_ownership()
     fs::remove_file(install.join("roms")).unwrap();
     std::os::unix::fs::symlink(&other, install.join("roms")).unwrap();
     assert!(verify_setup_link(&install, &managed, "s").is_err());
-    assert_eq!(fs::canonicalize(install.join("roms")).unwrap(), other);
+    assert_eq!(
+        fs::canonicalize(install.join("roms")).unwrap(),
+        fs::canonicalize(&other).unwrap()
+    );
 }
 
 #[cfg(unix)]
@@ -146,7 +155,10 @@ fn unowned_links_and_nested_reparse_points_are_not_followed() {
     setup_roms_link(&install, &managed, "s", true).unwrap();
     assert!(!install.join("roms/gb/link").exists());
     assert!(managed.is_dir());
-    assert_eq!(fs::canonicalize(install.join("roms")).unwrap(), managed);
+    assert_eq!(
+        fs::canonicalize(install.join("roms")).unwrap(),
+        fs::canonicalize(&managed).unwrap()
+    );
 }
 
 #[test]
