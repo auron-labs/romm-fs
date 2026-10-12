@@ -176,18 +176,33 @@ pub(super) fn publish_changed_save(
 fn rename_baseline(file: &File, source: &Path, backup: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
             FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
         };
-        let name: Vec<u16> = backup.as_os_str().encode_wide().collect();
+        // FILE_RENAME_INFO.FileName must be a fully qualified name: a plain
+        // file name is resolved relative to the process working directory and
+        // a bare `C:\` DOS path is misparsed. `\??\` is the Win32-visible NT
+        // namespace prefix that the rename IRP accepts directly. The IRP
+        // scans FileName as a NUL-terminated string regardless of
+        // FileNameLength, so dwBufferSize must cover the terminator too —
+        // otherwise the driver appends garbage read past the buffer.
+        let backup_string = backup.as_os_str().to_string_lossy();
+        let nt_name = if let Some(rest) = backup_string.strip_prefix(r"\\?\") {
+            format!(r"\??\{rest}")
+        } else if let Some(rest) = backup_string.strip_prefix(r"\\") {
+            format!(r"\??\UNC\{rest}")
+        } else {
+            format!(r"\??\{backup_string}")
+        };
+        let name: Vec<u16> = nt_name.encode_utf16().collect();
         let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-        let length = offset + name.len() * 2;
+        let length = offset + name.len() * 2 + 2;
         let mut buffer = vec![0u64; length.div_ceil(8)];
         let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
         // SAFETY: u64 storage supplies FILE_RENAME_INFO alignment and enough
-        // initialized bytes for its trailing UTF-16 filename. The exclusive
-        // plain-file handle remains live throughout the synchronous call.
+        // initialized bytes for the NUL-terminated trailing UTF-16 filename.
+        // The exclusive plain-file handle remains live throughout the call.
         unsafe {
             (*info).Anonymous.ReplaceIfExists = false;
             (*info).RootDirectory = std::ptr::null_mut();
