@@ -187,7 +187,10 @@ fn rename_baseline(file: &File, source: &Path, backup: &Path) -> Result<()> {
         // scans FileName as a NUL-terminated string regardless of
         // FileNameLength, so dwBufferSize must cover the terminator too —
         // otherwise the driver appends garbage read past the buffer.
-        let backup_string = backup.as_os_str().to_string_lossy();
+        // NT-prefixed names bypass DOS separator normalization, so `/`
+        // retained by portable slot paths would leave unresolvable
+        // components — normalize separators before prefixing.
+        let backup_string = backup.as_os_str().to_string_lossy().replace('/', "\\");
         let nt_name = if let Some(rest) = backup_string.strip_prefix(r"\\?\") {
             format!(r"\??\{rest}")
         } else if let Some(rest) = backup_string.strip_prefix(r"\\") {
@@ -489,10 +492,7 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 fn normalize_windows_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_lowercase()
+    path.to_string_lossy().trim_end_matches('\\').to_lowercase()
 }
 
 #[cfg(test)]
@@ -626,6 +626,40 @@ mod tests {
             assert_eq!(fs::read(&staged).unwrap(), b"remote update");
             assert!(!has_publication_sibling(&root));
         }
+    }
+
+    /// Slot-reconstructed targets can carry portable `/` separators inside
+    /// the `PathBuf`; the NT rename must normalize them rather than emit an
+    /// unresolvable `\??\`-prefixed mixed-separator path.
+    #[test]
+    fn baseline_replacement_normalizes_portable_separators_in_multi_level_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("saves");
+        fs::create_dir(&root).unwrap();
+        let parent = root.join("switch/Game/user");
+        fs::create_dir_all(&parent).unwrap();
+        let staged = directory.path().join("incoming.stage");
+        let target = parent.join("0");
+        // Build with '/' — what a path reconstructed from a portable file
+        // slot retains in its OsStr.
+        let backup = std::path::PathBuf::from(format!(
+            "{}/switch/Game/user/.0.rommfs-backup-test",
+            root.display()
+        ));
+        fs::write(&staged, b"remote update").unwrap();
+        fs::write(&target, b"baseline").unwrap();
+        publish_changed_save(
+            &staged,
+            &target,
+            &sha256_content_hash(b"remote update"),
+            &sha256_content_hash(b"baseline"),
+            &backup,
+            &root,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"remote update");
+        assert_eq!(fs::read(&backup).unwrap(), b"baseline");
     }
 
     #[test]
