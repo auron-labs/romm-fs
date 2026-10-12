@@ -23,15 +23,6 @@ pub fn render(
         log_scroll.scroll_to_bottom();
     }
 
-    // The superseded pre-task-5 renderers stay referenced so they keep
-    // type-checking: window.rs is owned by a parallel slice and cannot gain
-    // `#[allow(dead_code)]` from here.
-    let _ = (
-        RommfsWindow::render_activity,
-        RommfsWindow::render_downloads,
-        RommfsWindow::render_log,
-    );
-
     v_flex()
         .w_full()
         .gap_4()
