@@ -3,7 +3,7 @@
 //! download content (PRD R2). Inode identity is stable for an unchanged
 //! catalogue across enumerations and remounts.
 
-use crate::catalog::{Catalogue, NodeKind, VersionKey};
+use crate::catalogue::{Catalogue, NodeKind, VersionKey};
 use std::collections::HashMap;
 
 pub const ROOT_INODE: u64 = 1;

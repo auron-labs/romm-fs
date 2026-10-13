@@ -1,4 +1,4 @@
-use rommfs_core::catalog::build_catalogue;
+use rommfs_core::catalogue::build_catalogue;
 use rommfs_core::retrobat::{cache_artwork, cache_artwork_cancellable};
 use rommfs_core::romm::{PairedSession, PlatformDto, RomDto, RommClient};
 use rommfs_fixture::{contract, FixtureServer, ResponseSpec};
@@ -48,15 +48,15 @@ fn artwork_is_deduplicated_cached_and_never_requests_rom_bodies() {
     assert!(first.warnings().is_empty(), "{:?}", first.warnings());
     assert_eq!(first.references().len(), 2);
     assert_eq!(first.files().len(), 1);
-    assert_eq!(fixture.count_requests("GET", resource), 1);
+    assert_eq!(fixture.request_count("GET", resource), 1);
     let second = cache_artwork(&client, &catalogue, &roms, cache.path()).unwrap();
     assert_eq!(first.references(), second.references());
-    assert_eq!(fixture.count_requests("GET", resource), 1);
-    assert_eq!(fixture.count_requests("GET", "/api/roms"), 0);
+    assert_eq!(fixture.request_count("GET", resource), 1);
+    assert_eq!(fixture.request_count("GET", "/api/roms"), 0);
     let mut changed = roms;
     changed[0].updated_at = "new-version".into();
     cache_artwork(&client, &catalogue, &changed, cache.path()).unwrap();
-    assert_eq!(fixture.count_requests("GET", resource), 2);
+    assert_eq!(fixture.request_count("GET", resource), 2);
 }
 
 #[test]
@@ -111,7 +111,7 @@ fn missing_invalid_images_are_nonfatal_and_cancellation_does_not_publish_cache()
         &AtomicBool::new(false)
     )
     .is_err());
-    assert_eq!(fixture.count_requests("GET", resource), 1);
+    assert_eq!(fixture.request_count("GET", resource), 1);
 }
 
 #[test]

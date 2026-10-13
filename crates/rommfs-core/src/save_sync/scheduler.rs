@@ -1,6 +1,6 @@
 use super::journal::{LocalObservation, SaveSyncJournal, SnapshotRecord};
 use super::mapping::SaveMapping;
-use crate::catalog::RomKey;
+use crate::catalogue::RomKey;
 use crate::error::Result;
 use std::collections::HashMap;
 use std::fs;
@@ -435,7 +435,7 @@ mod tests {
             }],
         };
         let catalogue =
-            crate::catalog::build_catalogue(server, &[platform], &[rom], |_| {}).unwrap();
+            crate::catalogue::build_catalogue(server, &[platform], &[rom], |_| {}).unwrap();
         map_catalogue(&catalogue, Path::new("saves"))
             .unwrap()
             .mappings

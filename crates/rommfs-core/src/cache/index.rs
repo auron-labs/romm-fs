@@ -2,7 +2,7 @@
 //! bundled). Durable facts only: completion state, size, version, last_use.
 //! In-flight downloads and active-use tracking live in memory.
 
-use crate::catalog::RomKey;
+use crate::catalogue::RomKey;
 use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 

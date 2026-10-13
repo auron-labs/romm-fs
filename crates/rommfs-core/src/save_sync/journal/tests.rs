@@ -1,6 +1,6 @@
 use super::snapshot::copy_save_snapshot;
 use super::*;
-use crate::catalog::RomKey;
+use crate::catalogue::RomKey;
 use crate::romm::{PlatformDto, RomDto, RomFileDto};
 use crate::save_sync::{map_catalogue, MappingIssue, MappingReport, SaveMapping, UnmappedEntry};
 use uuid::Uuid;
@@ -15,7 +15,7 @@ fn scope(root: &Path, effective: &Path) -> SaveSyncScope {
 }
 
 fn mapping() -> SaveMapping {
-    let catalogue = crate::catalog::build_catalogue(
+    let catalogue = crate::catalogue::build_catalogue(
         "https://romm.example",
         &[PlatformDto {
             id: 1,

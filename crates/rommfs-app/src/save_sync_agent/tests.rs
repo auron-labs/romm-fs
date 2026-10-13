@@ -1,5 +1,5 @@
 use super::*;
-use rommfs_core::catalog::build_catalogue;
+use rommfs_core::catalogue::build_catalogue;
 use rommfs_core::events::{channel, AppEvent, EventSink};
 use rommfs_core::romm::{
     Credentials, PlatformDto, RomDto, RomFileDto, RommClient, SaveSyncIdentity,

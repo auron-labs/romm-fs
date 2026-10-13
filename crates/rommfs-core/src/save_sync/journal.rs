@@ -1,6 +1,6 @@
 use super::path::ensure_no_reparse_components;
 use super::settings::{validate_scope, windows_path_key, SaveSyncScope};
-use crate::catalog::RomKey;
+use crate::catalogue::RomKey;
 use crate::error::{Error, Result};
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -8,7 +8,7 @@
 
 use crate::cache::clock::Clock;
 use crate::cache::{CacheIndex, HydratedRemover};
-use crate::catalog::RomKey;
+use crate::catalogue::RomKey;
 use crate::error::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

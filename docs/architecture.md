@@ -6,13 +6,13 @@ map, not a target design; use the code as the authority when behavior changes.
 ## Crate boundaries
 
 `rommfs-core` contains portable domain and I/O code: RomM HTTP access in
-`romm/`, DTO-to-filesystem projection in `catalog.rs`, path and layout rules,
+`romm/`, DTO-to-filesystem projection in `catalogue.rs`, path and layout rules,
 cache/download behavior, save-sync rules and persistence, plus RetroBat setup
-and metadata. Its filesystem facade is `fscore.rs`; `tree.rs` provides stable
+and metadata. Its filesystem facade is `filesystem.rs`; `tree.rs` provides stable
 filesystem enumeration from a catalogue snapshot.
 
 `rommfs-cfapi` separates portable root ownership and frontend metadata
-operations (`root.rs`) from Windows CFAPI and ACL behavior (`imp.rs` and
+operations (`root.rs`) from Windows CFAPI and ACL behavior (`windows.rs` and
 `security.rs`). Native integration tests exercise a real mounted root on
 Windows.
 
@@ -24,7 +24,8 @@ session and desktop modules own app lifetime and Windows tray/startup behavior.
 
 `rommfs-fixture` supplies a local HTTP server for deterministic tests. It
 supports assertions about requests and response bodies without requiring a
-live RomM instance.
+live RomM instance. `route_hit_count` counts scripted route matches;
+`request_count` counts captured wire requests.
 
 ## Data flow
 
@@ -33,7 +34,7 @@ live RomM instance.
 2. It restores an account/server-scoped catalogue snapshot when available, or
    fetches the paginated platforms and ROM/file metadata. Refresh can happen in
    the background while the previous complete snapshot remains available.
-3. `catalog.rs` validates each original file identity and path, then projects
+3. `catalogue.rs` validates each original file identity and path, then projects
    supported original files into a generic or RetroBat tree. Multi-file games
    are represented as their individual original files when their paths are
    valid; unsupported or invalid records are reported.

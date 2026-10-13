@@ -1,4 +1,4 @@
-use rommfs_core::catalog::build_catalogue;
+use rommfs_core::catalogue::build_catalogue;
 use rommfs_core::romm::{PlatformDto, RomDto};
 use rommfs_core::save_sync::{file_slot, SaveFileRules};
 use std::{collections::BTreeMap, fs, path::Path};
@@ -87,7 +87,7 @@ fn scan_associates_multiple_files_by_unique_stem_or_server_target_and_reports_am
     }
 }
 
-fn gb_catalogue() -> (rommfs_core::catalog::Catalogue, Vec<RomDto>) {
+fn gb_catalogue() -> (rommfs_core::catalogue::Catalogue, Vec<RomDto>) {
     let platform = serde_json::from_value::<PlatformDto>(serde_json::json!({
         "id": 1, "slug": "gb", "fs_slug": "gb", "name": "Game Boy", "rom_count": 2
     }))
@@ -270,7 +270,7 @@ fn legacy_recovery_requires_one_launchable_gb_filename() {
 
 #[test]
 fn deleted_missing_and_unlaunchable_associations_leave_available_games_syncable() {
-    use rommfs_core::catalog::build_catalogue_for_layout;
+    use rommfs_core::catalogue::build_catalogue_for_layout;
     use rommfs_core::layout::RetroBatSystems;
     let (_, original) = gb_catalogue();
     let platform = serde_json::from_value::<PlatformDto>(serde_json::json!({

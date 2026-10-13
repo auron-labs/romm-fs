@@ -5,10 +5,10 @@
 //! entry stays visible.
 
 use rommfs_core::cache::{CacheIndex, Evictor, FakeClock, LiveState, NoopHydratedRemover};
-use rommfs_core::catalog::{build_catalogue, Catalogue, RomKey};
+use rommfs_core::catalogue::{build_catalogue, Catalogue, RomKey};
 use rommfs_core::download::{ContentSource, DownloadManager};
 use rommfs_core::error::{Error, Result};
-use rommfs_core::fscore::RommFs;
+use rommfs_core::filesystem::RommFs;
 use rommfs_core::romm::{PlatformDto, RomDto, RomFileDto};
 use rommfs_core::tree::{EntryKind, RommTree, ROOT_INODE};
 use std::collections::HashMap;

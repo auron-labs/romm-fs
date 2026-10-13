@@ -145,7 +145,10 @@ fn identical_first_sync_establishes_a_baseline_without_posting_or_replacing_loca
     let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
     let slot = journal.slot(&case.mapping.rom_key).unwrap().unwrap();
     assert_eq!(fs::read(&case.mapping.target_path).unwrap(), original);
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
     assert_eq!(slot.remote_slot_id.as_deref(), Some("31"));
     assert_eq!(slot.local_baseline_hash, slot.remote_baseline_hash);
     assert!(journal.incoming_saves().unwrap().is_empty());
@@ -173,7 +176,7 @@ fn repeated_reconciliation_reuses_verified_content_until_metadata_changes() {
         let inventory = receive_inventory(&updates);
         assert_eq!(inventory.saves[0].bytes, FIRST_BYTES);
     }
-    assert_eq!(fixture.count_requests("GET", "/api/saves/31/content"), 1);
+    assert_eq!(fixture.request_count("GET", "/api/saves/31/content"), 1);
 
     fixture.seed_save(FixtureSaveRecord {
         id: 31,
@@ -189,13 +192,13 @@ fn repeated_reconciliation_reuses_verified_content_until_metadata_changes() {
     jobs.send(reconciliation_job(&first_case)).unwrap();
     let inventory = receive_inventory(&updates);
     assert_eq!(inventory.saves[0].bytes, UPDATED_BYTES);
-    assert_eq!(fixture.count_requests("GET", "/api/saves/31/content"), 2);
+    assert_eq!(fixture.request_count("GET", "/api/saves/31/content"), 2);
 
     let other_installation = tempfile::tempdir().unwrap();
     let other_case = case(other_installation.path(), &fixture, false);
     jobs.send(reconciliation_job(&other_case)).unwrap();
     assert_eq!(receive_inventory(&updates).saves[0].bytes, UPDATED_BYTES);
-    assert_eq!(fixture.count_requests("GET", "/api/saves/31/content"), 3);
+    assert_eq!(fixture.request_count("GET", "/api/saves/31/content"), 3);
 
     active.store(false, std::sync::atomic::Ordering::SeqCst);
     drop(jobs);
@@ -321,7 +324,10 @@ fn invalid_history_dates_and_offsets_fail_without_publishing_a_remote_save() {
             SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
         assert!(!case.mapping.target_path.exists(), "{timestamp}");
         assert!(journal.incoming_saves().unwrap().is_empty(), "{timestamp}");
-        assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+        assert_eq!(
+            fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+            0
+        );
     }
 }
 
@@ -362,5 +368,8 @@ fn tied_remote_history_requires_attention_without_publishing_either_save() {
     assert!(slot.needs_attention);
     assert!(!case.mapping.target_path.exists());
     assert_eq!(journal.incoming_saves().unwrap().len(), 2);
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
 }

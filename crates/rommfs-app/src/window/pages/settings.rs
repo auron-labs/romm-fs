@@ -93,7 +93,7 @@ impl RommfsWindow {
                             .outline()
                             .disabled(
                                 locked
-                                    || self.state.conn != ConnState::Connected
+                                    || self.state.conn != ConnectionState::Connected
                                     || self.mount_input.read(cx).value().trim().is_empty(),
                             )
                             .on_click(cx.listener(|view, _, _, cx| {
@@ -104,7 +104,7 @@ impl RommfsWindow {
                             })),
                     )
                     .when(
-                        locked || self.state.conn != ConnState::Connected,
+                        locked || self.state.conn != ConnectionState::Connected,
                         |this| {
                             // §6: the disabled action explains why.
                             this.child(muted_xs(
@@ -152,7 +152,7 @@ impl RommfsWindow {
                                 Button::new("choose-save-folder")
                                     .label("Use save folder")
                                     .outline()
-                                    .disabled(self.state.conn != ConnState::Connected)
+                                    .disabled(self.state.conn != ConnectionState::Connected)
                                     .on_click(cx.listener(|view, _, _, cx| {
                                         view.controller.send(Command::SelectSaveFolder {
                                             path: PathBuf::from(
@@ -689,7 +689,8 @@ impl RommfsWindow {
     /// Start-at-login plus the honest close/quit description.
     fn render_background_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let login_supported = cfg!(windows);
-        let needs_connect = !self.state.start_at_login && self.state.conn != ConnState::Connected;
+        let needs_connect =
+            !self.state.start_at_login && self.state.conn != ConnectionState::Connected;
         let login_disabled = !login_supported || needs_connect;
         let login_reason = if !login_supported {
             "Start at login is available on Windows only."

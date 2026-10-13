@@ -3,7 +3,7 @@
 //! never force-deleted; both the hydrated copy and the private `.bin` go.
 
 use rommfs_core::cache::{CacheIndex, Evictor, FakeClock, HydratedRemover, LiveState};
-use rommfs_core::catalog::RomKey;
+use rommfs_core::catalogue::RomKey;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 

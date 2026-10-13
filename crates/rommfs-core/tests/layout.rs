@@ -1,4 +1,4 @@
-use rommfs_core::catalog::{build_catalogue, build_catalogue_for_layout};
+use rommfs_core::catalogue::{build_catalogue, build_catalogue_for_layout};
 use rommfs_core::layout::RetroBatSystems;
 use rommfs_core::romm::{PlatformDto, RomDto};
 use rommfs_core::tree::{EntryKind, RommTree};

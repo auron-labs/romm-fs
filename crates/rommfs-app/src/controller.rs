@@ -9,8 +9,8 @@ use rommfs_core::cache::clock::{Clock, SystemClock, DEFAULT_EVICTION_THRESHOLD_S
 use rommfs_core::cache::NoopHydratedRemover;
 use rommfs_core::cache::{CacheIndex, Evictor, HydratedRemover, LiveState};
 #[cfg(test)]
-use rommfs_core::catalog::build_catalogue;
-use rommfs_core::catalog::{server_id_of, Catalogue, RomKey};
+use rommfs_core::catalogue::build_catalogue;
+use rommfs_core::catalogue::{server_id_of, Catalogue, RomKey};
 use rommfs_core::catalogue_store::{CatalogueSnapshot, CatalogueStore};
 use rommfs_core::connection_settings::{
     ConnectionPreferences, ConnectionSettings, IntegrationMode,
@@ -21,7 +21,7 @@ use rommfs_core::events::{
     AppEvent, EventSink, ForeignEntry, ForeignKind, Level, LogBuffer, SaveSyncGameStatus,
     SaveSyncQueueStatus,
 };
-use rommfs_core::fscore::RommFs;
+use rommfs_core::filesystem::RommFs;
 use rommfs_core::romm::{Credentials, PairedSession, PairingPoll, PairingRequest, RommClient};
 use rommfs_core::save_sync::{
     discover_installations, map_catalogue, resolve_retrobat_gb_profile, validate_installation,
@@ -944,7 +944,7 @@ fn save_sync_settings_path() -> Option<PathBuf> {
 fn save_sync_discovery_input() -> DiscoveryInput {
     #[cfg(windows)]
     {
-        crate::save_sync_native::discovery_input()
+        crate::retrobat_discovery_windows::discovery_input()
     }
     #[cfg(not(windows))]
     {

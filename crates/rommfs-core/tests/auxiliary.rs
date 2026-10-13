@@ -96,10 +96,10 @@ fn explicit_auxiliary_setup_materializes_verified_destinations_and_preserves_mod
     }
     let cheat = install.join("cheats/retroarch/switch/Game.cht");
     assert_eq!(fs::read(&cheat).unwrap(), b"cheat");
-    let count = fx.count_requests("GET", "/api/roms/80/files/content/");
+    let count = fx.request_count("GET", "/api/roms/80/files/content/");
     assert_eq!(run().unchanged, 5);
     assert_eq!(
-        fx.count_requests("GET", "/api/roms/80/files/content/"),
+        fx.request_count("GET", "/api/roms/80/files/content/"),
         count
     );
     fs::write(&cheat, b"user changes").unwrap();
@@ -116,8 +116,8 @@ fn explicit_auxiliary_setup_materializes_verified_destinations_and_preserves_mod
         |_, _| {}
     )
     .is_err());
-    assert_eq!(fx.count_requests("GET", "/api/roms/81/files/content/"), 0);
-    assert_eq!(fx.count_requests("GET", "/api/roms/7/content/"), 0);
+    assert_eq!(fx.request_count("GET", "/api/roms/81/files/content/"), 0);
+    assert_eq!(fx.request_count("GET", "/api/roms/7/content/"), 0);
 }
 
 #[test]
@@ -181,9 +181,9 @@ fn duplicate_auxiliary_destinations_dedupe_or_skip_instead_of_failing() {
         .join("\n");
     assert!(warnings.contains("conflict.bin"), "{warnings}");
     assert!(warnings.contains("bios.bin"), "{warnings}");
-    assert_eq!(fx.count_requests("GET", "/api/firmware/3/content/"), 0);
-    assert_eq!(fx.count_requests("GET", "/api/firmware/4/content/"), 0);
-    assert_eq!(fx.count_requests("GET", "/api/firmware/2/content/"), 1);
+    assert_eq!(fx.request_count("GET", "/api/firmware/3/content/"), 0);
+    assert_eq!(fx.request_count("GET", "/api/firmware/4/content/"), 0);
+    assert_eq!(fx.request_count("GET", "/api/firmware/2/content/"), 1);
 }
 
 #[test]
@@ -246,7 +246,7 @@ fn duplicate_firmware_requires_equal_downloaded_content_not_size_or_timestamp() 
                 .iter()
                 .any(|w| w.message.contains("Conflicting auxiliary contents")));
         }
-        assert_eq!(fx.count_requests("GET", "/api/firmware/2/content/"), 1);
+        assert_eq!(fx.request_count("GET", "/api/firmware/2/content/"), 1);
     }
 }
 

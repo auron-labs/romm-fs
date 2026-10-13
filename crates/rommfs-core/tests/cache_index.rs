@@ -4,7 +4,7 @@
 //! drops interrupted state.
 
 use rommfs_core::cache::{CacheIndex, EntryState};
-use rommfs_core::catalog::RomKey;
+use rommfs_core::catalogue::RomKey;
 
 fn key(rom_id: i64, file_id: i64) -> RomKey {
     RomKey {

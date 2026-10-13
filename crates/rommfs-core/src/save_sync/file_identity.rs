@@ -1,6 +1,6 @@
 //! Reversible remote identities stored in RomM's `slot`, not rewritten filenames.
 use super::path::validate_windows_path_component;
-use crate::catalog::RomKey;
+use crate::catalogue::RomKey;
 use crate::{Error, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};

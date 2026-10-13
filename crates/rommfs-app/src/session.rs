@@ -1,6 +1,6 @@
 //! Application ownership independent of the visible window's lifetime.
 #[cfg(windows)]
-use crate::controller::{ConnState, MountState};
+use crate::controller::{ConnectionState, MountState};
 use crate::controller::{Controller, UiState};
 use rommfs_core::events::AppEvent;
 use std::rc::Rc;
@@ -26,7 +26,7 @@ impl ApplicationSession {
     pub fn drain(&mut self) -> Vec<AppEvent> {
         let events: Vec<_> = self.events.try_iter().collect();
         for event in &events {
-            self.state.apply(event);
+            self.state.apply_event(event);
         }
         events
     }
@@ -45,8 +45,8 @@ impl ApplicationSession {
             return "RomMFS · needs attention — Open for details".into();
         }
         let connection = match self.state.conn {
-            ConnState::Connected => "connected",
-            ConnState::Connecting => "connecting",
+            ConnectionState::Connected => "connected",
+            ConnectionState::Connecting => "connecting",
             _ => "not connected",
         };
         let mount = match self.state.mount {

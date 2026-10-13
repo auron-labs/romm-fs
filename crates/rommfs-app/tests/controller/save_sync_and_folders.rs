@@ -6,11 +6,11 @@ use super::*;
 #[test]
 fn signin_required_preserves_the_real_reason() {
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::Connecting);
-    ui.apply(&AppEvent::SignInRequired {
+    ui.apply_event(&AppEvent::Connecting);
+    ui.apply_event(&AppEvent::SignInRequired {
         reason: Some("credentials rejected by server".into()),
     });
-    assert_eq!(ui.conn, ConnState::SignInRequired);
+    assert_eq!(ui.conn, ConnectionState::SignInRequired);
     assert_eq!(
         ui.conn_error.as_deref(),
         Some("credentials rejected by server"),
@@ -23,7 +23,7 @@ fn signin_required_preserves_the_real_reason() {
 #[test]
 fn save_sync_zero_linked_files_is_not_up_to_date() {
     let mut ui = enabled_ui();
-    ui.apply(&AppEvent::SaveSyncQueueUpdated(queue(0, 0, 0, 0, 0)));
+    ui.apply_event(&AppEvent::SaveSyncQueueUpdated(queue(0, 0, 0, 0, 0)));
     assert_eq!(ui.save_sync_summary(), SaveSyncSummary::NoLinkedFiles);
     assert_ne!(
         ui.save_sync_summary(),
@@ -38,12 +38,12 @@ fn save_sync_zero_linked_files_is_not_up_to_date() {
 fn save_sync_summary_covers_the_status_table() {
     // Off — enabled=false, no implied protection.
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::Connected);
+    ui.apply_event(&AppEvent::Connected);
     assert_eq!(ui.save_sync_summary(), SaveSyncSummary::Off);
 
     // Needs setup — enabled but source config invalid.
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::Connected);
+    ui.apply_event(&AppEvent::Connected);
     ui.save_sync_enabled = true;
     ui.save_sync_available = false;
     assert_eq!(ui.save_sync_summary(), SaveSyncSummary::NeedsSetup);
@@ -54,43 +54,43 @@ fn save_sync_summary_covers_the_status_table() {
 
     // Reconciling — links known, check incomplete.
     let mut ui = enabled_ui();
-    ui.apply(&AppEvent::SaveSyncQueueUpdated(queue(4, 2, 0, 0, 0)));
+    ui.apply_event(&AppEvent::SaveSyncQueueUpdated(queue(4, 2, 0, 0, 0)));
     assert_eq!(ui.save_sync_summary(), SaveSyncSummary::Reconciling);
 
     // Syncing — outbound transfers pending.
     let mut ui = enabled_ui();
-    ui.apply(&AppEvent::SaveSyncQueueUpdated(queue(4, 4, 2, 0, 0)));
+    ui.apply_event(&AppEvent::SaveSyncQueueUpdated(queue(4, 4, 2, 0, 0)));
     assert_eq!(ui.save_sync_summary(), SaveSyncSummary::Syncing);
 
     // Needs attention — a failed operation beats an otherwise-busy queue.
     let mut ui = enabled_ui();
     let mut failed = queue(4, 4, 2, 0, 0);
     failed.failure = Some("upload rejected".into());
-    ui.apply(&AppEvent::SaveSyncQueueUpdated(failed));
+    ui.apply_event(&AppEvent::SaveSyncQueueUpdated(failed));
     assert_eq!(ui.save_sync_summary(), SaveSyncSummary::NeedsAttention);
 
     // Needs attention — dead actor.
     let mut ui = enabled_ui();
     let mut dead = queue(4, 4, 0, 0, 0);
     dead.actor_failed = true;
-    ui.apply(&AppEvent::SaveSyncQueueUpdated(dead));
+    ui.apply_event(&AppEvent::SaveSyncQueueUpdated(dead));
     assert_eq!(ui.save_sync_summary(), SaveSyncSummary::NeedsAttention);
 
     // Needs attention — review items pending.
     let mut ui = enabled_ui();
-    ui.apply(&AppEvent::SaveSyncQueueUpdated(queue(4, 4, 0, 1, 0)));
+    ui.apply_event(&AppEvent::SaveSyncQueueUpdated(queue(4, 4, 0, 1, 0)));
     assert_eq!(ui.save_sync_summary(), SaveSyncSummary::NeedsAttention);
 
     // Paused — worker throttled by network errors.
     let mut ui = enabled_ui();
     let mut paused = queue(4, 4, 0, 0, 0);
     paused.network_paused = true;
-    ui.apply(&AppEvent::SaveSyncQueueUpdated(paused));
+    ui.apply_event(&AppEvent::SaveSyncQueueUpdated(paused));
     assert_eq!(ui.save_sync_summary(), SaveSyncSummary::Paused);
 
     // Up to date — linked files checked, no pending work.
     let mut ui = enabled_ui();
-    ui.apply(&AppEvent::SaveSyncQueueUpdated(queue(4, 4, 0, 0, 0)));
+    ui.apply_event(&AppEvent::SaveSyncQueueUpdated(queue(4, 4, 0, 0, 0)));
     assert_eq!(ui.save_sync_summary(), SaveSyncSummary::UpToDate);
 }
 
@@ -99,15 +99,15 @@ fn save_sync_summary_covers_the_status_table() {
 #[test]
 fn save_sync_summary_follows_auth_and_offline() {
     let mut ui = enabled_ui();
-    ui.apply(&AppEvent::SignInRequired { reason: None });
+    ui.apply_event(&AppEvent::SignInRequired { reason: None });
     assert_eq!(ui.save_sync_summary(), SaveSyncSummary::AuthRequired);
 
     let mut ui = enabled_ui();
-    ui.apply(&AppEvent::SaveSyncAuthenticationRequired { session_id: 1 });
+    ui.apply_event(&AppEvent::SaveSyncAuthenticationRequired { session_id: 1 });
     assert_eq!(ui.save_sync_summary(), SaveSyncSummary::AuthRequired);
 
     let mut ui = enabled_ui();
-    ui.apply(&AppEvent::ConnectFailed {
+    ui.apply_event(&AppEvent::ConnectFailed {
         reason: "refused".into(),
     });
     assert_eq!(ui.save_sync_summary(), SaveSyncSummary::Offline);
@@ -119,35 +119,35 @@ fn save_sync_summary_follows_auth_and_offline() {
 #[test]
 fn folder_summary_never_implied_by_connection() {
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::Connected);
+    ui.apply_event(&AppEvent::Connected);
     assert_eq!(ui.folder_summary(), FolderSummary::SetupNeeded);
 
     // Persisted config for this server makes it "stopped", not "unconfigured".
-    ui.apply(&AppEvent::ConnectionRestored {
+    ui.apply_event(&AppEvent::ConnectionRestored {
         server: "romm.local".into(),
         mount_root: Some("C:\\RomM".into()),
     });
     assert_eq!(ui.folder_summary(), FolderSummary::Stopped);
-    assert_eq!(ui.conn, ConnState::Connected);
+    assert_eq!(ui.conn, ConnectionState::Connected);
 
-    ui.apply(&AppEvent::MountStarting {
+    ui.apply_event(&AppEvent::MountStarting {
         path: "C:\\RomM".into(),
     });
     assert_eq!(ui.folder_summary(), FolderSummary::Starting);
 
-    ui.apply(&AppEvent::MountStarted {
+    ui.apply_event(&AppEvent::MountStarted {
         path: "C:\\RomM".into(),
     });
     assert_eq!(ui.folder_summary(), FolderSummary::Ready);
 
-    ui.apply(&AppEvent::MountStopped);
+    ui.apply_event(&AppEvent::MountStopped);
     assert_eq!(ui.folder_summary(), FolderSummary::Stopped);
 
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::MountStarting {
+    ui.apply_event(&AppEvent::MountStarting {
         path: "C:\\RomM".into(),
     });
-    ui.apply(&AppEvent::MountFailed {
+    ui.apply_event(&AppEvent::MountFailed {
         reason: "denied".into(),
     });
     assert_eq!(ui.folder_summary(), FolderSummary::Failed);
@@ -158,22 +158,22 @@ fn folder_summary_never_implied_by_connection() {
 #[test]
 fn configured_folder_does_not_survive_reconnect() {
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::ConnectionRestored {
+    ui.apply_event(&AppEvent::ConnectionRestored {
         server: "romm.local".into(),
         mount_root: Some("C:\\RomM".into()),
     });
     assert_eq!(ui.folder_summary(), FolderSummary::Stopped);
 
-    ui.apply(&AppEvent::Connecting);
+    ui.apply_event(&AppEvent::Connecting);
     assert_eq!(ui.folder_summary(), FolderSummary::SetupNeeded);
 
-    ui.apply(&AppEvent::ConnectionRestored {
+    ui.apply_event(&AppEvent::ConnectionRestored {
         server: "other.local".into(),
         mount_root: Some("D:\\RomM".into()),
     });
     assert_eq!(ui.configured_mount_root.as_deref(), Some("D:\\RomM"));
 
-    ui.apply(&AppEvent::SignedOut);
+    ui.apply_event(&AppEvent::SignedOut);
     assert_eq!(ui.folder_summary(), FolderSummary::SetupNeeded);
 }
 

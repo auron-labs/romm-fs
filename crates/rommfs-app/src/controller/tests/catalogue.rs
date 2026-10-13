@@ -89,10 +89,10 @@ fn catalogue_pages_are_fetched_once_and_warm_remounts_make_no_http_requests() {
     worker.catalogue_store = Some(CatalogueStore::open(&tmp.path().join("catalogue.db")).unwrap());
     worker.connect(fx.url(), "user", "password");
     assert_eq!(worker.catalogue.as_ref().unwrap().entries.len(), 2448);
-    assert_eq!(fx.count("GET", "/api/platforms"), 1);
+    assert_eq!(fx.route_hit_count("GET", "/api/platforms"), 1);
     for offset in (0..2448).step_by(200) {
         assert_eq!(
-            fx.count("GET", &format!("/api/roms?limit=200&offset={offset}&")),
+            fx.route_hit_count("GET", &format!("/api/roms?limit=200&offset={offset}&")),
             1
         );
     }
@@ -101,8 +101,8 @@ fn catalogue_pages_are_fetched_once_and_warm_remounts_make_no_http_requests() {
         worker.start_mount(root.to_str().unwrap());
         worker.stop_mount();
     }
-    assert_eq!(fx.count("GET", "/api/platforms"), 1);
-    assert_eq!(fx.count("GET", "/api/roms/"), 0);
+    assert_eq!(fx.route_hit_count("GET", "/api/platforms"), 1);
+    assert_eq!(fx.route_hit_count("GET", "/api/roms/"), 0);
     assert!(
         worker.catalogue.is_some(),
         "mount construction retains the reusable snapshot"

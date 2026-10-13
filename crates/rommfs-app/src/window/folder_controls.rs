@@ -15,8 +15,8 @@ impl RommfsWindow {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let conn = self.state.conn;
-        let connecting = conn == ConnState::Connecting;
-        let connected = conn == ConnState::Connected;
+        let connecting = conn == ConnectionState::Connecting;
+        let connected = conn == ConnectionState::Connected;
         // The server that actually answered — a remembered session may
         // never have typed into the url field this launch.
         let server = self
@@ -246,7 +246,7 @@ impl RommfsWindow {
                 (summary != FolderSummary::SetupNeeded && !typed.is_empty()).then_some(typed)
             });
         let ready = summary == FolderSummary::Ready;
-        let connected = self.state.conn == ConnState::Connected;
+        let connected = self.state.conn == ConnectionState::Connected;
 
         // The primary action this state offers (UI-PLAN §3 truth table).
         let primary: Option<Button> = match summary {

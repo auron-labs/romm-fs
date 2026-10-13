@@ -192,7 +192,7 @@ pub(crate) fn check_directory(root: &Path) -> anyhow::Result<()> {
     let _guard = rommfs_core::save_sync::hold_save_directory_chain(parent)
         .with_context(|| format!("protect mount parent {}", parent.display()))?;
     #[cfg(windows)]
-    crate::imp::check_root_directory(root)
+    crate::windows::check_root_directory(root)
         .with_context(|| format!("inspect mount directory {}", root.display()))?;
     #[cfg(not(windows))]
     {
@@ -266,7 +266,7 @@ pub(crate) fn verify_local(path: &Path, entry: &OwnedEntry) -> anyhow::Result<()
 fn verify_entry(path: &Path, entry: &OwnedEntry) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        crate::imp::verify_owned(path, entry)
+        crate::windows::verify_owned(path, entry)
     }
     #[cfg(not(windows))]
     {
@@ -422,7 +422,7 @@ fn publish_local(
             verify_local(&target, entry)?;
         }
         #[cfg(windows)]
-        crate::imp::make_directory_writable(&target)?;
+        crate::windows::make_directory_writable(&target)?;
     }
     let target = root.join(relative);
     let _target_guard =
@@ -511,7 +511,7 @@ fn publish_local(
     staged.sync_all()?;
     drop(staged);
     #[cfg(windows)]
-    crate::imp::make_local_writable(&staging)?;
+    crate::windows::make_local_writable(&staging)?;
     if let Ok(metadata) = fs::symlink_metadata(&target) {
         anyhow::ensure!(
             metadata.is_file() && !rommfs_core::save_sync::path_is_reparse_point(&metadata),
@@ -520,14 +520,14 @@ fn publish_local(
     }
     fs::rename(staging, &target)?;
     #[cfg(windows)]
-    crate::imp::make_local_writable(&target)?;
+    crate::windows::make_local_writable(&target)?;
     Ok(())
 }
 
 fn hold_metadata_directories(root: &Path, directory: &Path) -> anyhow::Result<Vec<fs::File>> {
     #[cfg(windows)]
     {
-        crate::imp::hold_local_directory_chain(root, directory)
+        crate::windows::hold_local_directory_chain(root, directory)
     }
     #[cfg(not(windows))]
     {

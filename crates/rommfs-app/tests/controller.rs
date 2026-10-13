@@ -2,7 +2,9 @@
 //! These drive the same enum the GPUI window consumes — no GPUI, no network,
 //! and no duplicate state machine (PRD §6 "UI behavior" row).
 
-use rommfs_app::controller::{ConnState, FolderSummary, MountState, SaveSyncSummary, UiState};
+use rommfs_app::controller::{
+    ConnectionState, FolderSummary, MountState, SaveSyncSummary, UiState,
+};
 use rommfs_core::events::{AppEvent, Level, LogLine, SaveSyncQueueStatus};
 
 #[path = "controller/auxiliary_setup.rs"]
@@ -50,10 +52,10 @@ fn queue(
 
 fn enabled_ui() -> UiState {
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::Connecting);
-    ui.apply(&AppEvent::Connected);
+    ui.apply_event(&AppEvent::Connecting);
+    ui.apply_event(&AppEvent::Connected);
     // Queue/session events are gated on the actor's session id.
-    ui.apply(&AppEvent::SaveSyncSessionChanged { session_id: 1 });
+    ui.apply_event(&AppEvent::SaveSyncSessionChanged { session_id: 1 });
     ui.save_sync_enabled = true;
     ui.save_sync_available = true;
     ui
@@ -63,6 +65,6 @@ use rommfs_core::connection_settings::IntegrationMode;
 
 fn linked_ui() -> UiState {
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::Connected);
+    ui.apply_event(&AppEvent::Connected);
     ui
 }

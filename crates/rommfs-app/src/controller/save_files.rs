@@ -471,7 +471,7 @@ mod tests {
             scopes: vec!["assets.read".into(), "assets.write".into()],
         });
         worker.catalogue = Some(
-            rommfs_core::catalog::build_catalogue(&server_id_of(fixture.url()), &[], &[], |_| {})
+            rommfs_core::catalogue::build_catalogue(&server_id_of(fixture.url()), &[], &[], |_| {})
                 .unwrap(),
         );
         worker.source_snapshot = Some(CatalogueSnapshot {
@@ -506,7 +506,7 @@ mod tests {
         );
         assert_eq!(worker.save_sync_debounce_secs, 13);
         assert!(worker.save_sync_agent.is_none());
-        assert_eq!(fixture.count_requests("GET", "/api/saves"), 0);
+        assert_eq!(fixture.request_count("GET", "/api/saves"), 0);
     }
     #[test]
     fn failed_startup_mount_blocks_later_refresh_from_resuming_consented_sync() {
@@ -538,7 +538,7 @@ mod tests {
         assert!(!worker
             .save_sync_gate
             .enabled_for(worker.current_save_sync_epoch));
-        assert_eq!(fixture.count_requests("GET", "/api/saves"), 0);
+        assert_eq!(fixture.request_count("GET", "/api/saves"), 0);
     }
 
     fn populate_games(worker: &mut Worker) {
@@ -556,7 +556,7 @@ mod tests {
             })).unwrap()
         }).collect::<Vec<_>>();
         worker.catalogue = Some(
-            rommfs_core::catalog::build_catalogue(
+            rommfs_core::catalogue::build_catalogue(
                 worker.server_id.as_deref().unwrap(),
                 std::slice::from_ref(&platform),
                 &roms,
@@ -635,7 +635,7 @@ mod tests {
                 .any(|record| record.id == incoming_id));
         }
         assert_eq!(std::fs::read(root.join(path)).unwrap(), b"local save");
-        assert_eq!(fixture.count_requests("GET", "/api/saves"), 0);
+        assert_eq!(fixture.request_count("GET", "/api/saves"), 0);
     }
 
     #[test]
@@ -711,7 +711,7 @@ mod tests {
             worker.set_save_sync_enabled(false);
             assert!(worker.save_sync_agent.is_none());
             for event in events.try_iter() {
-                state.apply(&event);
+                state.apply_event(&event);
             }
             let queue = state
                 .save_sync_queue
@@ -726,7 +726,7 @@ mod tests {
         let exported = directory.path().join("exported.bin");
         worker.export_save_sync_incoming(worker.save_sync_session_id, &incoming_id, &exported);
         assert_eq!(std::fs::read(exported).unwrap(), b"remote save");
-        assert_eq!(fixture.count_requests("GET", "/api/saves"), 0);
+        assert_eq!(fixture.request_count("GET", "/api/saves"), 0);
         // Reopen the same settings and journal with consent still disabled.
         let (sink, reopened_events) = rommfs_core::events::channel();
         let mut reopened = Worker::new(sink);

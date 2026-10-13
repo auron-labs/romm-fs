@@ -6,7 +6,7 @@ use super::transfer::{
     IncomingJob, TransferJob, TransferUpdate, WorkerJob, ACTOR_POLL_INTERVAL,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use rommfs_core::catalog::RomKey;
+use rommfs_core::catalogue::RomKey;
 use rommfs_core::error::{Error, Result};
 use rommfs_core::events::{
     AppEvent, EventSink, Level, SaveSyncGameStatus, SaveSyncIncomingStatus, SaveSyncQueueStatus,
