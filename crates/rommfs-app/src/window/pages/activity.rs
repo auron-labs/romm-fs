@@ -92,8 +92,8 @@ fn attention_section(
     }
     if state.mount == MountState::Failed {
         let message = match &state.mount_error {
-            Some(error) => format!("Mount failed: {error}"),
-            None => "Mount failed".to_string(),
+            Some(error) => format!("Games folder failed to start: {error}"),
+            None => "Games folder failed to start".to_string(),
         };
         let target = state
             .mount_path
@@ -114,7 +114,7 @@ fn attention_section(
                 .when_some(target, |this, path| {
                     this.child(details_disclosure(
                         "attention-mount-details",
-                        format!("Mount target: {path}"),
+                        format!("Games folder: {path}"),
                         window,
                         cx,
                     ))
@@ -181,7 +181,7 @@ fn attention_section(
     if let Some(error) = &state.auxiliary_error {
         rows.push(
             attention_row(
-                format!("Support-file download failed: {error}"),
+                UserProblem::from_text("Couldn't install support files", error).line(),
                 Some(retry_button("retry-auxiliary", cx, |view, _| {
                     view.controller.send(Command::MaterializeAuxiliary);
                 })),
@@ -194,13 +194,18 @@ fn attention_section(
         // SetupRetroBat needs the install + managed roots, which only the
         // settings page collects — no retry here.
         rows.push(
-            attention_row(format!("RetroBat setup failed: {error}"), None, cx).into_any_element(),
+            attention_row(
+                UserProblem::from_text("Couldn't finish RetroBat setup", error).line(),
+                None,
+                cx,
+            )
+            .into_any_element(),
         );
     }
     if let Some(error) = &state.installer_error {
         rows.push(
             attention_row(
-                format!("RetroBat installer download failed: {error}"),
+                UserProblem::from_text("Couldn't get the RetroBat installer", error).line(),
                 Some(retry_button("retry-installer", cx, |view, _| {
                     view.controller.send(Command::DownloadRetroBatInstaller);
                 })),
@@ -296,7 +301,7 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
             recent.push(
                 op_row(
                     StatusKind::Success.color(cx),
-                    "Games folder mounted",
+                    "Games folder running",
                     detail,
                 )
                 .into_any_element(),

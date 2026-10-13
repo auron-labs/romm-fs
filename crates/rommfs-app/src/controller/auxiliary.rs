@@ -1,4 +1,5 @@
 use super::*;
+use rommfs_core::events::AuxiliarySummary;
 use rommfs_core::retrobat::AuxiliaryReport;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -17,21 +18,21 @@ impl Worker {
         let result = (|| -> anyhow::Result<AuxiliaryJob> {
             anyhow::ensure!(
                 self.mount.is_none(),
-                "Stop the mount before materializing auxiliary files"
+                "Stop the games folder before installing support files"
             );
             anyhow::ensure!(
                 !self.installer.is_running(),
-                "Finish installation before materializing auxiliary files"
+                "Finish the RetroBat installation before installing support files"
             );
             let installation = self
                 .preferences
                 .as_ref()
                 .and_then(|p| p.retrobat_root.clone())
-                .context("Select and set up a fresh RetroBat installation first")?;
+                .context("Choose a RetroBat installation and set it up first")?;
             let client = self
                 .client
                 .clone()
-                .context("Connect before materializing auxiliary files")?;
+                .context("Connect to RomM before installing support files")?;
             let source = self
                 .source_snapshot
                 .clone()
@@ -40,7 +41,7 @@ impl Worker {
             let account = self
                 .save_sync_identity
                 .as_ref()
-                .context("Verify the account before materializing files")?
+                .context("Sign in to RomM before installing support files")?
                 .account_id;
             let active = Arc::new(AtomicBool::new(true));
             let flag = active.clone();
@@ -60,8 +61,9 @@ impl Worker {
                         |completed, total| {
                             sink.emit(AppEvent::AuxiliaryStatus {
                                 running: true,
-                                detail: format!("Auxiliary files: {completed} / {total}"),
+                                detail: format!("Support files: {completed} / {total}"),
                                 error: None,
+                                summary: None,
                             });
                         },
                     )?)
@@ -79,8 +81,9 @@ impl Worker {
                 self.auxiliary_job = Some(job);
                 self.sink.emit(AppEvent::AuxiliaryStatus {
                     running: true,
-                    detail: "Checking auxiliary destinations and ownership".into(),
+                    detail: "Checking support file destinations and ownership".into(),
                     error: None,
+                    summary: None,
                 });
             }
             Err(error) => self.auxiliary_failed(error),
@@ -104,9 +107,22 @@ impl Worker {
             match result {
                 Ok(report) => {
                     for warning in &report.warnings {
-                        self.log(Level::Warn, "auxiliary", warning);
+                        self.log(Level::Warn, "auxiliary", &warning.message);
                     }
-                    self.sink.emit(AppEvent::AuxiliaryStatus { running:false,detail:format!("Auxiliary files: {} published, {} unchanged, {} issues. See Activity for unsupported or preserved files.",report.published,report.unchanged,report.warnings.len()),error:None });
+                    let issues = report.warnings.iter().filter(|w| w.is_issue()).count();
+                    self.sink.emit(AppEvent::AuxiliaryStatus {
+                        running: false,
+                        detail: format!(
+                            "Support files: {} installed, {} unchanged, {} need attention",
+                            report.published, report.unchanged, issues
+                        ),
+                        error: None,
+                        summary: Some(AuxiliarySummary {
+                            published: report.published,
+                            unchanged: report.unchanged,
+                            warnings: report.warnings,
+                        }),
+                    });
                 }
                 Err(error) => self.auxiliary_failed(error),
             }
@@ -116,14 +132,15 @@ impl Worker {
         if let Some(job) = self.auxiliary_job.take() {
             job.active.store(false, Ordering::Release);
             let _ = job.handle.join();
-            self.sink.emit(AppEvent::AuxiliaryStatus { running:false,detail:"Auxiliary download cancelled; completed files remain owned and partial files were not published".into(),error:None });
+            self.sink.emit(AppEvent::AuxiliaryStatus { running:false,detail:"Support file install cancelled; completed files were kept and partial files were not published".into(),error:None,summary:None });
         }
     }
     fn auxiliary_failed(&self, error: anyhow::Error) {
         self.sink.emit(AppEvent::AuxiliaryStatus {
             running: false,
-            detail: "Auxiliary setup failed; existing files were preserved".into(),
+            detail: "Support files weren't installed; existing files were left alone".into(),
             error: Some(format!("{error:#}")),
+            summary: None,
         });
     }
 }
@@ -147,6 +164,7 @@ mod tests {
                 running: true,
                 detail: "stale progress".into(),
                 error: None,
+                summary: None,
             });
             let _ = tx.send(Ok(AuxiliaryReport::default()));
         });

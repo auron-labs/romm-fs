@@ -402,7 +402,10 @@ pub fn describe_launch_failure(error: &Error) -> LaunchFailure {
         other => LaunchFailure {
             cancelled: false,
             detail: "Couldn't start the RetroBat installer".into(),
-            explanation: Some(other.to_string()),
+            explanation: Some(match other {
+                Error::Unsupported(text) => text.clone(),
+                other => other.to_string(),
+            }),
         },
     }
 }

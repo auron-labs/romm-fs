@@ -9,6 +9,7 @@
 use crate::controller::{
     Command, ConnState, Controller, FolderSummary, MountState, SaveSyncSummary, UiState,
 };
+use crate::problem::{auxiliary_headline, describe_auxiliary, Severity, UserProblem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
@@ -150,6 +151,74 @@ fn details_disclosure(
                     .text_xs()
                     .child(detail),
             )
+        })
+}
+
+/// A problem in the shared shape (UI-PLAN §4): bold title, one-line cause,
+/// optional action, and the raw text behind "Technical details".
+fn problem_block(
+    id: &'static str,
+    problem: &UserProblem,
+    action: Option<Button>,
+    window: &mut Window,
+    cx: &mut Context<RommfsWindow>,
+) -> impl IntoElement {
+    let color = match problem.severity {
+        Severity::Error => cx.theme().danger,
+        Severity::Warning => cx.theme().warning,
+    };
+    v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color)
+                .child(problem.title.clone()),
+        )
+        .when_some(problem.cause.clone(), |this, cause| {
+            this.child(muted(cause, cx))
+        })
+        .when_some(action, |this, button| {
+            this.child(div().pt_1().child(button))
+        })
+        .when_some(problem.technical.clone(), |this, technical| {
+            this.child(details_disclosure(
+                SharedString::from(format!("{id}-details")),
+                technical,
+                window,
+                cx,
+            ))
+        })
+}
+
+/// A quiet toggle that expands to a plain list of lines.
+fn notes_disclosure(
+    id: &'static str,
+    label: String,
+    lines: Vec<String>,
+    window: &mut Window,
+    cx: &mut Context<RommfsWindow>,
+) -> impl IntoElement {
+    let open = window.use_keyed_state(SharedString::from(format!("{id}-open")), cx, |_, _| {
+        std::cell::Cell::new(false)
+    });
+    let is_open = open.read(cx).get();
+    let toggle = open.clone();
+    v_flex()
+        .gap_1()
+        .child(
+            Button::new(id)
+                .ghost()
+                .small()
+                .label(if is_open { "Hide".to_string() } else { label })
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    toggle.update(cx, |open, _| open.set(!open.get()));
+                    cx.notify();
+                })),
+        )
+        .when(is_open, |this| {
+            this.children(lines.into_iter().map(|line| muted_xs(line, cx)))
         })
 }
 
@@ -1208,11 +1277,11 @@ impl RommfsWindow {
     /// the manage action (the install buttons live in Settings).
     fn render_overview_retrobat(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let (text, kind) = if self.state.retrobat_setup_running {
-            ("Installing…", StatusKind::Warning)
+            ("Setting up\u{2026}", StatusKind::Warning)
         } else if self.state.retrobat_setup_error.is_some() {
-            ("Setup failed", StatusKind::Danger)
+            ("Setup failed \u{2014} see Settings", StatusKind::Danger)
         } else if self.state.retrobat_root.is_some() {
-            ("Installed", StatusKind::Success)
+            ("Ready", StatusKind::Success)
         } else {
             ("Not set up", StatusKind::Muted)
         };
@@ -1233,9 +1302,6 @@ impl RommfsWindow {
                 } else {
                     this
                 }
-            })
-            .when_some(self.state.retrobat_setup_error.clone(), |this, error| {
-                this.child(error_line(error, cx))
             })
             .child(self.nav_button("overview-retrobat", "RetroBat settings", 3, false, cx))
     }
@@ -1282,10 +1348,10 @@ impl RommfsWindow {
                             .gap_3()
                             .pt_2()
                             .child(section_heading("RetroBat"))
-                            .child(self.retrobat_setup_panel(locked, cx))
+                            .child(self.retrobat_setup_panel(locked, window, cx))
                             .child(Separator::horizontal())
                             .child(section_heading("Support files"))
-                            .child(self.support_files_panel(locked, cx)),
+                            .child(self.support_files_panel(locked, window, cx)),
                     ),
             )
             .child(Separator::horizontal())
@@ -1651,7 +1717,12 @@ impl RommfsWindow {
     /// The focused RetroBat setup panel (UI-PLAN §RetroBat setup): the
     /// installer download, the link action and its result, and the
     /// foreign-item remediation — optional, never a prerequisite.
-    fn retrobat_setup_panel(&mut self, locked: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn retrobat_setup_panel(
+        &mut self,
+        locked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         v_flex()
             .gap_2()
             .child(
@@ -1694,12 +1765,26 @@ impl RommfsWindow {
                         )
                     }),
             )
-            .when_some(self.state.installer_detail.clone(), |this, detail| {
-                this.child(muted(detail, cx))
-            })
-            .when_some(self.state.installer_error.clone(), |this, error| {
-                this.child(error_line(error, cx))
-            })
+            .when(
+                self.state.installer_running || self.state.retrobat_root.is_none(),
+                |this| {
+                    // Installer messages only matter until an installation is
+                    // selected; afterwards setup owns the panel.
+                    this.when_some(self.state.installer_detail.clone(), |this, detail| {
+                        this.child(muted(detail, cx))
+                    })
+                },
+            )
+            .when_some(
+                self.state
+                    .installer_error
+                    .as_deref()
+                    .filter(|_| self.state.retrobat_root.is_none())
+                    .map(|raw| UserProblem::from_text("Couldn't get the RetroBat installer", raw)),
+                |this, problem| {
+                    this.child(problem_block("installer-problem", &problem, None, window, cx))
+                },
+            )
             .when_some(self.state.installer_progress.1, |this, total| {
                 this.child(Progress::new("installer-progress").value(if total == 0 {
                     0.
@@ -1736,10 +1821,7 @@ impl RommfsWindow {
                     )
             )
             .when(locked, |this| {
-                this.child(muted(
-                    "Stop the mount before changing its layout.",
-                    cx,
-                ))
+                this.child(self.locked_reason(cx))
             })
             .when(
                 !locked
@@ -1760,23 +1842,71 @@ impl RommfsWindow {
             .when_some(self.state.integration_notice.clone(), |this, note| {
                 this.child(muted(note, cx))
             })
-            .when_some(self.state.integration_error.clone(), |this, error| {
-                this.child(error_line(error, cx))
-            })
+            .when_some(
+                self.state.integration_error.as_deref().map(|raw| {
+                    UserProblem::from_text("Couldn't change the RetroBat layout", raw)
+                }),
+                |this, problem| {
+                    this.child(problem_block("integration-problem", &problem, None, window, cx))
+                },
+            )
             .when_some(self.render_foreign_remediation(cx), |this, block| {
                 this.child(block)
             })
-            .when_some(self.state.retrobat_setup_detail.clone(), |this, detail| {
-                this.child(muted(detail, cx))
+            // Only the current outcome: a failure replaces the last status
+            // line instead of stacking with it.
+            .when(self.state.retrobat_setup_error.is_none(), |this| {
+                this.when_some(self.state.retrobat_setup_detail.clone(), |this, detail| {
+                    this.child(muted(detail, cx))
+                })
             })
-            .when_some(self.state.retrobat_setup_error.clone(), |this, error| {
-                this.child(error_line(error, cx))
+            .when_some(
+                self.state.retrobat_setup_error.as_deref().map(|raw| {
+                    UserProblem::from_text("Couldn't finish RetroBat setup", raw)
+                }),
+                |this, problem| {
+                    this.child(problem_block("setup-problem", &problem, None, window, cx))
+                },
+            )
+    }
+
+    /// Why a Settings action is unavailable, with the stop action beside it
+    /// when the games folder is the cause.
+    fn locked_reason(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let running = matches!(self.state.mount, MountState::Mounted | MountState::Mounting);
+        let busy = self.state.retrobat_setup_running || self.state.auxiliary_running;
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(muted_xs(
+                if running {
+                    "Stop the games folder first (it is running)."
+                } else if busy {
+                    "Wait for the current setup or install to finish, or cancel it."
+                } else {
+                    ""
+                },
+                cx,
+            ))
+            .when(running, |this| {
+                this.child(
+                    Button::new("locked-stop-games-folder")
+                        .label("Stop games folder")
+                        .outline()
+                        .small()
+                        .on_click(cx.listener(|view, _, _, cx| view.on_stop_mount(cx))),
+                )
             })
     }
 
     /// Optional support-file downloads (BIOS/firmware/keys/cheats) — the
     /// auxiliary pipeline with its own progress and errors, never save data.
-    fn support_files_panel(&mut self, locked: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn support_files_panel(
+        &mut self,
+        locked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         v_flex()
             .gap_2()
             .child(
@@ -1807,26 +1937,68 @@ impl RommfsWindow {
                 locked || self.state.conn != ConnState::Connected,
                 |this| {
                     // §6: a disabled action carries its reason next to it.
-                    this.child(muted_xs(
-                        if locked {
-                            "Unavailable while the games folder or setup is running — stop it first."
-                        } else {
-                            "Connect to RomM first."
-                        },
-                        cx,
-                    ))
+                    if locked {
+                        this.child(self.locked_reason(cx))
+                    } else {
+                        this.child(muted_xs("Connect to RomM first.", cx))
+                    }
                 },
             )
             .child(muted(
                 "Downloads user-library BIOS, individual Switch firmware/keys, and RetroArch .cht cheats. No archives are extracted, no unowned or modified file is overwritten, and these files are never save data. Stop emulators before continuing.",
                 cx,
             ))
-            .when_some(self.state.auxiliary_detail.clone(), |this, detail| {
-                this.child(muted(detail, cx))
-            })
-            .when_some(self.state.auxiliary_error.clone(), |this, error| {
-                this.child(error_line(error, cx))
-            })
+            .when(
+                self.state.auxiliary_running || self.state.auxiliary_summary.is_none(),
+                |this| {
+                    this.when_some(self.state.auxiliary_detail.clone(), |this, detail| {
+                        this.child(muted(detail, cx))
+                    })
+                },
+            )
+            .when_some(
+                self.state.auxiliary_error.as_deref().map(|raw| {
+                    UserProblem::from_text("Couldn't install support files", raw)
+                }),
+                |this, problem| {
+                    this.child(problem_block("auxiliary-problem", &problem, None, window, cx))
+                },
+            )
+            .when_some(
+                self.state
+                    .auxiliary_summary
+                    .clone()
+                    .filter(|_| !self.state.auxiliary_running),
+                |this, summary| {
+                    let (headline, note) = auxiliary_headline(
+                        summary.published,
+                        summary.unchanged,
+                        &summary.warnings,
+                    );
+                    let lines: Vec<String> =
+                        summary.warnings.iter().map(describe_auxiliary).collect();
+                    this.child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(cx.theme().success)
+                                    .child(headline),
+                            )
+                            .when_some(note, |this, note| {
+                                this.child(muted(note, cx)).child(notes_disclosure(
+                                    "auxiliary-notes",
+                                    "Show what needs attention".into(),
+                                    lines,
+                                    window,
+                                    cx,
+                                ))
+                            }),
+                    )
+                },
+            )
             .when_some(
                 self.state.frontend_metadata_detail.clone(),
                 |this, detail| this.child(muted(detail, cx)),
@@ -1876,7 +2048,7 @@ impl RommfsWindow {
             )
             .child(muted(
                 format!(
-                    "{} Login startup reconnects and mounts before resuming previously authorized save sync.",
+                    "{} Login startup reconnects and starts the games folder before resuming previously authorized save sync.",
                     close_behavior_copy(self.tray_hides)
                 ),
                 cx,
@@ -2090,7 +2262,7 @@ impl RommfsWindow {
             })
             .when(self.state.catalogue_pending_remount, |this| {
                 this.child(muted(
-                    "A complete refresh is ready; stop and start the mount to publish it.",
+                    "A complete refresh is ready; stop and start the games folder to publish it.",
                     cx,
                 ))
             })

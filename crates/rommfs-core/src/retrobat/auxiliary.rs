@@ -1,6 +1,7 @@
 //! Explicit auxiliary materialization; never runs during catalogue loading.
 //! Unknown categories/archives are diagnosed instead of inventing extraction
 //! routes. Existing or emulator-modified files are never overwritten.
+use crate::events::{AuxiliaryWarning, AuxiliaryWarningKind};
 use crate::romm::{FirmwareDto, PlatformDto, RomDto, RommClient};
 use crate::save_sync::{
     ensure_no_reparse_components, hash_save_content, hold_save_directory_chain,
@@ -18,7 +19,44 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct AuxiliaryReport {
     pub published: usize,
     pub unchanged: usize,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<AuxiliaryWarning>,
+}
+
+fn warn(
+    kind: AuxiliaryWarningKind,
+    subject: impl Into<String>,
+    message: String,
+) -> AuxiliaryWarning {
+    AuxiliaryWarning {
+        kind,
+        subject: subject.into(),
+        message,
+    }
+}
+
+/// Unsupported errors carry user-facing text; strip the internal prefix.
+fn plain(error: &Error) -> String {
+    match error {
+        Error::Unsupported(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn classify(error: &Error) -> AuxiliaryWarningKind {
+    let text = plain(error);
+    if text.contains("is missing; rescan it on RomM") {
+        AuxiliaryWarningKind::MissingOnServer
+    } else if text.starts_with("Switch firmware must be") {
+        AuxiliaryWarningKind::SwitchArchive
+    } else {
+        AuxiliaryWarningKind::Other
+    }
+}
+
+fn file_subject(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 #[derive(Default, Deserialize, Serialize)]
 struct Index {
@@ -113,9 +151,9 @@ pub fn materialize_auxiliaries(
                     Ok(destinations)
                 } else { Ok(vec![bios.join(&f.file_name)]) }
             })();
-            match result { Ok(paths)=> for path in paths { files.push((path,Source::Firmware(f.clone()))); }, Err(e)=>report.warnings.push(format!("Firmware {}: {e}",f.id)) }
+            match result { Ok(paths)=> for path in paths { files.push((path,Source::Firmware(f.clone()))); }, Err(e)=>report.warnings.push(warn(classify(&e),f.file_name.clone(),format!("Firmware {} ({}): {}",f.id,f.file_name,plain(&e)))) }
         },
-        Err(e)=>report.warnings.push(format!("Firmware inventory unavailable: {e}. Browser sign-in must grant firmware.read; retry after signing in again.")),
+        Err(e)=>report.warnings.push(warn(AuxiliaryWarningKind::Other,"Firmware",format!("Firmware inventory unavailable: {}. Browser sign-in must grant firmware.read; retry after signing in again.",plain(&e)))),
     }
     for rom in roms {
         for file in rom
@@ -157,9 +195,17 @@ pub fn materialize_auxiliaries(
                         ),
                     },
                 )),
-                Err(e) => report
-                    .warnings
-                    .push(format!("ROM {} cheat {}: {e}", rom.id, file.id)),
+                Err(e) => report.warnings.push(warn(
+                    classify(&e),
+                    file.file_name.clone(),
+                    format!(
+                        "ROM {} cheat {} ({}): {}",
+                        rom.id,
+                        file.id,
+                        file.file_name,
+                        plain(&e)
+                    ),
+                )),
             }
         }
     }
@@ -222,14 +268,18 @@ pub fn materialize_auxiliaries(
             // distinct source so publication can compare the downloaded hashes.
             files.push((destination, distinct));
         } else {
-            report.warnings.push(format!(
-                "Conflicting auxiliary sources target {}; it was skipped: {}",
-                destination.display(),
-                distinct
-                    .iter()
-                    .map(|s| s.describe())
-                    .collect::<Vec<_>>()
-                    .join("; ")
+            report.warnings.push(warn(
+                AuxiliaryWarningKind::Other,
+                file_subject(&destination),
+                format!(
+                    "Conflicting auxiliary sources target {}; it was skipped: {}",
+                    destination.display(),
+                    distinct
+                        .iter()
+                        .map(|s| s.describe())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
             ));
         }
     }
@@ -251,7 +301,11 @@ pub fn materialize_auxiliaries(
             return Err(Error::Cancelled);
         }
         if let Err(e) = result {
-            report.warnings.push(format!("{}: {e}", path.display()));
+            report.warnings.push(warn(
+                AuxiliaryWarningKind::Other,
+                file_subject(&path),
+                format!("{}: {}", path.display(), plain(&e)),
+            ));
         }
         progress(n + 1, total);
     }
@@ -337,14 +391,18 @@ fn publish(
         return Err(Error::Cancelled);
     }
     if sources.len() > 1 {
-        report.warnings.push(format!(
-            "Content-verified duplicate auxiliary sources for {} publish once: {}",
-            path.display(),
-            sources
-                .iter()
-                .map(Source::describe)
-                .collect::<Vec<_>>()
-                .join("; ")
+        report.warnings.push(warn(
+            AuxiliaryWarningKind::Duplicate,
+            file_subject(path),
+            format!(
+                "Content-verified duplicate auxiliary sources for {} publish once: {}",
+                path.display(),
+                sources
+                    .iter()
+                    .map(Source::describe)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
         ));
     }
     index.files.insert(

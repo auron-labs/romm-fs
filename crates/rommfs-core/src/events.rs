@@ -84,6 +84,49 @@ pub struct ForeignEntry {
     pub kind: ForeignKind,
 }
 
+/// Why a support file was not installed, for plain-language reporting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuxiliaryWarningKind {
+    /// The server lists the file but it is missing on its disk; needs a rescan.
+    MissingOnServer,
+    /// Switch firmware uploaded as an archive instead of unpacked files.
+    SwitchArchive,
+    /// Same content published once from several sources. Informational.
+    Duplicate,
+    Other,
+}
+
+/// One structured note from a support-file install.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuxiliaryWarning {
+    pub kind: AuxiliaryWarningKind,
+    /// File name (or path) the note is about.
+    pub subject: String,
+    /// Full diagnostic text, as logged.
+    pub message: String,
+}
+
+impl AuxiliaryWarning {
+    /// Informational notes are not problems and are not counted as issues.
+    pub fn is_issue(&self) -> bool {
+        self.kind != AuxiliaryWarningKind::Duplicate
+    }
+}
+
+impl std::fmt::Display for AuxiliaryWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Outcome of a finished support-file install.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuxiliarySummary {
+    pub published: usize,
+    pub unchanged: usize,
+    pub warnings: Vec<AuxiliaryWarning>,
+}
+
 /// Events emitted by workers. UI renders these; tests assert on them.
 #[derive(Clone, Debug)]
 pub enum AppEvent {
@@ -102,6 +145,8 @@ pub enum AppEvent {
         running: bool,
         detail: String,
         error: Option<String>,
+        /// Present only on the final event of a completed install.
+        summary: Option<AuxiliarySummary>,
     },
     StartupPreference {
         enabled: bool,

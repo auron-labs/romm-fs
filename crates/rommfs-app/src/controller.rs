@@ -169,6 +169,8 @@ pub struct UiState {
     pub save_file_unmatched: Vec<UnmatchedFile>,
     pub auxiliary_detail: Option<String>,
     pub auxiliary_error: Option<String>,
+    /// Result of the last completed support-file install.
+    pub auxiliary_summary: Option<rommfs_core::events::AuxiliarySummary>,
     pub installer_running: bool,
     pub installer_ready: bool,
     pub installer_progress: (u64, Option<u64>),
@@ -245,6 +247,7 @@ impl UiState {
             auxiliary_running: false,
             auxiliary_detail: None,
             auxiliary_error: None,
+            auxiliary_summary: None,
             startup_error: None,
             save_file_games: Vec::new(),
             save_file_unmatched: Vec::new(),
@@ -330,6 +333,7 @@ impl UiState {
                 running,
                 detail,
                 error,
+                summary,
             } => {
                 // Auxiliary support-file downloads are their own operation:
                 // their status must not masquerade as (or overwrite) RetroBat
@@ -337,6 +341,7 @@ impl UiState {
                 self.auxiliary_running = *running;
                 self.auxiliary_detail = Some(detail.clone());
                 self.auxiliary_error = error.clone();
+                self.auxiliary_summary = summary.clone();
             }
             AppEvent::StartupPreference { enabled, error } => {
                 self.start_at_login = *enabled;
@@ -384,6 +389,8 @@ impl UiState {
                 self.retrobat_setup_detail = Some(detail.clone());
                 self.retrobat_setup_error = error.clone();
                 if *running {
+                    // A new setup attempt supersedes earlier messages.
+                    self.installer_error = None;
                     self.foreign_root = None;
                     self.foreign_entries.clear();
                     self.foreign_removal = None;
@@ -399,8 +406,22 @@ impl UiState {
                 error,
             } => {
                 let changed = self.integration != *mode;
+                let root_changed = self.retrobat_root != *retrobat_root;
                 self.integration = *mode;
                 self.retrobat_root = retrobat_root.clone();
+                if error.is_none() && retrobat_root.is_some() {
+                    // A usable installation is selected: the installer's
+                    // download/launch problems no longer apply.
+                    self.installer_error = None;
+                }
+                if root_changed {
+                    // Results belong to the installation that produced them.
+                    self.retrobat_setup_error = None;
+                    self.retrobat_setup_detail = None;
+                    self.auxiliary_error = None;
+                    self.auxiliary_detail = None;
+                    self.auxiliary_summary = None;
+                }
                 self.integration_error = error.clone();
                 self.integration_notice = if error.is_none() && changed {
                     Some(match mode {
@@ -2186,7 +2207,7 @@ impl Worker {
                     self.refresh_save_sync();
                 } else {
                     self.log(Level::Warn,"startup","Automatic mount did not complete; save sync remains stopped. Open RomMFS to inspect the error.");
-                    self.sink.emit(AppEvent::StartupPreference { enabled:preferences.start_at_login,error:Some("Automatic mount did not complete. Start the mount before resuming save sync.".into()) });
+                    self.sink.emit(AppEvent::StartupPreference { enabled:preferences.start_at_login,error:Some("The games folder did not start automatically. Start it before resuming save sync.".into()) });
                 }
             }
             Ok(())
@@ -2485,7 +2506,10 @@ impl Worker {
             error: None,
         });
         let result = (|| -> anyhow::Result<Vec<String>> {
-            anyhow::ensure!(self.mount.is_none(), "stop the mount before RetroBat setup");
+            anyhow::ensure!(
+                self.mount.is_none(),
+                "stop the games folder before RetroBat setup"
+            );
             anyhow::ensure!(
                 installation.is_absolute() && managed_root.is_absolute(),
                 "choose absolute RetroBat and managed ROM folder paths"
@@ -2583,7 +2607,7 @@ impl Worker {
         let result: Result<()> = (|| {
             if self.mount.is_some() {
                 return Err(Error::Unsupported(
-                    "stop the mount before changing its layout".into(),
+                    "stop the games folder before changing the layout".into(),
                 ));
             }
             let preferences = self.preferences.as_mut().ok_or_else(|| {
@@ -2924,7 +2948,8 @@ impl Worker {
                 "wait for auxiliary downloads",
                 path,
                 &Error::Unsupported(
-                    "Finish or cancel auxiliary materialization before mounting".into(),
+                    "Finish or cancel the support file install before starting the games folder"
+                        .into(),
                 ),
             );
             return;

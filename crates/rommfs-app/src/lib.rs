@@ -5,6 +5,7 @@ pub mod controller;
 mod desktop;
 #[cfg(windows)]
 mod icon;
+pub mod problem;
 mod save_sync_agent;
 #[cfg(windows)]
 mod save_sync_native;

@@ -173,7 +173,12 @@ fn duplicate_auxiliary_destinations_dedupe_or_skip_instead_of_failing() {
     assert_eq!(fs::read(install.join("bios/bios.bin")).unwrap(), b"keys");
     assert_eq!(fs::read(install.join("bios/other.bin")).unwrap(), b"go");
     assert!(!install.join("bios/conflict.bin").exists());
-    let warnings = report.warnings.join("\n");
+    let warnings = report
+        .warnings
+        .iter()
+        .map(|w| w.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(warnings.contains("conflict.bin"), "{warnings}");
     assert!(warnings.contains("bios.bin"), "{warnings}");
     assert_eq!(fx.count_requests("GET", "/api/firmware/3/content/"), 0);
@@ -239,7 +244,7 @@ fn duplicate_firmware_requires_equal_downloaded_content_not_size_or_timestamp() 
             assert!(report
                 .warnings
                 .iter()
-                .any(|w| w.contains("Conflicting auxiliary contents")));
+                .any(|w| w.message.contains("Conflicting auxiliary contents")));
         }
         assert_eq!(fx.count_requests("GET", "/api/firmware/2/content/"), 1);
     }
