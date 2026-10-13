@@ -1,4 +1,4 @@
-use crate::catalog::{Catalogue, RomEntry, RomKey};
+use crate::catalogue::{Catalogue, RomEntry, RomKey};
 use crate::error::{Error, Result};
 use crate::sanitize::sanitize_component;
 use std::collections::{HashMap, HashSet};
@@ -256,7 +256,7 @@ pub(crate) fn validate_mapping_path(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::build_catalogue;
+    use crate::catalogue::build_catalogue;
     use crate::romm::{PlatformDto, RomDto, RomFileDto};
 
     fn platform(slug: &str) -> PlatformDto {

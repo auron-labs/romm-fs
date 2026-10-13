@@ -6,15 +6,15 @@ use super::*;
 #[test]
 fn connect_success_shows_connected_and_catalogue_counts() {
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::Connecting);
-    assert_eq!(ui.conn, ConnState::Connecting);
+    ui.apply_event(&AppEvent::Connecting);
+    assert_eq!(ui.conn, ConnectionState::Connecting);
     assert!(ui.conn_error.is_none());
 
-    ui.apply(&AppEvent::Connected);
-    assert_eq!(ui.conn, ConnState::Connected);
+    ui.apply_event(&AppEvent::Connected);
+    assert_eq!(ui.conn, ConnectionState::Connected);
 
-    ui.apply(&AppEvent::CatalogueLoading);
-    ui.apply(&AppEvent::CatalogueLoaded {
+    ui.apply_event(&AppEvent::CatalogueLoading);
+    ui.apply_event(&AppEvent::CatalogueLoaded {
         platforms: 2,
         roms: 5,
         skipped_unsupported: 1,
@@ -28,21 +28,21 @@ fn connect_success_shows_connected_and_catalogue_counts() {
 #[test]
 fn auth_failure_shows_signin_required_not_connected() {
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::Connecting);
-    ui.apply(&AppEvent::SignInRequired { reason: None });
-    assert_eq!(ui.conn, ConnState::SignInRequired);
-    assert_ne!(ui.conn, ConnState::Connected);
+    ui.apply_event(&AppEvent::Connecting);
+    ui.apply_event(&AppEvent::SignInRequired { reason: None });
+    assert_eq!(ui.conn, ConnectionState::SignInRequired);
+    assert_ne!(ui.conn, ConnectionState::Connected);
 
     let err = ui.conn_error.expect("an error explanation is visible");
     assert!(err.contains("sign-in"), "unexpected error text: {err}");
 
     // And a non-auth connect failure shows its own reason.
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::Connecting);
-    ui.apply(&AppEvent::ConnectFailed {
+    ui.apply_event(&AppEvent::Connecting);
+    ui.apply_event(&AppEvent::ConnectFailed {
         reason: "transport error: refused".into(),
     });
-    assert_eq!(ui.conn, ConnState::Failed);
+    assert_eq!(ui.conn, ConnectionState::Failed);
     assert_eq!(ui.conn_error.as_deref(), Some("transport error: refused"));
 }
 
@@ -51,13 +51,13 @@ fn auth_failure_shows_signin_required_not_connected() {
 #[test]
 fn catalogue_failure_keeps_error_visible() {
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::Connecting);
-    ui.apply(&AppEvent::Connected);
-    ui.apply(&AppEvent::CatalogueLoading);
-    ui.apply(&AppEvent::CatalogueFailed {
+    ui.apply_event(&AppEvent::Connecting);
+    ui.apply_event(&AppEvent::Connected);
+    ui.apply_event(&AppEvent::CatalogueLoading);
+    ui.apply_event(&AppEvent::CatalogueFailed {
         reason: "server error 500".into(),
     });
-    assert_eq!(ui.conn, ConnState::Connected);
+    assert_eq!(ui.conn, ConnectionState::Connected);
     assert_eq!(ui.conn_error.as_deref(), Some("server error 500"));
     assert!(ui.catalogue.is_none(), "failed catalogue shows no counts");
 }
@@ -81,13 +81,13 @@ fn reconnect_clears_previous_session_state() {
             total: Some(10),
         },
     ] {
-        ui.apply(&ev);
+        ui.apply_event(&ev);
     }
-    ui.apply(&AppEvent::Connecting);
+    ui.apply_event(&AppEvent::Connecting);
     assert!(ui.catalogue.is_none());
     assert!(ui.downloads.is_empty());
     assert!(ui.conn_error.is_none());
-    assert_eq!(ui.conn, ConnState::Connecting);
+    assert_eq!(ui.conn, ConnectionState::Connecting);
 }
 
 /// Mount start/stop transitions land on the states the window renders.
@@ -96,23 +96,23 @@ fn mount_start_stop_transitions() {
     let mut ui = UiState::new(64);
     let path = "C:\\RomM".to_string();
 
-    ui.apply(&AppEvent::MountStarting { path: path.clone() });
+    ui.apply_event(&AppEvent::MountStarting { path: path.clone() });
     assert_eq!(ui.mount, MountState::Mounting);
     assert_eq!(ui.mount_path.as_deref(), Some(path.as_str()));
 
-    ui.apply(&AppEvent::MountStarted { path: path.clone() });
+    ui.apply_event(&AppEvent::MountStarted { path: path.clone() });
     assert_eq!(ui.mount, MountState::Mounted);
     assert_eq!(ui.mount_path.as_deref(), Some(path.as_str()));
     assert!(ui.mount_error.is_none());
 
-    ui.apply(&AppEvent::MountStopping);
+    ui.apply_event(&AppEvent::MountStopping);
     assert_eq!(
         ui.mount,
         MountState::Mounted,
         "still mounted while stopping"
     );
 
-    ui.apply(&AppEvent::MountStopped);
+    ui.apply_event(&AppEvent::MountStopped);
     assert_eq!(ui.mount, MountState::NotMounted);
 }
 
@@ -133,10 +133,10 @@ fn mount_request_is_pending_immediately() {
 #[test]
 fn mount_failure_never_shows_mounted_and_recovers() {
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::MountStarting {
+    ui.apply_event(&AppEvent::MountStarting {
         path: "C:\\RomM".into(),
     });
-    ui.apply(&AppEvent::MountFailed {
+    ui.apply_event(&AppEvent::MountFailed {
         reason: "root not empty".into(),
     });
     assert_eq!(ui.mount, MountState::Failed);
@@ -144,12 +144,12 @@ fn mount_failure_never_shows_mounted_and_recovers() {
     assert_eq!(ui.mount_error.as_deref(), Some("root not empty"));
 
     // A later successful attempt recovers cleanly.
-    ui.apply(&AppEvent::MountStarting {
+    ui.apply_event(&AppEvent::MountStarting {
         path: "C:\\RomM".into(),
     });
     assert_eq!(ui.mount, MountState::Mounting);
     assert!(ui.mount_error.is_none(), "retry clears the old error");
-    ui.apply(&AppEvent::MountStarted {
+    ui.apply_event(&AppEvent::MountStarted {
         path: "C:\\RomM".into(),
     });
     assert_eq!(ui.mount, MountState::Mounted);
@@ -160,25 +160,25 @@ fn mount_failure_never_shows_mounted_and_recovers() {
 #[test]
 fn stop_mount_marks_inflight_downloads_failed() {
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::DownloadStarted {
+    ui.apply_event(&AppEvent::DownloadStarted {
         file_id: 1,
         rom_id: 9,
         file_name: "g.gb".into(),
         total: Some(64),
     });
-    ui.apply(&AppEvent::DownloadStarted {
+    ui.apply_event(&AppEvent::DownloadStarted {
         file_id: 1,
         rom_id: 10,
         file_name: "h.gb".into(),
         total: Some(64),
     });
-    ui.apply(&AppEvent::DownloadFinished {
+    ui.apply_event(&AppEvent::DownloadFinished {
         file_id: 1,
         rom_id: 10,
         file_name: "h.gb".into(),
     });
-    ui.apply(&AppEvent::MountStopping);
-    ui.apply(&AppEvent::MountStopped);
+    ui.apply_event(&AppEvent::MountStopping);
+    ui.apply_event(&AppEvent::MountStopped);
 
     let inflight = ui.downloads.iter().find(|d| d.rom_id == 9).unwrap();
     assert_eq!(
@@ -196,7 +196,7 @@ fn stop_mount_marks_inflight_downloads_failed() {
 #[test]
 fn download_events_drive_progress_and_terminal_state() {
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::DownloadStarted {
+    ui.apply_event(&AppEvent::DownloadStarted {
         file_id: 1,
         rom_id: 7,
         file_name: "a.nes".into(),
@@ -211,7 +211,7 @@ fn download_events_drive_progress_and_terminal_state() {
         assert!(d.finished.is_none());
     }
 
-    ui.apply(&AppEvent::DownloadProgress {
+    ui.apply_event(&AppEvent::DownloadProgress {
         file_id: 1,
         rom_id: 7,
         received: 40,
@@ -219,7 +219,7 @@ fn download_events_drive_progress_and_terminal_state() {
     });
     assert_eq!(ui.downloads[0].received, 40);
 
-    ui.apply(&AppEvent::DownloadFinished {
+    ui.apply_event(&AppEvent::DownloadFinished {
         file_id: 1,
         rom_id: 7,
         file_name: "a.nes".into(),
@@ -231,19 +231,19 @@ fn download_events_drive_progress_and_terminal_state() {
 #[test]
 fn download_failure_is_terminal_and_retryable() {
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::DownloadStarted {
+    ui.apply_event(&AppEvent::DownloadStarted {
         file_id: 1,
         rom_id: 8,
         file_name: "b.sfc".into(),
         total: None,
     });
-    ui.apply(&AppEvent::DownloadProgress {
+    ui.apply_event(&AppEvent::DownloadProgress {
         file_id: 1,
         rom_id: 8,
         received: 12,
         total: None,
     });
-    ui.apply(&AppEvent::DownloadFailed {
+    ui.apply_event(&AppEvent::DownloadFailed {
         file_id: 1,
         rom_id: 8,
         file_name: "b.sfc".into(),
@@ -254,7 +254,7 @@ fn download_failure_is_terminal_and_retryable() {
     assert_eq!(d.received, 12, "progress at failure stays visible");
 
     // Retry replaces the terminal failure with a fresh in-flight row.
-    ui.apply(&AppEvent::DownloadStarted {
+    ui.apply_event(&AppEvent::DownloadStarted {
         file_id: 1,
         rom_id: 8,
         file_name: "b.sfc".into(),
@@ -270,13 +270,13 @@ fn download_failure_is_terminal_and_retryable() {
 #[test]
 fn download_without_total_stays_indeterminate() {
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::DownloadStarted {
+    ui.apply_event(&AppEvent::DownloadStarted {
         file_id: 1,
         rom_id: 5,
         file_name: "m.bin".into(),
         total: None,
     });
-    ui.apply(&AppEvent::DownloadProgress {
+    ui.apply_event(&AppEvent::DownloadProgress {
         file_id: 1,
         rom_id: 5,
         received: 1024,
@@ -293,7 +293,7 @@ fn download_without_total_stays_indeterminate() {
 fn log_buffer_caps_at_limit_newest_last() {
     let mut ui = UiState::new(20);
     for i in 0..30 {
-        ui.apply(&log(&format!("line {i}")));
+        ui.apply_event(&log(&format!("line {i}")));
     }
     let messages: Vec<&str> = ui.log.lines().map(|l| l.message.as_str()).collect();
     assert_eq!(messages.len(), 20);
@@ -306,11 +306,11 @@ fn log_buffer_caps_at_limit_newest_last() {
 #[test]
 fn evict_events_land_in_log() {
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::Evicted {
+    ui.apply_event(&AppEvent::Evicted {
         rom_id: 3,
         file_name: "old.nes".into(),
     });
-    ui.apply(&AppEvent::EvictFailed {
+    ui.apply_event(&AppEvent::EvictFailed {
         rom_id: 4,
         reason: "deferred".into(),
     });
@@ -323,14 +323,14 @@ fn evict_events_land_in_log() {
 fn file_id_separates_transfers_and_history_never_prunes_active_or_failed_rows() {
     let mut ui = UiState::new(32);
     for file_id in 1..=150 {
-        ui.apply(&AppEvent::DownloadStarted {
+        ui.apply_event(&AppEvent::DownloadStarted {
             rom_id: 7,
             file_id,
             file_name: format!("file{file_id}.nsp"),
             total: Some(10),
         });
     }
-    ui.apply(&AppEvent::DownloadProgress {
+    ui.apply_event(&AppEvent::DownloadProgress {
         rom_id: 7,
         file_id: 2,
         received: 5,
@@ -354,13 +354,13 @@ fn file_id_separates_transfers_and_history_never_prunes_active_or_failed_rows() 
         5
     );
     for file_id in 151..=300 {
-        ui.apply(&AppEvent::DownloadFinished {
+        ui.apply_event(&AppEvent::DownloadFinished {
             rom_id: 7,
             file_id,
             file_name: format!("file{file_id}.nsp"),
         });
     }
-    ui.apply(&AppEvent::DownloadFailed {
+    ui.apply_event(&AppEvent::DownloadFailed {
         rom_id: 7,
         file_id: 301,
         file_name: "failed.nsp".into(),

@@ -1,5 +1,5 @@
 //! Portable measurement only; this cannot predict Windows mount latency.
-use rommfs_core::catalog::build_catalogue;
+use rommfs_core::catalogue::build_catalogue;
 use rommfs_core::romm::RommClient;
 use rommfs_fixture::{contract, FixtureServer, ResponseSpec};
 use std::time::Instant;
@@ -54,9 +54,9 @@ fn observed_library_shape_fetches_each_page_once_without_rom_bodies() {
     eprintln!("observed-shape fixture: platforms=25 ROMs=2448 pages=13 HTTP={fetch_time:?} projection={:?}",projection_started.elapsed());
     assert_eq!(catalogue.platforms.len(), 25);
     assert_eq!(catalogue.entries.len(), 2448);
-    assert_eq!(server.count_requests("GET", "/api/platforms"), 1);
-    assert_eq!(server.count_requests("GET", "/api/roms?"), 13);
-    assert_eq!(server.count_requests("GET", "/api/roms/"), 0);
+    assert_eq!(server.request_count("GET", "/api/platforms"), 1);
+    assert_eq!(server.request_count("GET", "/api/roms?"), 13);
+    assert_eq!(server.request_count("GET", "/api/roms/"), 0);
     let requests = server.requests();
     for page in 0..13 {
         let offset = format!("offset={}", page * 200);

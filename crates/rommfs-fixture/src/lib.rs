@@ -237,8 +237,8 @@ impl FixtureServer {
         self.on(method, path_prefix, ResponseSpec::Sequence(specs));
     }
 
-    /// Requests seen for (method, path prefix).
-    pub fn count(&self, method: &str, path_prefix: &str) -> usize {
+    /// Number of scripted route matches for (method, path prefix).
+    pub fn route_hit_count(&self, method: &str, path_prefix: &str) -> usize {
         self.state
             .counts
             .lock()
@@ -248,9 +248,9 @@ impl FixtureServer {
             .unwrap_or(0)
     }
 
-    /// Count captured requests by their actual wire target, independent of
-    /// the route prefix used to script a dynamic handler.
-    pub fn count_requests(&self, method: &str, path_prefix: &str) -> usize {
+    /// Number of captured wire requests matching (method, path prefix),
+    /// independent of the scripted route that handled them.
+    pub fn request_count(&self, method: &str, path_prefix: &str) -> usize {
         self.state
             .requests_seen
             .lock()

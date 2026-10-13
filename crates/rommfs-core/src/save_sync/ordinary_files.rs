@@ -2,7 +2,7 @@ use super::{
     file_slot, path_from_file_slot, portable_save_path, resolve_save_target, save_file_key,
     MappingReport, SaveMapping, SaveProfile,
 };
-use crate::catalog::Catalogue;
+use crate::catalogue::Catalogue;
 use crate::romm::{RemoteSave, RomDto};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};

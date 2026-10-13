@@ -2,7 +2,7 @@
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConnState {
+pub enum ConnectionState {
     Idle,
     Connecting,
     Connected,
@@ -214,7 +214,7 @@ pub struct UiState {
     pub frontend_metadata_detail: Option<String>,
     pub frontend_metadata_error: Option<String>,
     pub pairing_code: Option<String>,
-    pub conn: ConnState,
+    pub conn: ConnectionState,
     pub conn_error: Option<String>,
     pub mount: MountState,
     pub mount_path: Option<String>,
@@ -294,7 +294,7 @@ impl UiState {
             frontend_metadata_detail: None,
             frontend_metadata_error: None,
             pairing_code: None,
-            conn: ConnState::Idle,
+            conn: ConnectionState::Idle,
             conn_error: None,
             mount: MountState::NotMounted,
             mount_path: None,
@@ -343,7 +343,7 @@ impl UiState {
     }
 
     /// Apply one worker event. This is THE transition table the UI uses.
-    pub fn apply(&mut self, event: &AppEvent) {
+    pub fn apply_event(&mut self, event: &AppEvent) {
         match event {
             AppEvent::ForeignRootEntries {
                 root,
@@ -486,7 +486,7 @@ impl UiState {
                 }
             }
             AppEvent::SignedOut => {
-                self.conn = ConnState::Idle;
+                self.conn = ConnectionState::Idle;
                 self.conn_error = None;
                 self.catalogue = None;
                 self.catalogue_refreshed_at = None;
@@ -509,12 +509,12 @@ impl UiState {
             AppEvent::PairingEnded { reason } => {
                 self.pairing_code = None;
                 if let Some(reason) = reason {
-                    self.conn = ConnState::Failed;
+                    self.conn = ConnectionState::Failed;
                     self.conn_error = Some(reason.clone());
                 }
             }
             AppEvent::Connecting => {
-                self.conn = ConnState::Connecting;
+                self.conn = ConnectionState::Connecting;
                 self.conn_error = None;
                 // A new connection attempt supersedes any prior session's
                 // catalogue/downloads — never show stale data for a server
@@ -550,7 +550,7 @@ impl UiState {
                 self.save_sync_existing_saves = None;
             }
             AppEvent::Connected => {
-                self.conn = ConnState::Connected;
+                self.conn = ConnectionState::Connected;
                 self.conn_error = None;
                 // A failed mount attempt belongs to the previous connection;
                 // keep it from rendering as a stale banner after reconnect.
@@ -558,11 +558,11 @@ impl UiState {
                 self.mount_error = None;
             }
             AppEvent::ConnectFailed { reason } => {
-                self.conn = ConnState::Failed;
+                self.conn = ConnectionState::Failed;
                 self.conn_error = Some(reason.clone());
             }
             AppEvent::SignInRequired { reason } => {
-                self.conn = ConnState::SignInRequired;
+                self.conn = ConnectionState::SignInRequired;
                 self.conn_error = Some(
                     reason
                         .clone()
@@ -764,7 +764,7 @@ impl UiState {
             AppEvent::SaveSyncAuthenticationRequired { session_id } => {
                 if *session_id == self.save_sync_session_id {
                     self.save_sync_authentication_required = true;
-                    self.conn = ConnState::SignInRequired;
+                    self.conn = ConnectionState::SignInRequired;
                 }
             }
             AppEvent::SaveSyncQueueUpdated(status) => {
@@ -863,7 +863,7 @@ impl UiState {
     /// connect to the games folder → optional support files).
     pub fn retrobat_steps(&self) -> RetroBatSteps {
         let folder_running = matches!(self.mount, MountState::Mounted | MountState::Mounting);
-        let connected = self.conn == ConnState::Connected;
+        let connected = self.conn == ConnectionState::Connected;
         let install = if self.installer_running {
             StepStatus::Running
         } else if self.retrobat_root.is_some() {
@@ -968,10 +968,10 @@ impl UiState {
     /// files is not "up to date"; an unlinked-file count does not downgrade
     /// an otherwise healthy linked set.
     pub fn save_sync_summary(&self) -> SaveSyncSummary {
-        if self.conn == ConnState::SignInRequired || self.save_sync_authentication_required {
+        if self.conn == ConnectionState::SignInRequired || self.save_sync_authentication_required {
             return SaveSyncSummary::AuthRequired;
         }
-        if self.conn == ConnState::Failed {
+        if self.conn == ConnectionState::Failed {
             return SaveSyncSummary::Offline;
         }
         if !self.save_sync_enabled {

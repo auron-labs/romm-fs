@@ -3,7 +3,7 @@
 //! single-file rule, visible-name sanitization, per-dir collision handling,
 //! version fingerprints, and a deterministic inode plan.
 
-use rommfs_core::catalog::{build_catalogue, server_id_of, Catalogue, VersionKey};
+use rommfs_core::catalogue::{build_catalogue, server_id_of, Catalogue, VersionKey};
 use rommfs_core::romm::{PlatformDto, RomDto};
 use rommfs_fixture::contract;
 use serde_json::{json, Value};

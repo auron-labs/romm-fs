@@ -8,7 +8,7 @@ use super::{
     path_string, private_artifact_path, private_snapshot_path, scope_only_params, sqlite,
     SaveSyncJournal, SnapshotRecord, SnapshotState,
 };
-use crate::catalog::RomKey;
+use crate::catalogue::RomKey;
 use crate::error::{Error, Result};
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};

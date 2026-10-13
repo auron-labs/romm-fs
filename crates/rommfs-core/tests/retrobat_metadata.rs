@@ -1,4 +1,4 @@
-use rommfs_core::catalog::build_catalogue;
+use rommfs_core::catalogue::build_catalogue;
 use rommfs_core::retrobat::{generate_gamelists, MetadataIndex};
 use rommfs_core::romm::{PlatformDto, RomDto};
 use rommfs_fixture::contract;

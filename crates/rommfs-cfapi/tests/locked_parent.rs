@@ -9,10 +9,10 @@
 
 use rommfs_cfapi::{check_mount_root, claim_mount_root, RootCheck, WindowsMount};
 use rommfs_core::cache::{CacheIndex, Evictor, FakeClock, LiveState, NoopHydratedRemover};
-use rommfs_core::catalog::{build_catalogue, RomKey};
+use rommfs_core::catalogue::{build_catalogue, RomKey};
 use rommfs_core::download::{ContentSource, DownloadManager};
 use rommfs_core::error::Result;
-use rommfs_core::fscore::RommFs;
+use rommfs_core::filesystem::RommFs;
 use rommfs_core::tree::RommTree;
 use std::collections::HashMap;
 use std::io::Write;

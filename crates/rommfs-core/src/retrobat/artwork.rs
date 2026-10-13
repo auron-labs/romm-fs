@@ -1,4 +1,4 @@
-use crate::catalog::Catalogue;
+use crate::catalogue::Catalogue;
 use crate::romm::{RomDto, RommClient};
 use crate::save_sync::ensure_no_reparse_components;
 use crate::{Error, Result};

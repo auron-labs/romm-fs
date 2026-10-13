@@ -4,7 +4,7 @@
 //! counts and source call counters are the proof.
 
 use rommfs_core::cache::{CacheIndex, LiveState};
-use rommfs_core::catalog::{RomEntry, RomKey, VersionKey};
+use rommfs_core::catalogue::{RomEntry, RomKey, VersionKey};
 use rommfs_core::download::{ContentSource, DownloadManager};
 use rommfs_core::error::{Error, Result};
 use rommfs_core::events::{channel, AppEvent};
@@ -408,10 +408,10 @@ fn real_client_fetches_through_the_content_source_impl() {
 
     let path = dm.ensure_ready(&e).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), BYTES);
-    assert_eq!(fx.count_requests("GET", "/api/roms/7/content/"), 0);
+    assert_eq!(fx.request_count("GET", "/api/roms/7/content/"), 0);
     dm.ensure_ready(&e).unwrap();
     assert_eq!(
-        fx.count("GET", "/api/roms/70/files/content/70"),
+        fx.route_hit_count("GET", "/api/roms/70/files/content/70"),
         1,
         "second ensure_ready must not request content again"
     );

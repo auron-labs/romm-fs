@@ -3,7 +3,7 @@
 //! lookup, stable inodes, and cookie-paged `read_dir` that neither loses
 //! nor duplicates entries.
 
-use rommfs_core::catalog::build_catalogue;
+use rommfs_core::catalogue::build_catalogue;
 use rommfs_core::romm::{PlatformDto, RomDto};
 use rommfs_core::tree::{EntryKind, RommTree, ROOT_INODE};
 use rommfs_fixture::contract;

@@ -16,7 +16,7 @@ impl RommfsWindow {
     fn render_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (conn_text, conn_kind) = self.conn_status(cx);
         let (sync_text, sync_kind) = self.save_sync_status();
-        let needs_sign_in = self.state.conn == ConnState::SignInRequired;
+        let needs_sign_in = self.state.conn == ConnectionState::SignInRequired;
         // §3: the connection block appears only for a live problem or
         // when sign-in is needed — a healthy connection adds no section.
         let show_connection = needs_sign_in || self.state.conn_error.is_some();

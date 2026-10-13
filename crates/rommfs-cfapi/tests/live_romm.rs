@@ -18,9 +18,9 @@
 use rommfs_cfapi::{check_mount_root, claim_mount_root, WindowsHydratedRemover, WindowsMount};
 use rommfs_core::cache::clock::DEFAULT_EVICTION_THRESHOLD_SECS;
 use rommfs_core::cache::{CacheIndex, Evictor, LiveState, SystemClock};
-use rommfs_core::catalog::{build_catalogue, server_id_of, RomKey};
+use rommfs_core::catalogue::{build_catalogue, server_id_of, RomKey};
 use rommfs_core::download::DownloadManager;
-use rommfs_core::fscore::RommFs;
+use rommfs_core::filesystem::RommFs;
 use rommfs_core::romm::{Credentials, RommClient};
 use rommfs_core::tree::RommTree;
 use std::collections::HashMap;

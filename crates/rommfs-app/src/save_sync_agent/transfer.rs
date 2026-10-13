@@ -43,11 +43,11 @@ pub(super) enum TransferUpdate {
         network_paused: bool,
     },
     Reconciled {
-        key: rommfs_core::catalog::RomKey,
+        key: rommfs_core::catalogue::RomKey,
         result: std::result::Result<IncomingInventory, SaveApiFailure>,
     },
     ReconciliationRetry {
-        key: rommfs_core::catalog::RomKey,
+        key: rommfs_core::catalogue::RomKey,
         message: String,
     },
 }

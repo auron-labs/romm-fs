@@ -1,6 +1,7 @@
 agent:
     - opencode
     - codex
+    - claude
 scope: project
 skills:
     - source: https://github.com/jeffallan/claude-skills

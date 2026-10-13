@@ -22,14 +22,14 @@ not current behavior.
 - RomM authentication, paging, DTOs, or routes: `crates/rommfs-core/src/romm/`,
   `crates/rommfs-core/tests/romm_client.rs`, `crates/rommfs-core/tests/pairing.rs`, and
   `docs/contracts/romm-api.md`.
-- Catalogue projection, filenames, supported layouts: `crates/rommfs-core/src/catalog.rs`,
+- Catalogue projection, filenames, supported layouts: `crates/rommfs-core/src/catalogue.rs`,
   `crates/rommfs-core/src/layout.rs`, `crates/rommfs-core/src/tree.rs`, and
   `crates/rommfs-core/tests/catalogue.rs`,
   `crates/rommfs-core/tests/catalogue_observed_shape.rs`, and
   `crates/rommfs-core/tests/tree.rs`.
 - Mount ownership, placeholder behavior, hydration, or eviction:
-  `crates/rommfs-cfapi/src/root.rs`, `crates/rommfs-cfapi/src/imp.rs`, `crates/rommfs-core/src/fscore.rs`,
-  `crates/rommfs-core/src/cache/`, `crates/rommfs-core/tests/fscore.rs`, and
+  `crates/rommfs-cfapi/src/root.rs`, `crates/rommfs-cfapi/src/windows.rs`, `crates/rommfs-core/src/filesystem.rs`,
+  `crates/rommfs-core/src/cache/`, `crates/rommfs-core/tests/filesystem.rs`, and
   `crates/rommfs-cfapi/tests/cfapi_native.rs` (Windows).
 - Controller state, connection, catalogue refresh, mounting, or setup:
   `crates/rommfs-app/src/controller.rs` dispatches to focused modules in
@@ -48,17 +48,18 @@ not current behavior.
   `crates/rommfs-core/src/save_sync/retrobat_paths.rs` and
   `crates/rommfs-core/src/save_sync/legacy_gb_profile.rs`.
 - RetroBat install, links, metadata, artwork, or auxiliary files:
-  `crates/rommfs-core/src/retrobat/`, relevant controller methods, and RetroBat integration
-  tests in `crates/rommfs-core/tests/retrobat_setup.rs`,
+  `crates/rommfs-core/src/retrobat/`, `crates/rommfs-app/src/retrobat_discovery_windows.rs`,
+  relevant controller methods, and RetroBat integration tests in `crates/rommfs-core/tests/retrobat_setup.rs`,
   `crates/rommfs-core/tests/retrobat_metadata.rs`, and
   `crates/rommfs-core/tests/retrobat_artwork.rs`. Check the API contract for
   server-side assumptions.
-- Window layout or page behavior: `crates/rommfs-app/src/window.rs`, `crates/rommfs-app/src/window/pages.rs`,
+- Window layout or page behavior: `crates/rommfs-app/src/window.rs`, `crates/rommfs-app/src/window/actions.rs`,
+  `crates/rommfs-app/src/window/folder_controls.rs`, `crates/rommfs-app/src/window/pages.rs`,
   and `crates/rommfs-app/src/window/pages/`;
   follow the GPUI Kit guides before changing GPUI state or visual structure.
 - Fixture routes or request assertions: `crates/rommfs-fixture/src/lib.rs` and
-  the consuming integration test. Prefer route-specific counters where the
-  assertion needs to distinguish scripted responses from wire requests.
+  the consuming integration test. Use `route_hit_count` for scripted route
+  matches and `request_count` for captured wire requests.
 
 ## Editing and verification
 

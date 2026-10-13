@@ -115,8 +115,8 @@ fn token_platforms_roms_download_flow_is_byte_exact() {
         fx.auth_headers("GET", "/api/roms/"),
         vec![Some("Bearer fixture-access-token".to_string())]
     );
-    assert_eq!(fx.count("GET", "/api/platforms"), 1);
-    assert_eq!(fx.count("GET", "/api/roms?"), 1);
+    assert_eq!(fx.route_hit_count("GET", "/api/platforms"), 1);
+    assert_eq!(fx.route_hit_count("GET", "/api/roms?"), 1);
 }
 
 #[test]
@@ -155,11 +155,20 @@ fn all_roms_pages_exactly_until_total() {
 
     let all = client.all_roms().unwrap();
     assert_eq!(all.len(), 450);
-    assert_eq!(fx.count("GET", "/api/roms?limit=200&offset=0&"), 1);
-    assert_eq!(fx.count("GET", "/api/roms?limit=200&offset=200&"), 1);
-    assert_eq!(fx.count("GET", "/api/roms?limit=200&offset=400&"), 1);
+    assert_eq!(
+        fx.route_hit_count("GET", "/api/roms?limit=200&offset=0&"),
+        1
+    );
+    assert_eq!(
+        fx.route_hit_count("GET", "/api/roms?limit=200&offset=200&"),
+        1
+    );
+    assert_eq!(
+        fx.route_hit_count("GET", "/api/roms?limit=200&offset=400&"),
+        1
+    );
     // No request beyond the expected pages.
-    assert_eq!(fx.count("GET", "/api/roms?"), 0);
+    assert_eq!(fx.route_hit_count("GET", "/api/roms?"), 0);
 }
 
 #[test]
@@ -181,7 +190,7 @@ fn listing_never_requests_rom_bodies() {
     client.roms_page(200, 0).unwrap();
 
     // Not a single content request was made while listing.
-    assert_eq!(fx.count("GET", "/api/roms/"), 0);
+    assert_eq!(fx.route_hit_count("GET", "/api/roms/"), 0);
 }
 
 #[test]
@@ -302,7 +311,7 @@ fn stalled_authentication_and_catalogue_responses_are_bounded() {
         matches!(auth_error, Error::Transport(_)),
         "got {auth_error:?}"
     );
-    assert_eq!(auth_fx.count("POST", "/api/token"), 1);
+    assert_eq!(auth_fx.route_hit_count("POST", "/api/token"), 1);
 
     let catalogue_fx = contract_server(vec![], 0);
     let catalogue_client = authed(&catalogue_fx).with_metadata_config(metadata);
@@ -312,7 +321,7 @@ fn stalled_authentication_and_catalogue_responses_are_bounded() {
         matches!(catalogue_error, Error::Transport(_)),
         "got {catalogue_error:?}"
     );
-    assert_eq!(catalogue_fx.count("GET", "/api/platforms"), 1);
+    assert_eq!(catalogue_fx.route_hit_count("GET", "/api/platforms"), 1);
 }
 
 #[test]

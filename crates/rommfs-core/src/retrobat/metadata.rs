@@ -1,4 +1,4 @@
-use crate::catalog::Catalogue;
+use crate::catalogue::Catalogue;
 use crate::romm::RomDto;
 use anyhow::Context;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};

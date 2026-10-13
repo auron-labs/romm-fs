@@ -1,7 +1,7 @@
 use rommfs_cfapi::{
     check_mount_root, claim_mount_root, publish_frontend_metadata, read_frontend_metadata,
 };
-use rommfs_core::catalog::build_catalogue;
+use rommfs_core::catalogue::build_catalogue;
 use rommfs_core::retrobat::{generate_gamelists, MetadataIndex};
 use rommfs_core::romm::{PlatformDto, RomDto};
 use rommfs_fixture::contract;

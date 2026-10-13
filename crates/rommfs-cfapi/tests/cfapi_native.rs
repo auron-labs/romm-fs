@@ -17,9 +17,9 @@ use rommfs_cfapi::{
 };
 use rommfs_core::cache::clock::{Clock, DEFAULT_EVICTION_THRESHOLD_SECS};
 use rommfs_core::cache::{CacheIndex, Evictor, FakeClock, LiveState};
-use rommfs_core::catalog::{build_catalogue, server_id_of, RomKey};
+use rommfs_core::catalogue::{build_catalogue, server_id_of, RomKey};
 use rommfs_core::download::DownloadManager;
-use rommfs_core::fscore::RommFs;
+use rommfs_core::filesystem::RommFs;
 use rommfs_core::retrobat::{generate_gamelists, MetadataIndex};
 use rommfs_core::romm::{Credentials, RommClient};
 use rommfs_core::tree::RommTree;
@@ -221,14 +221,14 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     assert!(!meta.is_dir());
     assert_eq!(meta.len(), bytes.len() as u64);
     assert_eq!(
-        server.count("GET", "/api/roms/"),
+        server.route_hit_count("GET", "/api/roms/"),
         0,
         "listing/stat must not request ROM content"
     );
 
     assert_read_only(&root, &rom_path);
     assert_eq!(
-        server.count("GET", "/api/roms/"),
+        server.route_hit_count("GET", "/api/roms/"),
         0,
         "failed mutations must not download content"
     );
@@ -267,14 +267,14 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     assert!(std::fs::read_to_string(&gamelist)
         .unwrap()
         .contains("<playcount>7</playcount>"));
-    assert_eq!(server.count("GET", "/api/roms/"), 0);
+    assert_eq!(server.route_hit_count("GET", "/api/roms/"), 0);
     assert_read_only(&root, &rom_path);
 
     // --- first content read: one download, byte-exact ---
     let got = std::fs::read(&rom_path).expect("first read");
     assert_eq!(got, bytes, "first read must return exact fixture bytes");
     assert_eq!(
-        server.count("GET", "/api/roms/"),
+        server.route_hit_count("GET", "/api/roms/"),
         1,
         "first read performs exactly one content download"
     );
@@ -296,7 +296,7 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     assert_eq!(tail, bytes[bytes.len() - 12..]);
     drop(file);
     assert_eq!(
-        server.count("GET", "/api/roms/"),
+        server.route_hit_count("GET", "/api/roms/"),
         1,
         "warm reads must be served without another download"
     );
@@ -328,7 +328,7 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
         Duration::from_secs(5),
         "warm external open to refresh last use",
     );
-    assert_eq!(server.count("GET", "/api/roms/"), 1);
+    assert_eq!(server.route_hit_count("GET", "/api/roms/"), 1);
 
     // Multiple simultaneous handles protect the same entry from eviction.
     let first = std::fs::File::open(&rom_path).unwrap();
@@ -346,7 +346,7 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     assert!(rom_path.exists(), "eviction keeps the catalogue entry");
     assert_eq!(std::fs::read(&rom_path).unwrap(), bytes);
     assert_eq!(
-        server.count("GET", "/api/roms/"),
+        server.route_hit_count("GET", "/api/roms/"),
         2,
         "evicted bytes must download again"
     );
@@ -376,7 +376,7 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
         },
     );
     assert_eq!(std::fs::read(&rom_path).unwrap(), bytes);
-    assert_eq!(server.count("GET", "/api/roms/"), 4);
+    assert_eq!(server.route_hit_count("GET", "/api/roms/"), 4);
 
     mount.stop();
     assert!(
@@ -415,7 +415,7 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
         .contains("<playcount>7</playcount>"));
     assert_eq!(std::fs::read(&rom_path).unwrap(), bytes);
     assert_eq!(
-        server.count("GET", "/api/roms/"),
+        server.route_hit_count("GET", "/api/roms/"),
         4,
         "remount uses the private cache"
     );

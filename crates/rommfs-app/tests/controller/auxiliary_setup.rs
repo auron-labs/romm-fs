@@ -7,7 +7,7 @@ use super::*;
 fn auxiliary_status_stays_separate_from_retrobat_setup() {
     let mut ui = UiState::new(64);
     ui.retrobat_setup_running = true;
-    ui.apply(&AppEvent::AuxiliaryStatus {
+    ui.apply_event(&AppEvent::AuxiliaryStatus {
         running: true,
         detail: "downloading keys".into(),
         error: None,
@@ -19,7 +19,7 @@ fn auxiliary_status_stays_separate_from_retrobat_setup() {
     // The RetroBat flag the caller left set is untouched either way.
     assert!(ui.retrobat_setup_running);
 
-    ui.apply(&AppEvent::AuxiliaryStatus {
+    ui.apply_event(&AppEvent::AuxiliaryStatus {
         running: false,
         detail: "done".into(),
         error: Some("network".into()),
@@ -34,7 +34,7 @@ fn auxiliary_status_stays_separate_from_retrobat_setup() {
 fn selecting_an_installation_clears_stale_installer_and_setup_state() {
     use rommfs_core::connection_settings::IntegrationMode;
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::RetroBatInstaller {
+    ui.apply_event(&AppEvent::RetroBatInstaller {
         running: false,
         ready: true,
         received: 0,
@@ -42,12 +42,12 @@ fn selecting_an_installation_clears_stale_installer_and_setup_state() {
         detail: "ready".into(),
         error: Some("Windows needs permission (os error 740)".into()),
     });
-    ui.apply(&AppEvent::RetroBatSetup {
+    ui.apply_event(&AppEvent::RetroBatSetup {
         running: false,
         detail: "failed".into(),
         error: Some("link failed".into()),
     });
-    ui.apply(&AppEvent::AuxiliaryStatus {
+    ui.apply_event(&AppEvent::AuxiliaryStatus {
         running: false,
         detail: "failed".into(),
         error: Some("nope".into()),
@@ -55,7 +55,7 @@ fn selecting_an_installation_clears_stale_installer_and_setup_state() {
     });
     // Selecting an installation drops the installer error and, because the
     // installation changed, the results of the previous one.
-    ui.apply(&AppEvent::IntegrationUpdated {
+    ui.apply_event(&AppEvent::IntegrationUpdated {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
@@ -66,12 +66,12 @@ fn selecting_an_installation_clears_stale_installer_and_setup_state() {
     assert!(ui.auxiliary_error.is_none() && ui.auxiliary_detail.is_none());
 
     // A failure for this installation survives re-applying the same selection.
-    ui.apply(&AppEvent::RetroBatSetup {
+    ui.apply_event(&AppEvent::RetroBatSetup {
         running: false,
         detail: "failed".into(),
         error: Some("link failed".into()),
     });
-    ui.apply(&AppEvent::IntegrationUpdated {
+    ui.apply_event(&AppEvent::IntegrationUpdated {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
@@ -81,7 +81,7 @@ fn selecting_an_installation_clears_stale_installer_and_setup_state() {
 
     // Restarting setup clears any installer error and the previous setup error.
     ui.installer_error = Some("again".into());
-    ui.apply(&AppEvent::RetroBatSetup {
+    ui.apply_event(&AppEvent::RetroBatSetup {
         running: true,
         detail: "working".into(),
         error: None,
@@ -93,7 +93,7 @@ fn selecting_an_installation_clears_stale_installer_and_setup_state() {
 fn auxiliary_summary_carries_structured_notes_and_restart_clears_it() {
     use rommfs_core::events::{AuxiliarySummary, AuxiliaryWarning, AuxiliaryWarningKind};
     let mut ui = UiState::new(64);
-    ui.apply(&AppEvent::AuxiliaryStatus {
+    ui.apply_event(&AppEvent::AuxiliaryStatus {
         running: false,
         detail: "done".into(),
         error: None,
@@ -113,7 +113,7 @@ fn auxiliary_summary_carries_structured_notes_and_restart_clears_it() {
         AuxiliaryWarningKind::MissingOnServer
     );
     assert!(ui.auxiliary_error.is_none());
-    ui.apply(&AppEvent::AuxiliaryStatus {
+    ui.apply_event(&AppEvent::AuxiliaryStatus {
         running: true,
         detail: "again".into(),
         error: None,

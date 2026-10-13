@@ -49,7 +49,7 @@ fn real_filesystem_notification_drives_the_agent_without_waiting_for_fallback_sc
         message.contains("verified upload revision")
     })
     .is_some());
-    let initial_posts = fixture.count_requests("POST", "/api/saves?rom_id=7&slot=");
+    let initial_posts = fixture.request_count("POST", "/api/saves?rom_id=7&slot=");
     assert_eq!(initial_posts, 1);
 
     fs::write(&case.mapping.target_path, NEXT_SAVE).unwrap();
@@ -60,7 +60,7 @@ fn real_filesystem_notification_drives_the_agent_without_waiting_for_fallback_sc
     agent.stop();
 
     assert_eq!(
-        fixture.count_requests("POST", "/api/saves?rom_id=7&slot="),
+        fixture.request_count("POST", "/api/saves?rom_id=7&slot="),
         2
     );
     assert_eq!(fixture.saved_saves()[1].bytes, NEXT_SAVE);
@@ -78,8 +78,11 @@ fn disabled_consent_does_not_start_watch_or_offer_a_durable_revision() {
 
     let (snapshot, _) = snapshot_after_stop(&case);
     assert_eq!(snapshot.state, SnapshotState::Ready);
-    assert_eq!(fixture.count("GET", INVENTORY_PATH), 0);
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+    assert_eq!(fixture.route_hit_count("GET", INVENTORY_PATH), 0);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
     assert_eq!(fs::read(&case.mapping.target_path).unwrap(), SAVE_BYTES);
 }
 
@@ -127,8 +130,11 @@ fn save_sync_401_emits_scoped_auth_status_and_pauses_further_requests() {
     assert_eq!(status.session_id, 1);
     agent.stop();
     assert_eq!(fs::read(&case.mapping.target_path).unwrap(), SAVE_BYTES);
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
-    assert_eq!(fixture.count_requests("GET", INVENTORY_PATH), 2);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
+    assert_eq!(fixture.request_count("GET", INVENTORY_PATH), 2);
     let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
     assert!(journal.incoming_saves().unwrap().is_empty());
 }
@@ -201,7 +207,10 @@ fn conflicted_game_does_not_block_a_healthy_local_only_game() {
         .find(|save| save.rom_id == 8)
         .unwrap();
     assert_eq!(uploaded.bytes, HEALTHY_LOCAL);
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
 }
 
 #[test]
@@ -272,7 +281,7 @@ fn tracked_local_removal_and_missing_remote_never_delete_or_resurrect_local_save
         original
     );
     assert_eq!(
-        missing_fixture.count("POST", "/api/saves?rom_id=7&slot="),
+        missing_fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
         0
     );
 }

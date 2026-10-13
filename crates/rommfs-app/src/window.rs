@@ -7,7 +7,7 @@
 //! library; the view composes sections and forwards `Command`s.
 
 use crate::controller::{
-    Command, ConnState, Controller, FolderSummary, MountState, SaveSyncSummary, UiState,
+    Command, ConnectionState, Controller, FolderSummary, MountState, SaveSyncSummary, UiState,
 };
 use crate::problem::{auxiliary_headline, describe_auxiliary, Severity, UserProblem};
 use gpui_kit::component::scroll::ScrollableElement as _;
@@ -474,7 +474,7 @@ impl RommfsWindow {
                 }
                 _ => {}
             }
-            self.state.apply(&event);
+            self.state.apply_event(&event);
             changed = true;
         }
         if save_sync_updated {
@@ -561,9 +561,9 @@ impl RommfsWindow {
     /// bare "Connected" reads as app-wide health (UI-PLAN §3).
     fn conn_status(&self, cx: &App) -> (SharedString, StatusKind) {
         match self.state.conn {
-            ConnState::Idle => ("RomM · not connected".into(), StatusKind::Muted),
-            ConnState::Connecting => ("RomM · connecting…".into(), StatusKind::Warning),
-            ConnState::Connected => {
+            ConnectionState::Idle => ("RomM · not connected".into(), StatusKind::Muted),
+            ConnectionState::Connecting => ("RomM · connecting…".into(), StatusKind::Warning),
+            ConnectionState::Connected => {
                 let user = self.user_input.read(cx).value();
                 if user.is_empty() {
                     ("RomM · connected".into(), StatusKind::Success)
@@ -574,8 +574,10 @@ impl RommfsWindow {
                     )
                 }
             }
-            ConnState::Failed => ("RomM · connection failed".into(), StatusKind::Danger),
-            ConnState::SignInRequired => ("RomM · sign-in required".into(), StatusKind::Danger),
+            ConnectionState::Failed => ("RomM · connection failed".into(), StatusKind::Danger),
+            ConnectionState::SignInRequired => {
+                ("RomM · sign-in required".into(), StatusKind::Danger)
+            }
         }
     }
 

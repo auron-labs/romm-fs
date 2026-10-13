@@ -148,10 +148,10 @@ fn save_sync_enable_request_is_refused_without_verified_account_and_save_root() 
 #[test]
 fn stale_save_sync_status_and_transfer_events_are_rejected_after_scope_change() {
     let mut state = UiState::new(32);
-    state.apply(&AppEvent::SaveSyncSessionChanged { session_id: 8 });
-    state.apply(&AppEvent::SaveSyncAuthenticationRequired { session_id: 7 });
-    assert_ne!(state.conn, ConnState::SignInRequired);
-    state.apply(&AppEvent::SaveSyncQueueUpdated(SaveSyncQueueStatus {
+    state.apply_event(&AppEvent::SaveSyncSessionChanged { session_id: 8 });
+    state.apply_event(&AppEvent::SaveSyncAuthenticationRequired { session_id: 7 });
+    assert_ne!(state.conn, ConnectionState::SignInRequired);
+    state.apply_event(&AppEvent::SaveSyncQueueUpdated(SaveSyncQueueStatus {
         session_id: 7,
         mapped_games: 1,
         reconciled_games: 1,
@@ -165,7 +165,7 @@ fn stale_save_sync_status_and_transfer_events_are_rejected_after_scope_change() 
         games: Vec::new(),
         incoming: Vec::new(),
     }));
-    state.apply(&AppEvent::SaveSyncTransferProgress {
+    state.apply_event(&AppEvent::SaveSyncTransferProgress {
         session_id: 7,
         rom_id: 3,
         revision: "stale-revision".into(),
@@ -175,11 +175,11 @@ fn stale_save_sync_status_and_transfer_events_are_rejected_after_scope_change() 
     assert!(state.save_sync_queue.is_none());
     assert!(state.save_sync_transfers.is_empty());
 
-    state.apply(&AppEvent::SaveSyncAuthenticationRequired { session_id: 8 });
+    state.apply_event(&AppEvent::SaveSyncAuthenticationRequired { session_id: 8 });
     assert!(state.save_sync_authentication_required);
-    assert_eq!(state.conn, ConnState::SignInRequired);
+    assert_eq!(state.conn, ConnectionState::SignInRequired);
 
-    state.apply(&AppEvent::SaveSyncQueueUpdated(SaveSyncQueueStatus {
+    state.apply_event(&AppEvent::SaveSyncQueueUpdated(SaveSyncQueueStatus {
         session_id: 8,
         mapped_games: 1,
         reconciled_games: 0,
@@ -542,7 +542,7 @@ fn disable_during_connect_prevents_the_older_scope_refresh_from_starting_sync() 
         "the stale refresh started an inventory request"
     );
     assert!(!controller.save_sync_gate.enabled_for(disabled_epoch));
-    assert_eq!(fixture.count_requests("POST", "/api/saves?"), 0);
-    assert_eq!(fixture.count_requests("GET", "/api/saves/31/content"), 0);
+    assert_eq!(fixture.request_count("POST", "/api/saves?"), 0);
+    assert_eq!(fixture.request_count("GET", "/api/saves/31/content"), 0);
     assert!(!install_root.join("saves/gb/Game.srm").exists());
 }

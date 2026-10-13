@@ -9,7 +9,7 @@
 //! - Progress events go to the `EventSink`; stop releases pending work.
 
 use crate::cache::{CacheIndex, LiveState};
-use crate::catalog::{RomEntry, RomKey};
+use crate::catalogue::{RomEntry, RomKey};
 use crate::error::{Error, Result};
 use crate::events::{AppEvent, EventSink};
 use crate::romm::RommClient;

@@ -272,7 +272,7 @@ fn skip_reason(path: &Path) -> ExistingSaveSkipReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::RomKey;
+    use crate::catalogue::RomKey;
     use crate::romm::{PlatformDto, RomDto, RomFileDto};
     use crate::save_sync::{map_catalogue, MappingReport, SaveMapping, SaveProfile};
     use std::fs::File;
@@ -329,8 +329,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut catalogue =
-            crate::catalog::build_catalogue("server", &platforms, &roms, |_| {}).unwrap();
-        catalogue.entries.push(crate::catalog::RomEntry {
+            crate::catalogue::build_catalogue("server", &platforms, &roms, |_| {}).unwrap();
+        catalogue.entries.push(crate::catalogue::RomEntry {
             key: RomKey {
                 server_id: "server".into(),
                 rom_id: 10,

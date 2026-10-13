@@ -7,7 +7,7 @@ use super::{
     path_string, scope_key_params, scope_only_params, sqlite, JournalSlot, LocalObservation,
     SaveSyncJournal, SaveSyncScope,
 };
-use crate::catalog::RomKey;
+use crate::catalogue::RomKey;
 use crate::error::{Error, Result};
 use crate::save_sync::mapping::{validate_mapping_path, MappingReport};
 use rusqlite::{OptionalExtension, Transaction};

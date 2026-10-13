@@ -6,9 +6,9 @@ mod desktop;
 #[cfg(windows)]
 mod icon;
 pub mod problem;
-mod save_sync_agent;
 #[cfg(windows)]
-mod save_sync_native;
+mod retrobat_discovery_windows;
+mod save_sync_agent;
 #[cfg(feature = "ui")]
 mod session;
 mod trace_bridge;

@@ -34,7 +34,10 @@ fn first_remote_save_is_published_only_when_target_never_existed() {
     );
     assert!(journal.snapshots().unwrap().is_empty());
     assert!(journal.incoming_saves().unwrap().is_empty());
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
 }
 
 #[test]
@@ -74,8 +77,11 @@ fn truncated_incoming_body_is_rejected_without_staging_or_local_publication() {
     let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
     assert!(!case.mapping.target_path.exists());
     assert!(journal.incoming_saves().unwrap().is_empty());
-    assert_eq!(fixture.count("GET", CONTENT_PATH), 1);
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+    assert_eq!(fixture.route_hit_count("GET", CONTENT_PATH), 1);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
 }
 
 #[test]
@@ -110,7 +116,7 @@ fn incoming_403_pauses_the_worker_without_invalidating_rom_session_or_repeating_
     );
     jobs.send(reconciliation_job(&case)).unwrap();
     thread::sleep(Duration::from_millis(350));
-    assert_eq!(fixture.count_requests("GET", INVENTORY_PATH), 1);
+    assert_eq!(fixture.request_count("GET", INVENTORY_PATH), 1);
 
     active.store(false, std::sync::atomic::Ordering::SeqCst);
     drop(jobs);
@@ -120,7 +126,7 @@ fn incoming_403_pauses_the_worker_without_invalidating_rom_session_or_repeating_
     let (jobs, updates, active, worker, _client) = start_reconciliation_worker(&fixture);
     jobs.send(reconciliation_job(&case)).unwrap();
     assert!(receive_inventory(&updates).saves.is_empty());
-    assert_eq!(fixture.count_requests("GET", INVENTORY_PATH), 2);
+    assert_eq!(fixture.request_count("GET", INVENTORY_PATH), 2);
     active.store(false, std::sync::atomic::Ordering::SeqCst);
     drop(jobs);
     worker.join().unwrap();
@@ -169,7 +175,10 @@ fn local_file_created_during_blocked_incoming_body_wins_without_remote_loss() {
         fs::read(&journal.incoming_saves().unwrap()[0].path).unwrap(),
         REMOTE_BYTES
     );
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
 }
 
 #[test]
@@ -206,7 +215,10 @@ fn disabling_while_incoming_body_is_blocked_prevents_late_publication() {
     agent.stop();
 
     assert!(!case.mapping.target_path.exists());
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
 }
 
 #[test]
@@ -352,5 +364,8 @@ fn external_change_matching_new_remote_bytes_resolves_staged_conflict_without_up
     assert_eq!(slot.remote_slot_id.as_deref(), Some("32"));
     assert!(journal.incoming_saves().unwrap().is_empty());
     assert_eq!(fs::read(&case.mapping.target_path).unwrap(), REMOTE_BYTES);
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
 }

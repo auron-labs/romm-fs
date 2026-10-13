@@ -16,7 +16,7 @@ fn clean_agent_discovers_all_file_slots_once_and_keeps_per_file_status() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("saves");
     fs::create_dir(&root).unwrap();
-    let server = rommfs_core::catalog::server_id_of(fx.url());
+    let server = rommfs_core::catalogue::server_id_of(fx.url());
     let scope = SaveSyncScope {
         server_id: server.clone(),
         account_id: ACCOUNT_ID.to_string(),
@@ -95,7 +95,7 @@ fn clean_agent_discovers_all_file_slots_once_and_keeps_per_file_status() {
         1
     );
     assert_eq!(
-        fx.count_requests("POST", "/api/saves?"),
+        fx.request_count("POST", "/api/saves?"),
         0,
         "incoming watcher feedback must not upload duplicates"
     );
@@ -273,7 +273,7 @@ fn ordinary_file_pipeline_reconstructs_replaces_and_preserves_conflicts_and_remo
     let root_b = second.path().join("saves");
     fs::create_dir(&root_a).unwrap();
     fs::create_dir(&root_b).unwrap();
-    let server = rommfs_core::catalog::server_id_of(fx.url());
+    let server = rommfs_core::catalogue::server_id_of(fx.url());
     let scope_a = SaveSyncScope {
         server_id: server.clone(),
         account_id: ACCOUNT_ID.to_string(),

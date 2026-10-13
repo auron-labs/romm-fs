@@ -16,7 +16,7 @@ impl Worker {
             _ => None,
         };
         let mut warnings = Vec::new();
-        let result = rommfs_core::catalog::build_catalogue_for_layout(
+        let result = rommfs_core::catalogue::build_catalogue_for_layout(
             self.server_id.as_deref().unwrap_or_default(),
             &snapshot.platforms,
             &snapshot.roms,

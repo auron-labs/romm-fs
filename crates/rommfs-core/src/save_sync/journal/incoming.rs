@@ -5,7 +5,7 @@ use super::super::sha256_content_hash;
 use super::{
     path_string, scope_key_params, scope_only_params, sqlite, IncomingSaveRecord, SaveSyncJournal,
 };
-use crate::catalog::RomKey;
+use crate::catalogue::RomKey;
 use crate::error::{Error, Result};
 use rusqlite::OptionalExtension;
 use std::fs::{self, File, OpenOptions};

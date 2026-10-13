@@ -6,7 +6,7 @@
 use crate::cache::clock::Clock;
 use crate::cache::policy::{ActiveGuard, EvictionOutcome};
 use crate::cache::Evictor;
-use crate::catalog::RomKey;
+use crate::catalogue::RomKey;
 use crate::download::DownloadManager;
 use crate::error::{Error, Result};
 use crate::tree::{NodeMeta, RommTree};
@@ -55,7 +55,7 @@ impl RommFs {
 
     // --- metadata: never downloads ---
 
-    pub fn catalogue(&self) -> &crate::catalog::Catalogue {
+    pub fn catalogue(&self) -> &crate::catalogue::Catalogue {
         self.tree.catalogue()
     }
 
@@ -147,7 +147,7 @@ impl RommFs {
         )
     }
 
-    fn entry_for(&self, inode: u64) -> Result<&crate::catalog::RomEntry> {
+    fn entry_for(&self, inode: u64) -> Result<&crate::catalogue::RomEntry> {
         let index = self
             .tree
             .rom_index_of(inode)

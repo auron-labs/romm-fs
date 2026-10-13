@@ -2,7 +2,7 @@ use crate::root::{self, Manifest, OwnedEntry, OwnedKind};
 use crate::security;
 use anyhow::Context;
 use rommfs_core::cache::HydratedRemover;
-use rommfs_core::fscore::RommFs;
+use rommfs_core::filesystem::RommFs;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};

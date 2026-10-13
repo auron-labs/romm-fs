@@ -25,12 +25,12 @@ fn production_agent_uploads_only_after_inventory_and_byte_readback() {
         slot.remote_baseline_hash.as_deref(),
         Some(snapshot.content_hash.as_str())
     );
-    assert_eq!(fixture.count_requests("GET", INVENTORY_PATH), 3);
+    assert_eq!(fixture.request_count("GET", INVENTORY_PATH), 3);
     assert_eq!(
-        fixture.count_requests("POST", "/api/saves?rom_id=7&slot="),
+        fixture.request_count("POST", "/api/saves?rom_id=7&slot="),
         1
     );
-    assert_eq!(fixture.count_requests("GET", CONTENT_PATH), 1);
+    assert_eq!(fixture.request_count("GET", CONTENT_PATH), 1);
     assert_eq!(fs::read(&case.mapping.target_path).unwrap(), SAVE_BYTES);
     assert!(fixture
         .requests()
@@ -127,11 +127,11 @@ fn one_game_upload_retry_remains_visible_after_another_game_verifies() {
         .issue
         .is_none());
     assert_eq!(
-        fixture.count_requests("POST", "/api/saves?rom_id=7&slot="),
+        fixture.request_count("POST", "/api/saves?rom_id=7&slot="),
         1
     );
     assert_eq!(
-        fixture.count_requests("POST", "/api/saves?rom_id=8&slot="),
+        fixture.request_count("POST", "/api/saves?rom_id=8&slot="),
         1
     );
     let recovered_status = wait_for_queue_status(&events, Duration::from_secs(8), |status| {
@@ -146,7 +146,7 @@ fn one_game_upload_retry_remains_visible_after_another_game_verifies() {
         .issue
         .is_none());
     assert_eq!(
-        fixture.count_requests("POST", "/api/saves?rom_id=7&slot="),
+        fixture.request_count("POST", "/api/saves?rom_id=7&slot="),
         2
     );
     agent.stop();
@@ -187,13 +187,13 @@ fn successive_revisions_wait_for_the_prior_baseline_to_be_verified() {
     assert_eq!(latest.revision, second.revision);
     assert_eq!(slot.remote_slot_id.as_deref(), Some("32"));
     assert_eq!(
-        fixture.count_requests("POST", "/api/saves?rom_id=7&slot="),
+        fixture.request_count("POST", "/api/saves?rom_id=7&slot="),
         2
     );
-    assert_eq!(fixture.count_requests("GET", INVENTORY_PATH), 5);
-    assert_eq!(fixture.count_requests("GET", CONTENT_PATH), 2);
+    assert_eq!(fixture.request_count("GET", INVENTORY_PATH), 5);
+    assert_eq!(fixture.request_count("GET", CONTENT_PATH), 2);
     assert_eq!(
-        fixture.count_requests("GET", "/api/saves/32/content?optimistic=false"),
+        fixture.request_count("GET", "/api/saves/32/content?optimistic=false"),
         1
     );
     let remote_saves = fixture.saved_saves();
@@ -262,7 +262,10 @@ fn local_write_while_first_upload_response_is_blocked_is_captured_and_uploaded_n
     assert_eq!(remote.len(), 2);
     assert_eq!(remote[0].bytes, SAVE_BYTES);
     assert_eq!(remote[1].bytes, NEXT_SAVE_BYTES);
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 2);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        2
+    );
     assert_eq!(
         fs::read(&case.mapping.target_path).unwrap(),
         NEXT_SAVE_BYTES
@@ -297,10 +300,10 @@ fn ambiguous_post_is_reconciled_after_restart_without_duplicate_upload() {
     let (recovered, _) = snapshot_after_stop(&case);
     assert_eq!(recovered.state, SnapshotState::RemoteComplete);
     assert_eq!(
-        fixture.count_requests("POST", "/api/saves?rom_id=7&slot="),
+        fixture.request_count("POST", "/api/saves?rom_id=7&slot="),
         1
     );
-    assert_eq!(fixture.count_requests("GET", CONTENT_PATH), 1);
+    assert_eq!(fixture.request_count("GET", CONTENT_PATH), 1);
     let stored = fixture.saved_saves();
     assert_eq!(stored.len(), 1);
     assert_eq!(
@@ -384,7 +387,7 @@ fn ambiguous_older_snapshot_is_verified_without_uploading_over_a_newer_conflict(
     );
     assert_eq!(journal.incoming_saves().unwrap().len(), 1);
     assert_eq!(
-        fixture.count_requests("POST", "/api/saves?rom_id=7&slot="),
+        fixture.request_count("POST", "/api/saves?rom_id=7&slot="),
         1
     );
     assert_eq!(fixture.saved_saves().len(), 1);
@@ -432,7 +435,7 @@ fn ambiguous_accepted_snapshot_does_not_resurrect_a_locally_removed_save() {
     assert_eq!(journal.incoming_saves().unwrap().len(), 1);
     assert!(!case.mapping.target_path.exists());
     assert_eq!(
-        fixture.count_requests("POST", "/api/saves?rom_id=7&slot="),
+        fixture.request_count("POST", "/api/saves?rom_id=7&slot="),
         1
     );
 }
@@ -492,8 +495,11 @@ fn malformed_success_response_is_treated_as_an_ambiguous_post() {
 
     let (recovered, _) = snapshot_after_stop(&case);
     assert_eq!(recovered.state, SnapshotState::RemoteComplete);
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 1);
-    assert_eq!(fixture.count("GET", CONTENT_PATH), 1);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        1
+    );
+    assert_eq!(fixture.route_hit_count("GET", CONTENT_PATH), 1);
     assert_eq!(fs::read(&case.mapping.target_path).unwrap(), SAVE_BYTES);
 }
 
@@ -531,7 +537,10 @@ fn preexisting_remote_save_requires_attention_and_is_never_overwritten() {
     let (snapshot, slot) = snapshot_after_stop(&case);
     assert_eq!(snapshot.state, SnapshotState::Ready);
     assert!(slot.needs_attention);
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
     assert_eq!(fs::read(&case.mapping.target_path).unwrap(), SAVE_BYTES);
 }
 
@@ -572,7 +581,7 @@ fn upload_metadata_must_match_the_exact_revision_identifier() {
     let (snapshot, slot) = snapshot_after_stop(&case);
     assert_eq!(snapshot.state, SnapshotState::Failed);
     assert!(slot.needs_attention);
-    assert_eq!(fixture.count("GET", CONTENT_PATH), 0);
+    assert_eq!(fixture.route_hit_count("GET", CONTENT_PATH), 0);
     assert_eq!(fs::read(&case.mapping.target_path).unwrap(), SAVE_BYTES);
 }
 
@@ -606,14 +615,17 @@ fn runtime_debounce_delays_inventory_and_keeps_conflicting_local_bytes() {
         message.contains("outside the verified owned revision format")
     })
     .is_some());
-    assert_eq!(fixture.count_requests("GET", INVENTORY_PATH), 1);
+    assert_eq!(fixture.request_count("GET", INVENTORY_PATH), 1);
     agent.stop();
 
     let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
     assert!(journal.snapshots().unwrap().is_empty());
     let slot = journal.slot(&case.mapping.rom_key).unwrap().unwrap();
     assert!(slot.needs_attention);
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
     assert_eq!(fs::read(&case.mapping.target_path).unwrap(), SAVE_BYTES);
 }
 
@@ -656,8 +668,11 @@ fn startup_restores_a_durable_generation_that_was_not_yet_snapshotted() {
     let (snapshot, slot) = snapshot_after_stop(&case);
     assert_eq!(snapshot.state, SnapshotState::Ready);
     assert!(slot.needs_attention);
-    assert_eq!(fixture.count("GET", INVENTORY_PATH), 1);
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+    assert_eq!(fixture.route_hit_count("GET", INVENTORY_PATH), 1);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
     assert_eq!(fs::read(&case.mapping.target_path).unwrap(), SAVE_BYTES);
 }
 
@@ -703,7 +718,7 @@ fn inventory_retry_honors_retry_after_without_losing_the_snapshot() {
     })
     .is_some());
     thread::sleep(Duration::from_millis(350));
-    assert_eq!(fixture.count("GET", INVENTORY_PATH), 1);
+    assert_eq!(fixture.route_hit_count("GET", INVENTORY_PATH), 1);
     assert!(wait_for_log(&events, Duration::from_secs(4), |message| {
         message.contains("verified upload revision")
     })
@@ -712,8 +727,11 @@ fn inventory_retry_honors_retry_after_without_losing_the_snapshot() {
 
     let (snapshot, _) = snapshot_after_stop(&case);
     assert_eq!(snapshot.state, SnapshotState::RemoteComplete);
-    assert_eq!(fixture.count("GET", INVENTORY_PATH), 4);
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+    assert_eq!(fixture.route_hit_count("GET", INVENTORY_PATH), 4);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
     assert_eq!(fs::read(&case.mapping.target_path).unwrap(), SAVE_BYTES);
 }
 
@@ -739,12 +757,12 @@ fn inventory_429_honors_retry_after_on_the_real_worker() {
         TransferUpdate::ReconciliationRetry { .. }
     ));
     thread::sleep(Duration::from_millis(2300));
-    assert_eq!(fixture.count_requests("GET", INVENTORY_PATH), 1);
+    assert_eq!(fixture.request_count("GET", INVENTORY_PATH), 1);
     assert!(matches!(
         updates.recv_timeout(Duration::from_secs(2)).unwrap(),
         TransferUpdate::ReconciliationRetry { .. }
     ));
-    assert_eq!(fixture.count_requests("GET", INVENTORY_PATH), 2);
+    assert_eq!(fixture.request_count("GET", INVENTORY_PATH), 2);
 
     active.store(false, std::sync::atomic::Ordering::SeqCst);
     drop(jobs);

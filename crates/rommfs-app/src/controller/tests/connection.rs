@@ -49,7 +49,7 @@ fn stopping_cancels_artwork_and_discards_late_metadata_results() {
     worker.poll_metadata();
     let mut state = UiState::new(32);
     while let Ok(event) = events.try_recv() {
-        state.apply(&event);
+        state.apply_event(&event);
     }
     assert!(!state.frontend_metadata_pending);
     assert!(state.frontend_metadata_error.is_none());
@@ -192,7 +192,7 @@ fn browser_pairing_cancelled_during_account_verification_never_connects_or_remem
         e,
         AppEvent::Connected | AppEvent::ConnectFailed { .. } | AppEvent::CatalogueLoaded { .. }
     )));
-    assert_eq!(fixture.count_requests("GET", "/api/platforms"), 0);
+    assert_eq!(fixture.request_count("GET", "/api/platforms"), 0);
     assert!(!format!("{events:?}").contains("secret-token"));
 }
 
@@ -217,7 +217,7 @@ fn save_sync_changes_do_not_cancel_browser_pairing_and_denial_is_visible() {
     worker.save_sync_gate.invalidate();
     worker.pairing.as_mut().unwrap().next_poll = Instant::now();
     worker.poll_pairing();
-    assert_eq!(fixture.count_requests("POST", "/api/auth/device/token"), 1);
+    assert_eq!(fixture.request_count("POST", "/api/auth/device/token"), 1);
     assert!(worker.client.is_none());
     assert!(worker.pairing.is_none());
     assert!(events
@@ -305,7 +305,7 @@ fn restore_keeps_the_configured_folder_visible() {
     );
     let mut state = UiState::new(16);
     for event in &collected {
-        state.apply(event);
+        state.apply_event(event);
     }
     assert_eq!(
         state.folder_summary(),
@@ -367,7 +367,7 @@ fn reauthentication_republishes_the_remembered_folder() {
 
     let mut state = UiState::new(16);
     for event in events.try_iter() {
-        state.apply(&event);
+        state.apply_event(&event);
     }
     assert_eq!(
         state.configured_mount_root.as_deref(),

@@ -4,7 +4,7 @@ use super::*;
 
 impl RommfsWindow {
     pub(super) fn on_connect(&mut self, cx: &mut Context<Self>) {
-        if self.state.conn == ConnState::Connecting {
+        if self.state.conn == ConnectionState::Connecting {
             return;
         }
         if !self.password_sign_in {

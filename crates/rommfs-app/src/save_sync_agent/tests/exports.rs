@@ -40,8 +40,8 @@ fn different_first_sync_keeps_both_and_explicit_export_is_separate_and_no_clobbe
     assert_eq!(fs::read(&export).unwrap(), REMOTE_BYTES);
     agent.stop();
 
-    let outbound_before = fixture.count_requests("POST", "/api/saves?rom_id=7&slot=");
-    let inventory_before = fixture.count_requests("GET", INVENTORY_PATH);
+    let outbound_before = fixture.request_count("POST", "/api/saves?rom_id=7&slot=");
+    let inventory_before = fixture.request_count("GET", INVENTORY_PATH);
     let offline_export = directory
         .path()
         .join("rommfs-incoming-reviewed.rommfs-incoming");
@@ -60,11 +60,11 @@ fn different_first_sync_keeps_both_and_explicit_export_is_separate_and_no_clobbe
     .unwrap();
     assert_eq!(fs::read(&offline_export).unwrap(), REMOTE_BYTES);
     assert_eq!(
-        fixture.count_requests("POST", "/api/saves?rom_id=7&slot="),
+        fixture.request_count("POST", "/api/saves?rom_id=7&slot="),
         outbound_before
     );
     assert_eq!(
-        fixture.count_requests("GET", INVENTORY_PATH),
+        fixture.request_count("GET", INVENTORY_PATH),
         inventory_before
     );
 
@@ -77,7 +77,10 @@ fn different_first_sync_keeps_both_and_explicit_export_is_separate_and_no_clobbe
             .unwrap()
             .needs_attention
     );
-    assert_eq!(fixture.count("POST", "/api/saves?rom_id=7&slot="), 0);
+    assert_eq!(
+        fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
 }
 
 #[test]

@@ -42,7 +42,7 @@ fn mount_root_is_created_and_existing_user_files_are_preserved() {
 #[test]
 fn foreign_entries_populate_remediation_state_and_clear_on_retry() {
     let mut state = UiState::new(16);
-    state.apply(&AppEvent::ForeignRootEntries {
+    state.apply_event(&AppEvent::ForeignRootEntries {
         root: "C:\\RomM".into(),
         entries: vec![
             ForeignEntry {
@@ -59,7 +59,7 @@ fn foreign_entries_populate_remediation_state_and_clear_on_retry() {
     assert_eq!(state.foreign_root.as_deref(), Some("C:\\RomM"));
     assert_eq!(state.foreign_entries.len(), 2);
     assert!(state.foreign_removal.is_none());
-    state.apply(&AppEvent::ForeignRootEntries {
+    state.apply_event(&AppEvent::ForeignRootEntries {
         root: "C:\\RomM".into(),
         entries: vec![ForeignEntry {
             path: "gb/gamelist.xml".into(),
@@ -69,7 +69,7 @@ fn foreign_entries_populate_remediation_state_and_clear_on_retry() {
     });
     assert_eq!(state.foreign_removal, Some(Ok(1)));
     assert_eq!(state.foreign_entries.len(), 1);
-    state.apply(&AppEvent::MountStarting {
+    state.apply_event(&AppEvent::MountStarting {
         path: "C:\\RomM".into(),
     });
     assert!(state.foreign_entries.is_empty());
@@ -144,13 +144,13 @@ fn failed_mount_logs_its_stage_and_path_before_and_after_validation() {
 #[test]
 fn connect_clears_a_stale_mount_failure() {
     let mut state = UiState::new(32);
-    state.apply(&AppEvent::MountFailed {
+    state.apply_event(&AppEvent::MountFailed {
         reason: "connect to a RomM server before mounting".into(),
     });
     assert_eq!(state.mount, MountState::Failed);
     assert!(state.mount_error.is_some());
 
-    state.apply(&AppEvent::Connected);
+    state.apply_event(&AppEvent::Connected);
     assert_eq!(state.mount, MountState::NotMounted);
     assert!(state.mount_error.is_none());
 }
@@ -345,11 +345,11 @@ fn mount_path_is_scoped_to_its_session() {
         },
         AppEvent::MountStopped,
     ] {
-        state.apply(&event);
+        state.apply_event(&event);
     }
     assert_eq!(state.folder_summary(), FolderSummary::Stopped);
 
-    state.apply(&AppEvent::SignedOut);
+    state.apply_event(&AppEvent::SignedOut);
 
     assert!(state.mount_path.is_none());
     assert_eq!(
@@ -360,7 +360,7 @@ fn mount_path_is_scoped_to_its_session() {
 
     // A path stashed by a mount attempt dies with that session too.
     state.mount_path = Some("/srv/a".into());
-    state.apply(&AppEvent::Connecting);
+    state.apply_event(&AppEvent::Connecting);
     assert!(state.mount_path.is_none());
     assert_eq!(state.folder_summary(), FolderSummary::SetupNeeded);
 }
@@ -404,7 +404,7 @@ fn games_folder_apply_updates_the_session_config() {
     );
     let mut state = UiState::new(16);
     for event in events.try_iter() {
-        state.apply(&event);
+        state.apply_event(&event);
     }
     assert_eq!(state.configured_mount_root.as_deref(), Some("/new/roms"));
     assert_eq!(
@@ -416,10 +416,10 @@ fn games_folder_apply_updates_the_session_config() {
 
     // A live mount keeps its real path — the applied folder is the
     // next start's target.
-    state.apply(&AppEvent::MountStarted {
+    state.apply_event(&AppEvent::MountStarted {
         path: "/live".into(),
     });
-    state.apply(&AppEvent::MountRootConfigured {
+    state.apply_event(&AppEvent::MountRootConfigured {
         server: "s".into(),
         mount_root: "/newer".into(),
     });
