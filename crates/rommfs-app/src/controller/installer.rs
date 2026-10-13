@@ -126,7 +126,7 @@ impl InstallerJob {
                             release.sha256()
                         ),
                     ));
-                    emit(sink, false, true, format!("RetroBat {} installer verified. Launch its wizard, then select the fresh installation folder for setup.", release.version()), None);
+                    emit(sink, false, true, format!("RetroBat {} installer verified. Launch it to install RetroBat; RomMFS then picks up the installation.", release.version()), None);
                     self.ready = Some((release, path));
                 }
                 Err(Error::Cancelled) => {

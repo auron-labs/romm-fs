@@ -667,6 +667,7 @@ fn selecting_an_installation_clears_stale_installer_and_setup_state() {
     ui.apply(&AppEvent::IntegrationUpdated {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("C:\\RetroBat".into()),
+        setup_complete: false,
         error: None,
     });
     assert!(ui.installer_error.is_none());
@@ -682,6 +683,7 @@ fn selecting_an_installation_clears_stale_installer_and_setup_state() {
     ui.apply(&AppEvent::IntegrationUpdated {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("C:\\RetroBat".into()),
+        setup_complete: false,
         error: None,
     });
     assert!(ui.retrobat_setup_error.is_some());
@@ -727,4 +729,125 @@ fn auxiliary_summary_carries_structured_notes_and_restart_clears_it() {
         summary: None,
     });
     assert!(ui.auxiliary_summary.is_none());
+}
+
+use rommfs_core::connection_settings::IntegrationMode;
+
+fn linked_ui() -> UiState {
+    let mut ui = UiState::new(64);
+    ui.apply(&AppEvent::Connected);
+    ui
+}
+
+#[test]
+fn retrobat_steps_unlock_in_order_with_one_primary() {
+    use rommfs_app::controller::{RetroBatStep, StepStatus};
+    let mut ui = linked_ui();
+    let steps = ui.retrobat_steps();
+    assert_eq!(steps.install, StepStatus::Ready);
+    assert!(matches!(steps.link, StepStatus::Blocked(_)));
+    assert!(matches!(steps.support, StepStatus::Blocked(_)));
+    assert_eq!(steps.primary(), Some(RetroBatStep::Install));
+
+    ui.apply(&AppEvent::IntegrationUpdated {
+        mode: IntegrationMode::RetroBat,
+        retrobat_root: Some("C:\\RetroBat".into()),
+        setup_complete: false,
+        error: None,
+    });
+    let steps = ui.retrobat_steps();
+    assert_eq!(steps.install, StepStatus::Done);
+    assert_eq!(steps.link, StepStatus::Ready);
+    assert_eq!(steps.primary(), Some(RetroBatStep::Link));
+    // Selecting an installation is not the same as the layout being set up.
+    assert!(!ui.retrobat_setup_ok);
+
+    ui.apply(&AppEvent::RetroBatSetup {
+        running: true,
+        detail: "working".into(),
+        error: None,
+    });
+    assert_eq!(ui.retrobat_steps().link, StepStatus::Running);
+    assert_eq!(ui.retrobat_steps().primary(), None);
+
+    ui.apply(&AppEvent::RetroBatSetup {
+        running: false,
+        detail: "linked".into(),
+        error: None,
+    });
+    let steps = ui.retrobat_steps();
+    assert_eq!(steps.link, StepStatus::Done);
+    assert_eq!(steps.support, StepStatus::Ready);
+    assert_eq!(steps.primary(), Some(RetroBatStep::Support));
+    assert!(ui.integration_notice.is_none());
+
+    // Re-applying the same selection keeps the result; a new root drops it.
+    ui.apply(&AppEvent::IntegrationUpdated {
+        mode: IntegrationMode::RetroBat,
+        retrobat_root: Some("C:\\RetroBat".into()),
+        setup_complete: false,
+        error: None,
+    });
+    assert_eq!(ui.retrobat_steps().link, StepStatus::Done);
+    ui.apply(&AppEvent::IntegrationUpdated {
+        mode: IntegrationMode::RetroBat,
+        retrobat_root: Some("D:\\RetroBat".into()),
+        setup_complete: false,
+        error: None,
+    });
+    assert_eq!(ui.retrobat_steps().link, StepStatus::Ready);
+
+    // A verified record on disk counts after a restart.
+    ui.apply(&AppEvent::IntegrationUpdated {
+        mode: IntegrationMode::RetroBat,
+        retrobat_root: Some("E:\\RetroBat".into()),
+        setup_complete: true,
+        error: None,
+    });
+    assert_eq!(ui.retrobat_steps().link, StepStatus::Done);
+
+    // A running games folder blocks (re)setup.
+    ui.apply(&AppEvent::MountStarted {
+        path: "C:\\RomM".into(),
+    });
+    assert!(matches!(
+        ui.retrobat_steps().support,
+        StepStatus::Blocked(_)
+    ));
+}
+
+#[test]
+fn retrobat_setup_failure_is_a_retry_not_done() {
+    use rommfs_app::controller::StepStatus;
+    let mut ui = linked_ui();
+    ui.apply(&AppEvent::IntegrationUpdated {
+        mode: IntegrationMode::RetroBat,
+        retrobat_root: Some("C:\\RetroBat".into()),
+        setup_complete: false,
+        error: None,
+    });
+    ui.apply(&AppEvent::RetroBatSetup {
+        running: false,
+        detail: "failed".into(),
+        error: Some("denied".into()),
+    });
+    assert_eq!(ui.retrobat_steps().link, StepStatus::Failed);
+}
+
+#[test]
+fn loaded_catalogue_means_the_folder_is_not_unconfigured() {
+    let mut ui = UiState::new(64);
+    ui.catalogue = Some((3, 10, 0));
+    assert_eq!(ui.folder_summary(), FolderSummary::Stopped);
+}
+
+#[test]
+fn progress_counts_are_parsed_from_status_lines() {
+    use rommfs_app::controller::parse_progress_counts;
+    assert_eq!(
+        parse_progress_counts("Auxiliary files: 32 / 146"),
+        Some((32, 146))
+    );
+    assert_eq!(parse_progress_counts("Starting"), None);
+    assert_eq!(parse_progress_counts("0 / 0"), None);
 }

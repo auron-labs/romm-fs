@@ -196,6 +196,9 @@ pub enum AppEvent {
     IntegrationUpdated {
         mode: crate::connection_settings::IntegrationMode,
         retrobat_root: Option<String>,
+        /// A verified RetroBat setup record exists for this installation and
+        /// games folder.
+        setup_complete: bool,
         error: Option<String>,
     },
     SignedOut,

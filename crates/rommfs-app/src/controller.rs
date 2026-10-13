@@ -80,13 +80,78 @@ pub enum FolderSummary {
 impl FolderSummary {
     pub fn label(self) -> &'static str {
         match self {
-            Self::SetupNeeded => "Set up your games folder",
+            Self::SetupNeeded => "No games folder chosen yet",
             Self::Stopped => "Games folder stopped",
             Self::Starting => "Starting games folder…",
             Self::Ready => "Games folder ready",
             Self::Failed => "Couldn't start the games folder",
         }
     }
+}
+
+/// Where one step of the RetroBat flow stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepStatus {
+    Done,
+    /// Actionable now.
+    Ready,
+    Running,
+    /// The last attempt failed; the action is a retry.
+    Failed,
+    /// Unavailable until something else happens (the reason).
+    Blocked(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetroBatStep {
+    Install,
+    Link,
+    Support,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetroBatSteps {
+    pub install: StepStatus,
+    pub link: StepStatus,
+    pub support: StepStatus,
+}
+
+impl RetroBatSteps {
+    /// The one step whose action is highlighted: the first that is neither
+    /// done nor blocked. Nothing is highlighted while an operation runs.
+    pub fn primary(&self) -> Option<RetroBatStep> {
+        [
+            (RetroBatStep::Install, self.install),
+            (RetroBatStep::Link, self.link),
+            (RetroBatStep::Support, self.support),
+        ]
+        .into_iter()
+        .find_map(|(step, status)| match status {
+            StepStatus::Running => Some(None),
+            StepStatus::Ready | StepStatus::Failed => Some(Some(step)),
+            _ => None,
+        })
+        .flatten()
+    }
+}
+
+/// Parses a trailing "N / M" count out of a status line, for determinate
+/// progress ("Auxiliary files: 32 / 146").
+pub fn parse_progress_counts(detail: &str) -> Option<(u64, u64)> {
+    let (left, right) = detail.split_once('/')?;
+    let done = left
+        .trim_end()
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    let total = right
+        .trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    (total > 0).then_some((done, total))
 }
 
 /// The derived save-sync summary the whole UI shares (UI-PLAN §5): configured,
@@ -182,6 +247,9 @@ pub struct UiState {
     /// Confirmation/next-step shown after a layout change succeeds.
     pub integration_notice: Option<String>,
     pub retrobat_setup_running: bool,
+    /// True once setup for the selected installation has actually succeeded
+    /// (this session, or a verified setup record found on disk).
+    pub retrobat_setup_ok: bool,
     pub retrobat_setup_detail: Option<String>,
     pub retrobat_setup_error: Option<String>,
     pub frontend_metadata_pending: bool,
@@ -261,6 +329,7 @@ impl UiState {
             integration_error: None,
             integration_notice: None,
             retrobat_setup_running: false,
+            retrobat_setup_ok: false,
             retrobat_setup_detail: None,
             retrobat_setup_error: None,
             frontend_metadata_pending: false,
@@ -388,6 +457,9 @@ impl UiState {
                 self.retrobat_setup_running = *running;
                 self.retrobat_setup_detail = Some(detail.clone());
                 self.retrobat_setup_error = error.clone();
+                if *running || error.is_some() {
+                    self.retrobat_setup_ok = false;
+                }
                 if *running {
                     // A new setup attempt supersedes earlier messages.
                     self.installer_error = None;
@@ -395,14 +467,14 @@ impl UiState {
                     self.foreign_entries.clear();
                     self.foreign_removal = None;
                 } else if error.is_none() {
-                    // Setup finished — the "Next: run Set up RetroBat" hint
-                    // from the layout change is done.
+                    self.retrobat_setup_ok = true;
                     self.integration_notice = None;
                 }
             }
             AppEvent::IntegrationUpdated {
                 mode,
                 retrobat_root,
+                setup_complete,
                 error,
             } => {
                 let changed = self.integration != *mode;
@@ -414,6 +486,9 @@ impl UiState {
                     // download/launch problems no longer apply.
                     self.installer_error = None;
                 }
+                self.retrobat_setup_ok = *mode == IntegrationMode::RetroBat
+                    && retrobat_root.is_some()
+                    && (*setup_complete || (!root_changed && self.retrobat_setup_ok));
                 if root_changed {
                     // Results belong to the installation that produced them.
                     self.retrobat_setup_error = None;
@@ -424,12 +499,12 @@ impl UiState {
                 }
                 self.integration_error = error.clone();
                 self.integration_notice = if error.is_none() && changed {
-                    Some(match mode {
-                        IntegrationMode::RetroBat => {
-                            "RetroBat layout is active. Next: run \"Set up RetroBat\" below.".into()
-                        }
-                        IntegrationMode::Generic => "Generic layout is active.".into(),
-                    })
+                    match mode {
+                        // The layout is only reported as active once setup
+                        // has linked it; the Settings steps say what is next.
+                        IntegrationMode::RetroBat => None,
+                        IntegrationMode::Generic => Some("Generic layout is active.".into()),
+                    }
                 } else {
                     None
                 };
@@ -823,6 +898,55 @@ impl UiState {
         self.prune_downloads();
     }
 
+    /// The three-step RetroBat flow derived from real state (install →
+    /// connect to the games folder → optional support files).
+    pub fn retrobat_steps(&self) -> RetroBatSteps {
+        let folder_running = matches!(self.mount, MountState::Mounted | MountState::Mounting);
+        let connected = self.conn == ConnState::Connected;
+        let install = if self.installer_running {
+            StepStatus::Running
+        } else if self.retrobat_root.is_some() {
+            StepStatus::Done
+        } else {
+            StepStatus::Ready
+        };
+        let link = if self.retrobat_root.is_none() {
+            StepStatus::Blocked("Install RetroBat first.")
+        } else if self.retrobat_setup_running {
+            StepStatus::Running
+        } else if self.retrobat_setup_ok {
+            StepStatus::Done
+        } else if !connected {
+            StepStatus::Blocked("Connect to RomM first.")
+        } else if folder_running {
+            StepStatus::Blocked("Stop the games folder first.")
+        } else if self.retrobat_setup_error.is_some() {
+            StepStatus::Failed
+        } else {
+            StepStatus::Ready
+        };
+        let support = if self.auxiliary_running {
+            StepStatus::Running
+        } else if !self.retrobat_setup_ok {
+            StepStatus::Blocked("Connect RetroBat to your games folder first.")
+        } else if !connected {
+            StepStatus::Blocked("Connect to RomM first.")
+        } else if folder_running {
+            StepStatus::Blocked("Stop the games folder first.")
+        } else if self.auxiliary_error.is_some() {
+            StepStatus::Failed
+        } else if self.auxiliary_summary.is_some() {
+            StepStatus::Done
+        } else {
+            StepStatus::Ready
+        };
+        RetroBatSteps {
+            install,
+            link,
+            support,
+        }
+    }
+
     /// Whether the games folder is usable right now, derived only from real
     /// mount events — never from connection, configuration, or sync state.
     pub fn folder_summary(&self) -> FolderSummary {
@@ -831,7 +955,12 @@ impl UiState {
             MountState::Mounting => FolderSummary::Starting,
             MountState::Failed => FolderSummary::Failed,
             MountState::NotMounted => {
-                if self.mount_path.is_some() || self.configured_mount_root.is_some() {
+                // A loaded catalogue means a folder was already set up, even
+                // when its path hasn't been reported to this session.
+                if self.mount_path.is_some()
+                    || self.configured_mount_root.is_some()
+                    || self.catalogue.is_some()
+                {
                     FolderSummary::Stopped
                 } else {
                     FolderSummary::SetupNeeded
@@ -2284,7 +2413,23 @@ impl Worker {
 
     fn emit_integration(&self, error: Option<String>) {
         let preferences = self.preferences.as_ref();
+        let setup_complete = preferences.is_some_and(|p| {
+            match (
+                p.integration == IntegrationMode::RetroBat,
+                p.retrobat_root.as_deref(),
+                p.mount_root.as_deref(),
+            ) {
+                (true, Some(install), Some(managed)) => rommfs_core::retrobat::verify_setup_link(
+                    install,
+                    managed,
+                    &server_id_of(&p.server),
+                )
+                .is_ok(),
+                _ => false,
+            }
+        });
         self.sink.emit(AppEvent::IntegrationUpdated {
+            setup_complete,
             mode: preferences.map(|p| p.integration).unwrap_or_default(),
             retrobat_root: preferences
                 .and_then(|p| p.retrobat_root.as_ref())
