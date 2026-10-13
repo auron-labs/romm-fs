@@ -686,3 +686,162 @@ fn log_section(
                 ),
         )
 }
+
+impl RommfsWindow {
+    fn render_download_row(
+        &self,
+        download: crate::controller::DownloadView,
+        cx: &App,
+    ) -> impl IntoElement {
+        let (status_text, status_kind) = match &download.finished {
+            None => (
+                match download.total {
+                    Some(total) => {
+                        format!("{} / {}", fmt_bytes(download.received), fmt_bytes(total))
+                    }
+                    None => format!("{} —", fmt_bytes(download.received)),
+                },
+                StatusKind::Muted,
+            ),
+            Some(Ok(())) => ("Complete".to_string(), StatusKind::Success),
+            Some(Err(error)) => (format!("Failed: {error}"), StatusKind::Danger),
+        };
+        let percent = match download.total {
+            Some(total) if total > 0 => {
+                (100.0 * download.received as f64 / total as f64).min(100.0)
+            }
+            _ if matches!(download.finished, Some(Ok(()))) => 100.0,
+            _ => 0.0,
+        } as f32;
+        h_flex()
+            .gap_3()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(download.file_name.clone()),
+            )
+            .child(
+                div().w_64().child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div().flex_1().child(
+                                Progress::new(("download", download.file_id))
+                                    .value(percent)
+                                    .loading(
+                                        download.finished.is_none() && download.total.is_none(),
+                                    )
+                                    .xsmall(),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .w_10()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(
+                                    if download.finished.is_none() && download.total.is_none() {
+                                        "—".into()
+                                    } else {
+                                        format!("{percent:.0}%")
+                                    },
+                                ),
+                        ),
+                ),
+            )
+            .child(
+                div()
+                    .w_40()
+                    .text_sm()
+                    .whitespace_nowrap()
+                    .text_color(status_kind.color(cx))
+                    .child(status_text),
+            )
+    }
+}
+
+fn level_str(level: Level) -> &'static str {
+    match level {
+        Level::Info => "INFO",
+        Level::Warn => "WARN",
+        Level::Error => "ERROR",
+    }
+}
+fn level_kind(level: Level) -> StatusKind {
+    match level {
+        Level::Info => StatusKind::Muted,
+        Level::Warn => StatusKind::Warning,
+        Level::Error => StatusKind::Danger,
+    }
+}
+fn fmt_time(unix_secs: u64) -> String {
+    let secs = unix_secs % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+pub(in crate::window) fn format_log_line(line: &rommfs_core::events::LogLine) -> String {
+    if line.op.is_empty() {
+        format!(
+            "{} {:<5} {}",
+            fmt_time(line.unix_secs),
+            level_str(line.level),
+            line.message
+        )
+    } else {
+        format!(
+            "{} {:<5} [{}] {}",
+            fmt_time(line.unix_secs),
+            level_str(line.level),
+            line.op,
+            line.message
+        )
+    }
+}
+fn render_log_line(
+    line: &rommfs_core::events::LogLine,
+    count: usize,
+    cx: &App,
+) -> impl IntoElement {
+    let time = div()
+        .text_color(cx.theme().muted_foreground)
+        .child(fmt_time(line.unix_secs));
+    let level = div()
+        .w_12()
+        .text_color(level_kind(line.level).color(cx))
+        .child(level_str(line.level));
+    let body = if line.op.is_empty() {
+        line.message.clone()
+    } else {
+        format!("[{}] {}", line.op, line.message)
+    };
+    let body = if count > 1 {
+        format!("{body} (×{count})")
+    } else {
+        body
+    };
+    h_flex()
+        .gap_2()
+        .child(time)
+        .child(level)
+        .child(div().text_color(cx.theme().foreground).child(body))
+}
+fn fmt_bytes(n: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];
+    let mut v = n as f64;
+    let mut unit = 0;
+    while v >= 1024.0 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[unit])
+    }
+}

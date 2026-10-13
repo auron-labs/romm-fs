@@ -1010,3 +1010,95 @@ pub fn render(
         .child(view.save_review_status_strip(cx))
         .child(section)
 }
+
+impl RommfsWindow {
+    fn render_incoming_row(
+        &mut self,
+        incoming: &SaveSyncIncomingStatus,
+        can_export: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let incoming = incoming.clone();
+        let error = self
+            .state
+            .save_sync_export_errors
+            .get(&incoming.incoming_id)
+            .cloned();
+        let feedback = self
+            .state
+            .save_sync_export_feedback
+            .get(&incoming.incoming_id)
+            .cloned();
+        let mut row = v_flex()
+            .gap_1()
+            .child(div().text_xs().child(format!(
+                "{} · RomM save {} · pending revision {} · {} · {} · {}",
+                incoming.rom_name,
+                incoming.remote_id,
+                incoming.incoming_id,
+                incoming.state,
+                incoming.reason,
+                incoming.content_hash,
+            )))
+            .child(
+                Button::new(format!("export-{}", incoming.incoming_id))
+                    .label("Export…")
+                    .outline()
+                    .small()
+                    .disabled(!can_export)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.prompt_export(incoming.clone(), cx);
+                    })),
+            );
+        if let Some(error) = error {
+            row = row.child(error_line(format!("Export failed: {error}"), cx));
+        }
+        if let Some(path) = feedback {
+            row = row.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().success)
+                    .child(format!("Exported to {path}; review remains pending.")),
+            );
+        }
+        row
+    }
+}
+
+fn existing_save_inventory_summary(preview: Option<&ExistingSavePreview>) -> String {
+    let Some(preview) = preview else {
+        return "Refresh to discover new or unmatched save files.".into();
+    };
+    let diagnostics = if preview.diagnostics.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", preview.diagnostics.join(" "))
+    };
+    match preview.status {
+        ExistingSaveScanStatus::Unavailable => {
+            format!("Existing-file scan unavailable; counts are not reported.{diagnostics}")
+        }
+        ExistingSaveScanStatus::Complete | ExistingSaveScanStatus::Partial => {
+            let completeness = if preview.status == ExistingSaveScanStatus::Partial {
+                "partial; counts may be incomplete"
+            } else {
+                "complete"
+            };
+            let reasons = preview
+                .skipped_reasons
+                .iter()
+                .map(|count| format!("{} {}", count.files, count.reason.label()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let skipped = if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" ({reasons})")
+            };
+            format!(
+                "Existing files ({completeness}): {} recognized files; {} skipped{skipped}.{diagnostics}",
+                preview.supported_files, preview.skipped_files
+            )
+        }
+    }
+}

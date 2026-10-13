@@ -1,8 +1,8 @@
 use super::super::*;
 use crate::controller::{parse_progress_counts, RetroBatStep, StepStatus};
 
-/// Settings page: connection, folders, the RetroBat flow, background
-/// operation and Advanced (UI-PLAN §4).
+/// Settings page: connection, folders, RetroBat, background operation, and
+/// Advanced details (UI-PLAN §4).
 pub fn render(
     view: &mut RommfsWindow,
     window: &mut Window,
@@ -14,6 +14,164 @@ pub fn render(
         view.retrobat_anchor.scroll_to(window, cx);
     }
     view.render_settings(window, cx)
+}
+
+impl RommfsWindow {
+    /// Settings in the plan's order (UI-PLAN §Settings organization):
+    /// connection, folders, the RetroBat flow, background operation, then
+    /// the Advanced disclosure.
+    fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let locked = self.state.retrobat_setup_running
+            || self.state.auxiliary_running
+            || matches!(self.state.mount, MountState::Mounted | MountState::Mounting);
+        v_flex()
+            .gap_6()
+            .child(page_heading("Settings"))
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(section_heading("Connection"))
+                    .child(self.render_connection(window, cx)),
+            )
+            .child(Separator::horizontal())
+            .child(self.render_folders_section(locked, window, cx))
+            .child(Separator::horizontal())
+            .child(self.render_retrobat_section(locked, window, cx))
+            .child(Separator::horizontal())
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(section_heading("Background operation"))
+                    .child(self.render_background_panel(cx)),
+            )
+            .child(Separator::horizontal())
+            .child(
+                Collapsible::new()
+                    .open(self.advanced_open)
+                    .child(self.disclosure_row(
+                        "settings-advanced-disclosure",
+                        "Advanced",
+                        self.advanced_open,
+                        |view| view.advanced_open = !view.advanced_open,
+                        window,
+                        cx,
+                    ))
+                    .content(self.render_advanced_detail(window, cx)),
+            )
+    }
+
+    /// Folders: the games folder once, the layout choice, and the custom
+    /// save-data folder behind its own disclosure (UI-PLAN §Settings).
+    fn render_folders_section(
+        &mut self,
+        locked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .child(section_heading("Folders"))
+            .child(field_column(
+                "Games folder",
+                Input::new(&self.mount_input).w_full(),
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("settings-browse-folder")
+                            .label("Browse…")
+                            .outline()
+                            .disabled(locked)
+                            .on_click(cx.listener(|view, _, _, cx| view.browse_games_folder(cx))),
+                    )
+                    .child(
+                        Button::new("apply-games-folder")
+                            .label("Choose games folder")
+                            .outline()
+                            .disabled(
+                                locked
+                                    || self.state.conn != ConnState::Connected
+                                    || self.mount_input.read(cx).value().trim().is_empty(),
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                let path =
+                                    view.mount_input.read(cx).value().trim().to_string();
+                                view.controller.send(Command::SetMountRoot { path });
+                                cx.notify();
+                            })),
+                    )
+                    .when(
+                        locked || self.state.conn != ConnState::Connected,
+                        |this| {
+                            // §6: the disabled action explains why.
+                            this.child(muted_xs(
+                                if locked {
+                                    "Stop the games folder to change its location."
+                                } else {
+                                    "Connect to RomM first."
+                                },
+                                cx,
+                            ))
+                        },
+                    ),
+            )
+            .child(self.layout_radio(locked, cx))
+            .when_some(
+                self.state
+                    .save_sync_effective_saves_root
+                    .clone()
+                    .or_else(|| self.state.save_sync_selected_root.clone()),
+                |this, root| {
+                    this.child(muted_xs(format!("Save data is kept in {root}"), cx))
+                },
+            )
+            .child(
+                Collapsible::new()
+                    .open(self.custom_saves_open)
+                    .child(self.disclosure_row(
+                        "custom-saves-disclosure",
+                        "Use a different save folder",
+                        self.custom_saves_open,
+                        |view| view.custom_saves_open = !view.custom_saves_open,
+                        window,
+                        cx,
+                    ))
+                    .content(
+                        v_flex()
+                            .gap_2()
+                            .pt_2()
+                            .child(field_column(
+                                "Save-data folder",
+                                Input::new(&self.save_folder_input).w_full(),
+                                cx,
+                            ))
+                            .child(
+                                Button::new("choose-save-folder")
+                                    .label("Use save folder")
+                                    .outline()
+                                    .disabled(self.state.conn != ConnState::Connected)
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.controller.send(Command::SelectSaveFolder {
+                                            path: PathBuf::from(
+                                                view.save_folder_input
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim(),
+                                            ),
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(muted_xs(
+                                "Select saves only, not an emulator's entire portable folder. All file formats and companions are supported. Shared saves and memory cards remain excluded.",
+                                cx,
+                            )),
+                    ),
+            )
+    }
 }
 
 /// Header line of one step: number and title with its status on the right.
@@ -472,5 +630,152 @@ impl RommfsWindow {
                 self.state.frontend_metadata_error.clone(),
                 |this, error| this.child(error_line(error, cx)),
             )
+    }
+}
+
+impl RommfsWindow {
+    /// A disclosure row is one interactive control: pointer, Enter, Space,
+    /// and a visible focus ring all toggle the same open state.
+    fn disclosure_row(
+        &mut self,
+        id: &'static str,
+        title: &'static str,
+        open: bool,
+        toggle: fn(&mut Self),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let focus_handle = window
+            .use_keyed_state(SharedString::from(format!("{id}-focus")), cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            })
+            .read(cx)
+            .clone();
+        let focused = focus_handle.is_focused(window);
+        h_flex()
+            .id(id)
+            .key_context("Disclosure")
+            .track_focus(&focus_handle)
+            .on_action(cx.listener(move |view, _: &ActivateControl, _window, cx| {
+                toggle(view);
+                cx.notify();
+            }))
+            .on_click(cx.listener(move |view, _, _, cx| {
+                toggle(view);
+                cx.notify();
+            }))
+            .w_full()
+            .gap_2()
+            .h_8()
+            .px_3()
+            .border_1()
+            .border_color(if focused {
+                cx.theme().primary
+            } else {
+                cx.theme().border
+            })
+            .rounded(cx.theme().radius)
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .small()
+                .text_color(cx.theme().muted_foreground),
+            )
+            .child(title)
+    }
+    /// Start-at-login plus the honest close/quit description.
+    fn render_background_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let login_supported = cfg!(windows);
+        let needs_connect = !self.state.start_at_login && self.state.conn != ConnState::Connected;
+        let login_disabled = !login_supported || needs_connect;
+        let login_reason = if !login_supported {
+            "Start at login is available on Windows only."
+        } else if needs_connect {
+            "Connect to RomM with a remembered sign-in first."
+        } else {
+            ""
+        };
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(
+                        Switch::new("start-at-login")
+                            .checked(self.state.start_at_login)
+                            .label("Start at login")
+                            .disabled(login_disabled)
+                            .on_change(cx.listener(move |view, checked, _, cx| {
+                                if login_disabled {
+                                    return;
+                                }
+                                view.controller.send(Command::SetStartAtLogin {
+                                    enabled: *checked,
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .when(login_disabled, |this| {
+                        this.child(muted_xs(login_reason, cx))
+                    }),
+            )
+            .child(muted(
+                format!(
+                    "{} Login startup reconnects and starts the games folder before resuming previously authorized save sync.",
+                    close_behavior_copy(self.tray_hides)
+                ),
+                cx,
+            ))
+            .when_some(self.state.startup_error.clone(), |this, error| {
+                this.child(error_line(error, cx))
+            })
+    }
+    fn render_advanced_detail(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let can_apply_debounce = self.state.save_sync_available || self.state.save_sync_enabled;
+        let mut detail = v_flex()
+            .gap_2()
+            .pt_2()
+            .child(muted_xs(
+                "Changed files upload automatically. Remote-only changes replace an unchanged synchronized baseline; simultaneous changes and active files are kept for review. Local deletion never deletes remote saves.",
+                cx,
+            ))
+            .child(muted_xs(
+                if self.tray_hides {
+                    "Sync continues while RomMFS runs, including in the tray."
+                } else {
+                    "Sync continues while RomMFS runs."
+                },
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_end()
+                    .child(div().w_40().child(field_column(
+                        "Wait after a save changes (seconds)",
+                        Input::new(&self.debounce_input).w_full().small(),
+                        cx,
+                    )))
+                    .child(
+                        Button::new("save-sync-apply-debounce")
+                            .label("Apply")
+                            .outline()
+                            .small()
+                            .disabled(!can_apply_debounce)
+                            .on_click(cx.listener(|view, _, _, cx| view.apply_save_sync_debounce(cx))),
+                    ),
+            );
+        if let Some(error) = self.debounce_error.clone() {
+            detail = detail.child(error_line(error, cx));
+        }
+        detail
     }
 }

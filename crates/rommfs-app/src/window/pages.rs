@@ -7,3 +7,4 @@ pub mod activity;
 pub mod overview;
 pub mod save_review;
 pub mod settings;
+pub mod setup;
