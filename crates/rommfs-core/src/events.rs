@@ -129,9 +129,6 @@ pub enum AppEvent {
         running: bool,
         detail: String,
         error: Option<String>,
-        /// On a roms-conflict failure: how many entries are classified as
-        /// known stock/OS files or links the user may consent to removing.
-        removable_conflicts: usize,
     },
     PairingReady {
         user_code: String,

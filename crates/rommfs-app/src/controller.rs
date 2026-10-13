@@ -196,9 +196,6 @@ pub struct UiState {
     pub foreign_entries: Vec<ForeignEntry>,
     /// Set after a "remove leftover links" pass ran.
     pub foreign_removal: Option<std::result::Result<usize, String>>,
-    /// How many known stock/OS files and links the last RetroBat setup
-    /// refusal reported as removable with consent.
-    pub retrobat_setup_removable: usize,
     pub downloads: Vec<DownloadView>,
     pub catalogue_progress: Option<(String, u64, Option<u64>, u64)>,
     pub mount_progress: Option<(String, u64, Option<u64>, u64)>,
@@ -275,7 +272,6 @@ impl UiState {
             foreign_root: None,
             foreign_entries: Vec::new(),
             foreign_removal: None,
-            retrobat_setup_removable: 0,
             downloads: Vec::new(),
             catalogue_progress: None,
             mount_progress: None,
@@ -383,12 +379,10 @@ impl UiState {
                 running,
                 detail,
                 error,
-                removable_conflicts,
             } => {
                 self.retrobat_setup_running = *running;
                 self.retrobat_setup_detail = Some(detail.clone());
                 self.retrobat_setup_error = error.clone();
-                self.retrobat_setup_removable = *removable_conflicts;
                 if *running {
                     self.foreign_root = None;
                     self.foreign_entries.clear();
@@ -947,9 +941,6 @@ pub enum Command {
     SetupRetroBat {
         installation: PathBuf,
         managed_root: PathBuf,
-        /// User consented to deleting only the classified stock/OS files and
-        /// leftover links inside RetroBat's roms directory.
-        remove_known: bool,
     },
     /// Delete foreign symlinks/junctions (never data-bearing reparse points) under a refused
     /// mount root, then republish the remaining foreign list.
@@ -2485,13 +2476,12 @@ impl Worker {
         }
     }
 
-    fn setup_retrobat(&mut self, installation: &Path, managed_root: &Path, remove_known: bool) {
+    fn setup_retrobat(&mut self, installation: &Path, managed_root: &Path) {
         self.cancel_auxiliary();
         self.sink.emit(AppEvent::RetroBatSetup {
             running: true,
             detail: "Checking installation and ROM ownership".into(),
             error: None,
-            removable_conflicts: 0,
         });
         let result = (|| -> anyhow::Result<Vec<String>> {
             anyhow::ensure!(self.mount.is_none(), "stop the mount before RetroBat setup");
@@ -2518,18 +2508,16 @@ impl Worker {
             rommfs_core::retrobat::switch_save_setting(&std::fs::read_to_string(
                 home.join("es_settings.cfg"),
             )?)?;
-            rommfs_core::retrobat::setup_roms_link(
-                installation,
-                managed_root,
-                server,
-                remove_known,
-            )?;
-            rommfs_core::retrobat::configure_switch_saves(installation)
+            let outcome =
+                rommfs_core::retrobat::setup_roms_link(installation, managed_root, server)?;
+            let mut messages = vec![outcome.summary()];
+            messages.extend(rommfs_core::retrobat::configure_switch_saves(installation)?);
+            Ok(messages)
         })();
         match result {
             Ok(messages) => {
                 let detail = format!(
-                    "RetroBat ROM directory linked to {}. {}",
+                    "RetroBat roms folder set up for {}: {}",
                     managed_root.display(),
                     messages.join(". ")
                 );
@@ -2539,20 +2527,15 @@ impl Worker {
                     running: false,
                     detail,
                     error: None,
-                    removable_conflicts: 0,
                 });
             }
             Err(error) => {
-                let removable = error
-                    .downcast_ref::<rommfs_core::retrobat::RomsConflicts>()
-                    .map_or(0, |c| c.removable.len());
                 let error = format!("{error:#}");
                 self.log(Level::Error, "retrobat-setup", error.clone());
                 self.sink.emit(AppEvent::RetroBatSetup {
                     running: false,
                     detail: "RetroBat setup did not complete".into(),
                     error: Some(error),
-                    removable_conflicts: removable,
                 });
             }
         }
@@ -3324,8 +3307,7 @@ fn worker_loop_with_interval_from(
             Command::SetupRetroBat {
                 installation,
                 managed_root,
-                remove_known,
-            } => worker.setup_retrobat(installation, managed_root, *remove_known),
+            } => worker.setup_retrobat(installation, managed_root),
             Command::RemoveForeignLinks { root } => worker.remove_foreign_links(root),
             Command::SetIntegration {
                 mode,
@@ -3388,7 +3370,6 @@ fn worker_loop_with_interval_from(
                     running: false,
                     detail: "RetroBat setup stopped".into(),
                     error: Some(format!("internal error: {msg}")),
-                    removable_conflicts: 0,
                 }),
                 Command::RemoveForeignLinks { .. } => {}
                 Command::SetIntegration { .. }

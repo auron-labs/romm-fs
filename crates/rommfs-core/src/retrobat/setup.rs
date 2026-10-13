@@ -1,7 +1,6 @@
 use crate::layout::RetroBatSystems;
 use crate::save_sync::{
     ensure_no_reparse_components, hold_save_directory_chain, path_is_reparse_point,
-    path_is_symbolic_link, remove_symbolic_link,
 };
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -17,6 +16,40 @@ pub struct SetupRecord {
     pub server_id: String,
     pub managed_root: PathBuf,
     pub version: Option<String>,
+    /// Per-system links (`roms/<name>`) RomMFS created. Empty for schema 1
+    /// records, whose whole `roms` directory was a single link.
+    #[serde(default)]
+    pub links: Vec<String>,
+}
+
+/// What a setup run did, so the caller can report skipped systems.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct SetupOutcome {
+    pub record: SetupRecord,
+    /// Systems now linked to the managed library (new or already present).
+    pub linked: Vec<String>,
+    /// Systems whose `roms/<name>` already has content and was left as-is.
+    pub skipped: Vec<String>,
+    /// Setup predates per-system links: `roms` itself is the managed link.
+    pub legacy_whole_link: bool,
+}
+
+impl SetupOutcome {
+    pub fn summary(&self) -> String {
+        if self.legacy_whole_link {
+            return "RetroBat's roms folder is already linked to the managed folder".into();
+        }
+        let mut text = format!("{} system folder(s) linked", self.linked.len());
+        if !self.skipped.is_empty() {
+            text.push_str(&format!(
+                "; {} system(s) already have content in RetroBat's roms folder and were left as-is: {}",
+                self.skipped.len(),
+                self.skipped.join(", ")
+            ));
+        }
+        text
+    }
 }
 
 fn inspect_installation(installation: &Path) -> anyhow::Result<()> {
@@ -44,7 +77,7 @@ fn load_record(installation: &Path) -> anyhow::Result<Option<SetupRecord>> {
             let record: SetupRecord =
                 serde_json::from_slice(&bytes).context("invalid RetroBat setup record")?;
             anyhow::ensure!(
-                record.schema == 1,
+                matches!(record.schema, 1 | 2),
                 "unsupported RetroBat setup record schema"
             );
             Ok(Some(record))
@@ -79,10 +112,11 @@ fn expected_record(
         Err(error) => return Err(error.into()),
     };
     Ok(SetupRecord {
-        schema: 1,
+        schema: 2,
         server_id: server.into(),
         managed_root: managed,
         version,
+        links: Vec::new(),
     })
 }
 
@@ -92,252 +126,201 @@ fn check_record(record: &SetupRecord, expected: &SetupRecord) -> anyhow::Result<
     Ok(())
 }
 
-/// Verify the link target AND its setup ownership, never just the path spelling.
+/// Compare link targets tolerating Windows verbatim (`\\?\`) prefixes.
+fn same_target(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| {
+        let text = p.to_string_lossy().replace('\\', "/");
+        text.strip_prefix("//?/").unwrap_or(&text).to_lowercase()
+    };
+    a == b || norm(a) == norm(b)
+}
+
+/// Verify setup ownership and every recorded link, never just path spelling.
+/// A recorded link that is missing is tolerated (re-running setup restores it);
+/// one that now points elsewhere is rejected and left untouched.
 pub fn verify_setup_link(installation: &Path, managed: &Path, server: &str) -> anyhow::Result<()> {
     let expected = expected_record(installation, managed, server)?;
     let record = load_record(installation)?
         .context("run RetroBat setup before mounting this integration")?;
     check_record(&record, &expected)?;
     let roms = installation.join("roms");
-    anyhow::ensure!(
-        path_is_reparse_point(&fs::symlink_metadata(&roms)?),
-        "RetroBat roms directory is not the setup-owned link"
-    );
-    anyhow::ensure!(
-        fs::canonicalize(&roms)? == expected.managed_root,
-        "RetroBat roms link points to a different directory; it was not changed"
-    );
-    Ok(())
-}
-
-/// What stands between a real `roms/` directory and the managed link,
-/// classified so a caller can offer one explicit cleanup for the entries that
-/// are never user data while still refusing to touch the rest.
-#[derive(Debug, Default)]
-pub struct RomsConflicts {
-    /// RetroBat stock info/read-me files, OS metadata noise, and
-    /// symlinks/junctions. Removing a link deletes only the link, never its
-    /// target — these are safe to delete only after explicit user consent.
-    pub removable: Vec<PathBuf>,
-    /// Anything else — possible user data. Setup refuses until the user moves
-    /// these out themselves; RomMFS never moves, backs up, or deletes them.
-    pub blocking: Vec<PathBuf>,
-}
-
-impl RomsConflicts {
-    pub fn is_empty(&self) -> bool {
-        self.removable.is_empty() && self.blocking.is_empty()
-    }
-}
-
-impl std::fmt::Display for RomsConflicts {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if !self.blocking.is_empty() {
-            write!(
-                f,
-                "RetroBat roms contains {} entr{} that may be user data — move them out before setup:\n{}",
-                self.blocking.len(),
-                if self.blocking.len() == 1 { "y" } else { "ies" },
-                self.blocking
-                    .iter()
-                    .take(12)
-                    .map(|p| format!("  {}", p.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )?;
-            if self.blocking.len() > 12 {
-                write!(f, "\n  and {} more", self.blocking.len() - 12)?;
-            }
-            if !self.removable.is_empty() {
-                write!(
-                    f,
-                    "\n{} known RetroBat stock/system file(s) and link(s) can also be removed",
-                    self.removable.len()
-                )?;
-            }
-        } else {
-            write!(
-                f,
-                "RetroBat roms contains only {} known stock/system file(s) and link(s); RomMFS can remove them with your consent:\n{}",
-                self.removable.len(),
-                self.removable
-                    .iter()
-                    .take(12)
-                    .map(|p| format!("  {}", p.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )?;
-            if self.removable.len() > 12 {
-                write!(f, "\n  and {} more", self.removable.len() - 12)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for RomsConflicts {}
-
-/// Filenames that are never user data inside a stock RetroBat `roms` tree:
-/// the per-system info files a fresh install ships and OS metadata noise.
-fn stock_or_noise_name(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let name = name.to_lowercase();
-    (name.starts_with("_info") && name.ends_with(".txt"))
-        || matches!(
-            name.as_str(),
-            "readme.txt" | "_readme.txt" | "readme.md" | "desktop.ini" | "thumbs.db" | ".ds_store"
-        )
-}
-
-/// Remove one entry the classifier marked removable. The type is re-verified
-/// at delete time so a file swapped in between scan and consent is never
-/// deleted; a link loses only the link object, never its target.
-fn remove_known_foreign(path: &Path) -> anyhow::Result<()> {
-    let _parent_guard =
-        hold_save_directory_chain(path.parent().context("removable entry has no parent")?)?;
-    let metadata = fs::symlink_metadata(path)?;
+    // `roms` itself may legitimately be a legacy link; `installation` is already checked.
+    let metadata = fs::symlink_metadata(&roms)?;
     if path_is_reparse_point(&metadata) {
-        remove_symbolic_link(path)?;
+        // Schema 1: `roms` itself is the setup-owned link.
+        anyhow::ensure!(
+            fs::canonicalize(&roms)? == expected.managed_root,
+            "RetroBat roms link points to a different directory; it was not changed"
+        );
         return Ok(());
     }
-    anyhow::ensure!(
-        metadata.is_file() && stock_or_noise_name(path),
-        "not a classified removable entry: {}",
-        path.display()
-    );
-    fs::remove_file(path)?;
+    anyhow::ensure!(metadata.is_dir(), "RetroBat roms is not a directory");
+    for name in &record.links {
+        validate_link_name(name)?;
+        let link = roms.join(name);
+        match fs::symlink_metadata(&link) {
+            Ok(m) if path_is_reparse_point(&m) => {
+                let target = fs::read_link(&link)?;
+                anyhow::ensure!(
+                    same_target(&target, &expected.managed_root.join(name)),
+                    "RetroBat roms\\{name} link points to a different directory; it was not changed"
+                );
+            }
+            // Missing or replaced by the user: no longer ours, nothing to verify.
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
     Ok(())
 }
 
-/// Link an empty ROM directory to a separately verified managed root. The caller
-/// must validate native root ownership and establish that RetroBat is stopped.
-/// A persisted intent permits recovery after interruption between record/link.
-/// `remove_known` consents to deleting only classified stock/OS files and
-/// links; possible user files still refuse and are never moved or deleted.
+fn validate_link_name(name: &str) -> anyhow::Result<()> {
+    crate::save_sync::validate_windows_path_component(name)
+        .map_err(|e| anyhow::anyhow!("invalid recorded system name {name:?}: {e}"))
+}
+
+/// Returns the directories (parents first) of `root` when it contains nothing
+/// but empty ordinary directories, or `None` as soon as any file or link shows
+/// up. Only an entirely empty tree may be replaced by a link.
+fn empty_directory_tree(root: &Path) -> anyhow::Result<Option<Vec<PathBuf>>> {
+    let mut directories = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let _parent_guard =
+            hold_save_directory_chain(path.parent().context("ROM entry has no parent")?)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if path_is_reparse_point(&metadata) || !metadata.is_dir() {
+            return Ok(None);
+        }
+        directories.push(path.clone());
+        for entry in fs::read_dir(path)? {
+            pending.push(entry?.path());
+        }
+    }
+    Ok(Some(directories))
+}
+
+/// Coexist with whatever is already in RetroBat's `roms` directory: keep it a
+/// real directory and add `roms/<system>` links to the managed library for each
+/// system RetroBat knows. A system whose folder already has content (stock or
+/// user) is left untouched and reported as skipped. Nothing is ever deleted,
+/// moved or overwritten; only empty directories are replaced by a link.
+///
+/// The caller must validate native root ownership and establish that RetroBat
+/// is stopped. The record (listing intended links) is persisted before the
+/// links are created so an interrupted run is recovered by running setup again.
 pub fn setup_roms_link(
     installation: &Path,
     managed: &Path,
     server: &str,
-    remove_known: bool,
-) -> anyhow::Result<SetupRecord> {
-    let expected = expected_record(installation, managed, server)?;
+) -> anyhow::Result<SetupOutcome> {
+    let mut expected = expected_record(installation, managed, server)?;
     let _installation_guard = hold_save_directory_chain(installation)?;
     let _managed_guard = hold_save_directory_chain(&expected.managed_root)?;
     let previous = load_record(installation)?;
     if let Some(record) = &previous {
         check_record(record, &expected)?;
     }
-    let roms = installation.join("roms");
-    let metadata = match fs::symlink_metadata(&roms) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    if metadata.as_ref().is_some_and(path_is_reparse_point) {
-        verify_setup_link(installation, managed, server)?;
-        return Ok(expected);
-    }
     anyhow::ensure!(
         fs::canonicalize(installation)? != expected.managed_root,
         "installation and managed ROM root must differ"
     );
-    let mut directories = Vec::new();
-    let mut conflicts = RomsConflicts::default();
-    if roms.try_exists()? {
-        scan_roms_contents(&roms, &mut directories, &mut conflicts)?;
+    let roms = installation.join("roms");
+    match fs::symlink_metadata(&roms) {
+        Ok(m) if path_is_reparse_point(&m) => {
+            verify_setup_link(installation, managed, server)?;
+            return Ok(SetupOutcome {
+                record: previous.unwrap_or(expected),
+                linked: Vec::new(),
+                skipped: Vec::new(),
+                legacy_whole_link: true,
+            });
+        }
+        Ok(m) => anyhow::ensure!(m.is_dir(), "RetroBat roms exists and is not a directory"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&roms)?,
+        Err(e) => return Err(e.into()),
     }
-    if remove_known {
-        // Best-effort per entry: re-verified at delete time, failures are
-        // reported as still-removable so a retry (or manual cleanup) sees them.
-        let mut kept = Vec::new();
-        let mut errors = Vec::new();
-        for path in conflicts.removable.drain(..) {
-            match remove_known_foreign(&path) {
-                Ok(()) => {}
-                Err(e) => {
-                    kept.push(path.clone());
-                    errors.push(format!("{}: {e}", path.display()));
+    let systems = RetroBatSystems::from_installation(installation)?;
+    let recorded = previous
+        .as_ref()
+        .map(|r| r.links.clone())
+        .unwrap_or_default();
+
+    enum Plan {
+        Adopt,
+        Create(Vec<PathBuf>),
+    }
+    let mut plans = Vec::new();
+    let mut skipped = Vec::new();
+    for name in systems.folders() {
+        let link = roms.join(name);
+        match fs::symlink_metadata(&link) {
+            Ok(m) if path_is_reparse_point(&m) => {
+                let ours = fs::read_link(&link)
+                    .is_ok_and(|t| same_target(&t, &expected.managed_root.join(name)));
+                if ours {
+                    plans.push((name.to_owned(), Plan::Adopt));
+                } else {
+                    skipped.push(name.to_owned());
                 }
             }
-        }
-        conflicts.removable = kept;
-        if !errors.is_empty() {
-            return Err(anyhow::Error::new(conflicts).context(format!(
-                "failed to remove {} known entries: {}",
-                errors.len(),
-                errors.join("; ")
-            )));
+            Ok(m) if m.is_dir() => match empty_directory_tree(&link)? {
+                Some(directories) => plans.push((name.to_owned(), Plan::Create(directories))),
+                None => skipped.push(name.to_owned()),
+            },
+            Ok(_) => skipped.push(name.to_owned()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                plans.push((name.to_owned(), Plan::Create(Vec::new())));
+            }
+            Err(e) => return Err(e.into()),
         }
     }
-    if !conflicts.is_empty() {
-        return Err(anyhow::Error::new(conflicts));
+
+    let mut links: Vec<String> = recorded;
+    for (name, _) in &plans {
+        if !links.contains(name) {
+            links.push(name.clone());
+        }
     }
+    links.sort();
+    expected.links = links;
     let record_path = installation.join(RECORD);
-    // Do not replace an existing ownership record; compatible upgrades are
-    // diagnostics, not a reason to acquire different ownership.
-    if previous.is_none() {
+    if previous.as_ref().map(|r| (&r.links, r.schema)) != Some((&expected.links, 2)) {
         let mut file = tempfile::NamedTempFile::new_in(installation)?;
         serde_json::to_writer(file.as_file_mut(), &expected)?;
         file.as_file().sync_all()?;
-        file.persist_noclobber(&record_path)
-            .map_err(|error| error.error)?;
+        file.persist(&record_path).map_err(|error| error.error)?;
     }
-    // Only empty ordinary directories. remove_dir refuses a concurrent new file.
-    // No recursive deletion, backups, or migration of the ROM directory.
-    for directory in directories.into_iter().rev() {
-        let _parent_guard =
-            hold_save_directory_chain(directory.parent().context("ROM directory has no parent")?)?;
-        ensure_no_reparse_components(&directory)?;
-        fs::remove_dir(directory)?;
-    }
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(&expected.managed_root, &roms).context(
-        "create RetroBat ROM directory link (Windows Developer Mode or link privilege is required)",
-    )?;
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&expected.managed_root, &roms)?;
-    verify_setup_link(installation, managed, server)?;
-    Ok(expected)
-}
 
-/// Collect every ordinary directory (emptied later, deepest last) and classify
-/// each non-directory entry: links and known stock/OS files are removable with
-/// consent; everything else blocks setup as possible user data.
-fn scan_roms_contents(
-    root: &Path,
-    directories: &mut Vec<PathBuf>,
-    conflicts: &mut RomsConflicts,
-) -> anyhow::Result<()> {
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        let _parent_guard =
-            hold_save_directory_chain(path.parent().context("ROM entry has no parent")?)?;
-        let metadata = fs::symlink_metadata(&path)?;
-        if path_is_reparse_point(&metadata) {
-            if path_is_symbolic_link(&path)? {
-                conflicts.removable.push(path);
-            } else {
-                conflicts.blocking.push(path);
+    let mut linked = Vec::new();
+    for (name, plan) in plans {
+        let link = roms.join(&name);
+        if let Plan::Create(directories) = plan {
+            // Only empty ordinary directories. remove_dir refuses a concurrent
+            // new file. No recursive deletion, backups, or migration.
+            for directory in directories.into_iter().rev() {
+                let _parent_guard = hold_save_directory_chain(
+                    directory.parent().context("ROM directory has no parent")?,
+                )?;
+                ensure_no_reparse_components(&directory)?;
+                fs::remove_dir(directory)?;
             }
-            continue;
+            let target = expected.managed_root.join(&name);
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_dir(&target, &link).context(
+                "create RetroBat ROM directory link (Windows Developer Mode or link privilege is required)",
+            )?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &link)?;
         }
-        if !metadata.is_dir() {
-            if metadata.is_file() && stock_or_noise_name(&path) {
-                conflicts.removable.push(path);
-            } else {
-                conflicts.blocking.push(path);
-            }
-            continue;
-        }
-        let _directory_guard = hold_save_directory_chain(&path)?;
-        directories.push(path.clone());
-        for entry in fs::read_dir(path)? {
-            pending.push(entry?.path());
-        }
+        linked.push(name);
     }
-    conflicts.removable.sort();
-    conflicts.blocking.sort();
-    Ok(())
+    verify_setup_link(installation, managed, server)?;
+    Ok(SetupOutcome {
+        record: expected,
+        linked,
+        skipped,
+        legacy_whole_link: false,
+    })
 }

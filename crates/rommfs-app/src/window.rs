@@ -1643,7 +1643,7 @@ impl RommfsWindow {
                     ),
             )
             .child(muted(
-                "Requires a fresh installation configured through RomMFS setup. Its ROM directory must be empty or already managed by RomMFS.",
+                "Requires a RetroBat installation set up through RomMFS. Existing content in its roms folder is left untouched.",
                 cx,
             ))
     }
@@ -1700,7 +1700,7 @@ impl RommfsWindow {
                 }))
             })
             .child(muted(
-                "Setup links RetroBat's ROM folder to the games folder and configures Switch saves. Stop RetroBat and its emulators first. Unowned ROM files are never moved or removed.",
+                "Setup adds a link in RetroBat's roms folder for each system, pointing at the games folder, and configures Switch saves. Systems that already have files there are left as they are. Stop RetroBat and its emulators first; nothing existing is moved or removed.",
                 cx,
             ))
             .child(
@@ -1721,39 +1721,11 @@ impl RommfsWindow {
                                         managed_root: PathBuf::from(
                                             view.mount_input.read(cx).value().trim(),
                                         ),
-                                        remove_known: false,
                                     });
                                 }
                                 cx.notify();
                             })),
                     )
-                    .when(self.state.retrobat_setup_removable > 0, |this| {
-                        this.child(
-                            Button::new("setup-retrobat-remove-known")
-                                .label(format!(
-                                    "Remove {} known files/links and retry",
-                                    self.state.retrobat_setup_removable
-                                ))
-                                .outline()
-                                .disabled(
-                                    locked
-                                        || self.state.conn != ConnState::Connected
-                                        || self.settings_install_root(cx).is_none(),
-                                )
-                                .on_click(cx.listener(|view, _, _, cx| {
-                                    if let Some(installation) = view.settings_install_root(cx) {
-                                        view.controller.send(Command::SetupRetroBat {
-                                            installation,
-                                            managed_root: PathBuf::from(
-                                                view.mount_input.read(cx).value().trim(),
-                                            ),
-                                            remove_known: true,
-                                        });
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                    }),
             )
             .when(locked, |this| {
                 this.child(muted(

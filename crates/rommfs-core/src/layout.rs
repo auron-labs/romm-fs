@@ -54,7 +54,25 @@ impl RetroBatSystems {
         crate::save_sync::ensure_no_reparse_components(root)?;
         let path = root.join("emulationstation/.emulationstation/es_systems.cfg");
         crate::save_sync::ensure_no_reparse_components(&path)?;
-        Self::from_xml(&std::fs::read_to_string(&path)?)
+        let xml = match std::fs::read_to_string(&path) {
+            Ok(xml) => xml,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::Unsupported(format!(
+                    "RetroBat has not created its system configuration yet ({} is missing). \
+                     Start RetroBat once, close it, then retry setup.",
+                    path.display()
+                )))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        Self::from_xml(&xml)
+    }
+
+    /// Folder names (as spelled in the configuration), sorted.
+    pub fn folders(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.systems.values().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        names
     }
 
     pub fn folder(&self, slug: &str, fs_slug: &str) -> Option<&str> {

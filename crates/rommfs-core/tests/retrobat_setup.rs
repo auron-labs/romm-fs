@@ -1,8 +1,6 @@
 #[cfg(unix)]
 use rommfs_core::retrobat::verify_setup_link;
-use rommfs_core::retrobat::{
-    configure_switch_saves, setup_roms_link, switch_save_setting, RomsConflicts,
-};
+use rommfs_core::retrobat::{configure_switch_saves, setup_roms_link, switch_save_setting};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -29,80 +27,129 @@ fn installation(parent: &Path) -> (PathBuf, PathBuf) {
     (install, managed)
 }
 
+const STOCK_SYSTEMS: &str = "<systemList>\
+<system><name>gb</name><path>~/../roms/gb</path><extension>.gb</extension></system>\
+<system><name>snes</name><path>~/../roms/snes</path><extension>.sfc</extension></system>\
+<system><name>singe</name><path>~/../roms/singe</path><extension>.singe</extension></system>\
+<system><name>ports</name><path>~/../roms/ports</path><extension>.libretro</extension></system>\
+<system><name>halflife</name><path>~/../roms/halflife</path><extension>.pak</extension></system>\
+</systemList>";
+
+/// Compact subset of a pristine RetroBat 8.3.0 `roms` tree (see the
+/// clean-machine file listing): singe, ports and halflife ship content.
+fn write_stock_roms(install: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fs::write(
+        install.join("emulationstation/.emulationstation/es_systems.cfg"),
+        STOCK_SYSTEMS,
+    )
+    .unwrap();
+    let files = [
+        "roms/singe/ldp.singe",
+        "roms/singe/Dragon's Lair/dl.singe",
+        "roms/singe/Dragon's Lair/dl.txt",
+        "roms/ports/2048.libretro",
+        "roms/ports/gamelist.xml",
+        "roms/ports/images/2048.png",
+        "roms/ports/xrick/data.zip",
+        "roms/halflife/extras.pak",
+        "roms/halflife/valve/config.cfg",
+        "roms/halflife/valve/extras.pk3",
+        "roms/quake/_info.txt",
+        "roms/user-dump/game.nsp",
+    ];
+    files
+        .iter()
+        .map(|rel| {
+            let path = install.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes = format!("stock bytes of {rel}").into_bytes();
+            fs::write(&path, &bytes).unwrap();
+            (path, bytes)
+        })
+        .collect()
+}
+
+#[cfg(unix)]
 #[test]
-fn stock_and_unowned_files_are_reported_and_preserved_without_partial_setup() {
+fn stock_retrobat_roms_content_coexists_with_managed_links() {
     let dir = tempfile::tempdir().unwrap();
     let (install, managed) = installation(dir.path());
-    fs::write(install.join("roms/gb/stock.txt"), b"stock").unwrap();
-    fs::write(install.join("roms/game.nsp"), b"user data").unwrap();
-    let error = setup_roms_link(&install, &managed, "s", false).unwrap_err();
-    let conflicts = error
-        .downcast_ref::<RomsConflicts>()
-        .expect("typed conflict report");
-    assert_eq!(conflicts.blocking.len(), 2);
-    let error = error.to_string();
-    assert!(
-        error.contains("stock.txt") && error.contains("game.nsp"),
-        "{error}"
-    );
-    assert_eq!(
-        fs::read(install.join("roms/game.nsp")).unwrap(),
-        b"user data"
-    );
-    assert!(!install.join(".rommfs-setup.json").exists());
-    assert!(install.join("roms/gb/empty").is_dir());
+    let existing = write_stock_roms(&install);
+    let outcome = setup_roms_link(&install, &managed, "s").unwrap();
+    // Systems with content are left alone and reported, not errors.
+    assert_eq!(outcome.skipped, ["halflife", "ports", "singe"]);
+    assert!(outcome
+        .summary()
+        .contains("left as-is: halflife, ports, singe"));
+    // Empty or absent system folders became links to the managed library.
+    assert_eq!(outcome.linked, ["gb", "snes"]);
+    for system in ["gb", "snes"] {
+        assert!(path_is_link(&install.join("roms").join(system)));
+        assert_eq!(
+            fs::read_link(install.join("roms").join(system)).unwrap(),
+            fs::canonicalize(&managed).unwrap().join(system)
+        );
+    }
+    assert!(!path_is_link(&install.join("roms")));
+    for (path, bytes) in &existing {
+        assert_eq!(&fs::read(path).unwrap(), bytes, "{}", path.display());
+    }
+    let record = fs::read_to_string(install.join(".rommfs-setup.json")).unwrap();
+    assert!(record.contains("\"schema\":2") && record.contains("\"links\":[\"gb\",\"snes\"]"));
+    // Re-running is idempotent and verification passes.
+    let again = setup_roms_link(&install, &managed, "s").unwrap();
+    assert_eq!(again.linked, ["gb", "snes"]);
+    assert_eq!(again.skipped, ["halflife", "ports", "singe"]);
+    verify_setup_link(&install, &managed, "s").unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn rerun_adds_links_for_systems_that_become_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let (install, managed) = installation(dir.path());
+    setup_roms_link(&install, &managed, "s").unwrap();
+    assert!(!install.join("roms/snes").exists());
+    fs::write(
+        install.join("emulationstation/.emulationstation/es_systems.cfg"),
+        STOCK_SYSTEMS,
+    )
+    .unwrap();
+    let outcome = setup_roms_link(&install, &managed, "s").unwrap();
+    assert!(outcome.linked.contains(&"snes".to_string()));
+    assert!(path_is_link(&install.join("roms/snes")));
+}
+
+#[cfg(unix)]
+#[test]
+fn empty_system_directories_are_replaced_and_foreign_links_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let (install, managed) = installation(dir.path());
+    fs::write(
+        install.join("emulationstation/.emulationstation/es_systems.cfg"),
+        STOCK_SYSTEMS,
+    )
+    .unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, install.join("roms/snes")).unwrap();
+    let outcome = setup_roms_link(&install, &managed, "s").unwrap();
+    // roms/gb/empty was an empty directory tree: replaced by the link.
+    assert!(outcome.linked.contains(&"gb".to_string()));
+    assert!(path_is_link(&install.join("roms/gb")));
+    assert!(outcome.skipped.contains(&"snes".to_string()));
+    assert_eq!(fs::read_link(install.join("roms/snes")).unwrap(), elsewhere);
 }
 
 #[test]
-fn consented_cleanup_removes_only_stock_and_noise_never_user_files() {
+fn missing_system_configuration_asks_to_start_retrobat_once() {
     let dir = tempfile::tempdir().unwrap();
     let (install, managed) = installation(dir.path());
-    fs::write(install.join("roms/gb/_info.txt"), b"stock info").unwrap();
-    fs::write(install.join("roms/gb/desktop.ini"), b"noise").unwrap();
-    fs::write(install.join("roms/Thumbs.db"), b"noise").unwrap();
-    // Without consent the removable files still refuse setup and survive.
-    let error = setup_roms_link(&install, &managed, "s", false).unwrap_err();
-    let conflicts = error
-        .downcast_ref::<RomsConflicts>()
-        .expect("cleanup UI needs the typed report");
-    assert_eq!(conflicts.removable.len(), 3);
-    assert!(conflicts.blocking.is_empty());
-    let error = error.to_string();
-    assert!(error.contains("_info.txt"), "{error}");
-    assert!(install.join("roms/gb/_info.txt").exists());
-    // With consent the classified files go and setup completes.
-    setup_roms_link(&install, &managed, "s", true).unwrap();
-    assert_eq!(
-        fs::canonicalize(install.join("roms")).unwrap(),
-        fs::canonicalize(&managed).unwrap()
-    );
-    assert!(!install.join("roms").join("gb/_info.txt").exists());
-    assert!(install.join(".rommfs-setup.json").exists());
-}
-
-#[test]
-fn user_files_block_setup_even_after_consent_and_are_never_deleted() {
-    let dir = tempfile::tempdir().unwrap();
-    let (install, managed) = installation(dir.path());
-    fs::write(install.join("roms/gb/_info.txt"), b"stock info").unwrap();
-    fs::write(install.join("roms/gb/gamelist.xml"), b"<gameList/>").unwrap();
-    fs::write(install.join("roms/game.nsp"), b"user data").unwrap();
-    let error = setup_roms_link(&install, &managed, "s", true)
+    fs::remove_file(install.join("emulationstation/.emulationstation/es_systems.cfg")).unwrap();
+    let error = setup_roms_link(&install, &managed, "s")
         .unwrap_err()
         .to_string();
-    assert!(
-        error.contains("gamelist.xml") && error.contains("game.nsp"),
-        "{error}"
-    );
-    // The consented stock file was removed; user files were not, and no
-    // record or link was created.
-    assert!(!install.join("roms/gb/_info.txt").exists());
-    assert_eq!(
-        fs::read(install.join("roms/game.nsp")).unwrap(),
-        b"user data"
-    );
-    assert!(!install.join(".rommfs-setup.json").exists());
-    assert!(!path_is_link(&install.join("roms")));
+    assert!(error.contains("Start RetroBat once, close it"), "{error}");
 }
 
 #[cfg(unix)]
@@ -119,46 +166,44 @@ fn path_is_link(path: &Path) -> bool {
 fn setup_accepts_compatible_versions_is_repeatable_and_rejects_wrong_ownership() {
     let dir = tempfile::tempdir().unwrap();
     let (install, managed) = installation(dir.path());
-    let record = setup_roms_link(&install, &managed, "s", false).unwrap();
-    assert_eq!(record.version.as_deref(), Some("9.0.1-compatible"));
+    let outcome = setup_roms_link(&install, &managed, "s").unwrap();
+    assert_eq!(outcome.record.version.as_deref(), Some("9.0.1-compatible"));
     assert_eq!(
-        fs::canonicalize(install.join("roms")).unwrap(),
-        fs::canonicalize(&managed).unwrap()
+        fs::read_link(install.join("roms/gb")).unwrap(),
+        fs::canonicalize(&managed).unwrap().join("gb")
     );
-    setup_roms_link(&install, &managed, "s", false).unwrap();
-    assert!(setup_roms_link(&install, &managed, "other", false).is_err());
+    setup_roms_link(&install, &managed, "s").unwrap();
+    assert!(setup_roms_link(&install, &managed, "other").is_err());
     let other = dir.path().join("other");
     fs::create_dir(&other).unwrap();
-    assert!(setup_roms_link(&install, &other, "s", false).is_err());
-    fs::remove_file(install.join("roms")).unwrap();
-    std::os::unix::fs::symlink(&other, install.join("roms")).unwrap();
+    assert!(setup_roms_link(&install, &other, "s").is_err());
+    // A recorded link retargeted elsewhere is rejected and left untouched.
+    fs::remove_file(install.join("roms/gb")).unwrap();
+    std::os::unix::fs::symlink(&other, install.join("roms/gb")).unwrap();
     assert!(verify_setup_link(&install, &managed, "s").is_err());
-    assert_eq!(
-        fs::canonicalize(install.join("roms")).unwrap(),
-        fs::canonicalize(&other).unwrap()
-    );
+    assert_eq!(fs::read_link(install.join("roms/gb")).unwrap(), other);
 }
 
 #[cfg(unix)]
 #[test]
-fn unowned_links_and_nested_reparse_points_are_not_followed() {
+fn legacy_whole_roms_link_is_still_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let (install, managed) = installation(dir.path());
-    std::os::unix::fs::symlink(&managed, install.join("roms/gb/link")).unwrap();
-    // Links are classified removable: still refused without consent, deleted
-    // (link only — target intact) with consent.
-    assert!(setup_roms_link(&install, &managed, "s", false).is_err());
-    assert!(fs::symlink_metadata(install.join("roms/gb/link"))
-        .unwrap()
-        .file_type()
-        .is_symlink());
-    setup_roms_link(&install, &managed, "s", true).unwrap();
-    assert!(!install.join("roms/gb/link").exists());
-    assert!(managed.is_dir());
-    assert_eq!(
-        fs::canonicalize(install.join("roms")).unwrap(),
-        fs::canonicalize(&managed).unwrap()
-    );
+    fs::remove_dir_all(install.join("roms")).unwrap();
+    let canonical = fs::canonicalize(&managed).unwrap();
+    std::os::unix::fs::symlink(&canonical, install.join("roms")).unwrap();
+    let version = "9.0.1-compatible";
+    fs::write(
+        install.join(".rommfs-setup.json"),
+        format!(
+            "{{\"schema\":1,\"server_id\":\"s\",\"managed_root\":{:?},\"version\":\"{version}\"}}",
+            canonical.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    verify_setup_link(&install, &managed, "s").unwrap();
+    let outcome = setup_roms_link(&install, &managed, "s").unwrap();
+    assert!(outcome.legacy_whole_link && path_is_link(&install.join("roms")));
 }
 
 #[test]

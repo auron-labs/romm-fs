@@ -149,11 +149,12 @@ instant (metadata only); the first launch of a game downloads its file once.
 
 ## Set up RetroBat
 
-> The RetroBat integration requires a fresh installation configured through
-> RomMFS setup. Its ROM directory must be empty or already managed by RomMFS.
+> The RetroBat integration coexists with whatever is already in RetroBat's
+> `roms` folder; existing content is never moved, replaced or deleted.
 
 In **Settings → RetroBat**, use **Download official installer** and then
-**Launch installer…**, or select a fresh installation you installed separately.
+**Launch installer…**, or select an installation you installed separately. Start RetroBat once and
+close it before setup so it creates its system configuration.
 RomMFS discovers the latest stable official Windows package, streams its bytes,
 checks the release size and SHA-256 digest, and rechecks integrity before launch.
 Cancel a download in RomMFS; cancel installation inside the official wizard.
@@ -163,16 +164,19 @@ Compatible versions are accepted by required layout,
 not version equality; 8.2.1 is the source/package research reference.
 
 In **Settings**, select RetroBat, choose its installation and a separate managed
-ROM folder, then choose **Set up RetroBat**. Setup links `<RetroBat>/roms` to that
-folder. Windows directory symlink creation requires Developer Mode or the
-appropriate link privilege; RomMFS does not elevate. Setup refuses unowned ROM
-files, including stock helper files, and lists their paths. Nothing is migrated,
-backed up or deleted from a nonempty ROM library. Other RetroBat folders remain
-in place.
+ROM folder, then choose **Set up RetroBat**. `<RetroBat>/roms` stays a real
+directory; setup adds a link `roms/<system>` → `<managed folder>/<system>` for
+each system RetroBat defines whose folder is absent or empty. A system folder
+that already has files (RetroBat's stock `singe`, `ports` or `halflife`, or your
+own ROMs) is left untouched and reported as skipped. Windows directory symlink
+creation requires Developer Mode or the appropriate link privilege; RomMFS does
+not elevate. Nothing is migrated, backed up, overwritten or deleted. Other
+RetroBat folders remain in place.
 
-Setup records link ownership in `<RetroBat>/.rommfs-setup.json`. Rerunning with
-the same server/root verifies the existing link and can recover an interrupted
-link step. A changed/unowned link is preserved and rejected. Targeted frontend
+Setup records the links it created in `<RetroBat>/.rommfs-setup.json`. Rerunning
+with the same server/root verifies them, adds links for newly available
+systems and can recover an interrupted link step. A changed/unowned link is
+preserved and rejected. Older whole-`roms` link installs keep working. Targeted frontend
 settings edits get an `es_settings.cfg.rommfs-<id>.bak` configuration backup.
 The system-level Switch save option is enabled; RetroBat's Eden/Citron launchers
 then generate their distinct save-location keys. Missing emulators are reported
