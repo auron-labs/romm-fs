@@ -727,7 +727,10 @@ impl UiState {
                 self.save_sync_existing_saves = existing_saves.clone();
                 self.save_sync_preview = preview_saves.clone();
                 self.save_sync_available = *available;
-                self.save_sync_problem = selected_problem.clone();
+                self.save_sync_problem = selected_problem
+                    .as_deref()
+                    .map(|raw| crate::problem::UserProblem::from_text("Save sync", raw))
+                    .and_then(|problem| problem.cause);
                 self.save_sync_enabled = *enabled;
                 self.save_sync_debounce_secs = *debounce_secs;
             }
@@ -971,6 +974,38 @@ impl UiState {
         }
     }
 
+    /// Save files that match no game in the library (stock emulator data and
+    /// the like). They are never synced; the review page collapses them.
+    pub fn save_files_ignored(&self) -> usize {
+        self.save_file_unmatched
+            .iter()
+            .filter(|file| file.no_candidate)
+            .count()
+    }
+
+    /// The save-sync problem worth interrupting the user for. Save sync is
+    /// silent until the user enables it: a missing folder or unverified
+    /// account is a setup hint then, not something needing attention.
+    pub fn save_sync_attention(&self) -> Option<String> {
+        if !self.save_sync_enabled {
+            return None;
+        }
+        self.save_sync_failure
+            .clone()
+            .or_else(|| self.save_sync_problem.clone())
+            .or_else(|| {
+                self.save_sync_queue
+                    .as_ref()
+                    .and_then(|queue| queue.failure.clone())
+            })
+    }
+
+    /// One-line hint shown while save sync is off and cannot be enabled yet.
+    pub fn save_sync_off_hint(&self) -> Option<&'static str> {
+        (!self.save_sync_enabled && !self.save_sync_available && self.save_sync_problem.is_some())
+            .then_some("Save sync is off. Choose a save folder or RetroBat installation in Settings to use it.")
+    }
+
     /// The one derived save-sync status (UI-PLAN §5 table). Zero eligible
     /// files is not "up to date"; an unlinked-file count does not downgrade
     /// an otherwise healthy linked set.
@@ -1199,6 +1234,7 @@ impl Controller {
             },
             None => sink,
         };
+        crate::trace_bridge::TraceBridge::install(sink.clone());
         let (cmd_tx, cmd_rx) = mpsc::channel::<CommandEnvelope>();
         let worker_sink = sink.clone();
         let save_sync_gate = SaveSyncCommandGate::new();
@@ -3842,48 +3878,89 @@ fn claim_mount_root(root: &Path, server_id: &str) -> Result<()> {
     rommfs_cfapi::claim_mount_root(root, server_id).map_err(mount_root_error)
 }
 
-/// Collapse the per-file repeats a catalogue build produces ("rom 824 file
-/// 5425: …") into one Activity line per (rom, reason). The complete detail is
-/// written to the diagnostic file, where bulk output belongs.
+/// Aggregate the per-file warnings a catalogue build produces into one line
+/// per reason with a count and a few examples. Per-file detail is dropped: a
+/// large library produced thousands of near-identical lines every refresh.
 fn emit_catalogue_warnings(sink: &EventSink, warnings: Vec<String>) {
-    let mut grouped: std::collections::BTreeMap<String, usize> = Default::default();
-    for warning in &warnings {
-        sink.log_detail(Level::Warn, "catalogue", warning.clone());
-        *grouped.entry(summarize_warning(warning)).or_default() += 1;
-    }
-    for (message, count) in grouped {
-        sink.emit(AppEvent::log(
-            Level::Warn,
-            "catalogue",
-            if count > 1 {
-                format!("{message} (×{count})")
-            } else {
-                message
-            },
-        ));
+    for message in summarize_catalogue_warnings(&warnings) {
+        sink.emit(AppEvent::log(Level::Warn, "catalogue", message));
     }
 }
 
-/// "rom 824 file 5425: reason" → "rom 824: reason"; "file 228: invalid
-/// category" → "invalid category". Anything already aggregate passes through.
-fn summarize_warning(warning: &str) -> String {
-    if let Some(rest) = warning.strip_prefix("rom ") {
-        if let Some((rom, rest)) = rest.split_once(' ') {
-            if let Some(rest) = rest.strip_prefix("file ") {
-                if let Some((_, reason)) = rest.split_once(": ") {
-                    return format!("rom {rom}: {reason}");
-                }
+#[derive(Default)]
+struct WarningGroup {
+    /// Distinct subjects, so a rom-level and file-level report of the same
+    /// thing count once.
+    subjects: std::collections::BTreeSet<(i64, i64)>,
+    files: bool,
+    other: usize,
+}
+
+const WARNING_EXAMPLES: usize = 5;
+
+/// "rom 12 file 40: reason" → ((12, 40), reason); "rom 12: reason" →
+/// ((12, 0), reason). Anything else passes through unparsed.
+/// (rom id, file id or 0), whether it was file-scoped, the reason.
+type ParsedWarning<'a> = ((i64, i64), bool, &'a str);
+
+fn parse_catalogue_warning(warning: &str) -> Option<ParsedWarning<'_>> {
+    let rest = warning.strip_prefix("rom ")?;
+    let (rom, rest) = rest.split_once([' ', ':'])?;
+    let rom: i64 = rom.parse().ok()?;
+    // `rest` begins just after the separator that ended the id.
+    let separator = warning.as_bytes()["rom ".len() + rom.to_string().len()];
+    if separator == b':' {
+        return Some(((rom, 0), false, rest.trim_start()));
+    }
+    let (file, reason) = rest.strip_prefix("file ")?.split_once(": ")?;
+    Some(((rom, file.parse().ok()?), true, reason))
+}
+
+fn summarize_catalogue_warnings(warnings: &[String]) -> Vec<String> {
+    let mut groups: std::collections::BTreeMap<String, WarningGroup> = Default::default();
+    for warning in warnings {
+        match parse_catalogue_warning(warning) {
+            Some((subject, is_file, reason)) => {
+                // Per-file detail ("adjusted to <name>") is not part of the reason.
+                let reason = if reason.starts_with("visible path adjusted") {
+                    "visible path adjusted"
+                } else {
+                    reason
+                };
+                let group = groups.entry(reason.to_string()).or_default();
+                group.files |= is_file;
+                group.subjects.insert(subject);
             }
+            None => groups.entry(warning.clone()).or_default().other += 1,
         }
-        return warning.to_string();
     }
-    if let Some((_, reason)) = warning
-        .strip_prefix("file ")
-        .and_then(|r| r.split_once(": "))
-    {
-        return reason.to_string();
-    }
-    warning.to_string()
+    groups
+        .into_iter()
+        .map(|(reason, group)| {
+            if group.subjects.is_empty() {
+                return if group.other > 1 {
+                    format!("{reason} (\u{d7}{})", group.other)
+                } else {
+                    reason
+                };
+            }
+            let examples: Vec<String> = group
+                .subjects
+                .iter()
+                .take(WARNING_EXAMPLES)
+                .map(|(rom, file)| match file {
+                    0 => format!("rom {rom}"),
+                    file => format!("rom {rom} file {file}"),
+                })
+                .collect();
+            format!(
+                "{} {}: {reason} (e.g. {})",
+                group.subjects.len(),
+                if group.files { "files" } else { "roms" },
+                examples.join(", ")
+            )
+        })
+        .collect()
 }
 
 fn mount_root_error(e: anyhow::Error) -> Error {
@@ -4019,6 +4096,25 @@ fn log_line(level: Level, op: &'static str, message: String) -> rommfs_core::eve
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn catalogue_warnings_collapse_to_one_counted_line_per_reason() {
+        let mut warnings: Vec<String> = (1..=8)
+            .map(|n| format!("rom {n} file {}: original file retained but its extension is not launchable by this frontend", n * 10))
+            .collect();
+        warnings.push("rom 3: no original file records".into());
+        warnings.push("rom 4: no original file records".into());
+        warnings.push("rom 1 file 10: visible path adjusted to \"a (1).zip\"".into());
+        warnings.push("rom 2 file 20: visible path adjusted to \"b (1).zip\"".into());
+        warnings.push("platform x: odd".into());
+        let lines = super::summarize_catalogue_warnings(&warnings);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines.contains(&"8 files: original file retained but its extension is not launchable by this frontend (e.g. rom 1 file 10, rom 2 file 20, rom 3 file 30, rom 4 file 40, rom 5 file 50)".to_string()));
+        assert!(lines.contains(&"2 roms: no original file records (e.g. rom 3, rom 4)".to_string()));
+        assert!(lines.contains(
+            &"2 files: visible path adjusted (e.g. rom 1 file 10, rom 2 file 20)".to_string()
+        ));
+        assert!(lines.contains(&"platform x: odd".to_string()));
+    }
     #[test]
     fn application_owner_keeps_worker_alive_after_view_handle_drops_and_quit_joins_once() {
         let (sink, _events) = rommfs_core::events::channel();

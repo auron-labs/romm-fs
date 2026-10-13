@@ -364,6 +364,9 @@ struct RommfsWindow {
     /// Row key expanded to its detail block (file id or title key).
     #[allow(dead_code)] // read by pages/save_review.rs
     save_review_expanded: Option<SharedString>,
+    /// Whether files that match no game in the library are listed.
+    #[allow(dead_code)] // read by pages/save_review.rs
+    save_review_show_ignored: bool,
     // --- Activity page state (window/pages/activity.rs) ---
     /// Minimum log severity shown: 0 = everything, 1 = warnings+errors,
     /// 2 = errors only.
@@ -607,6 +610,7 @@ impl RommfsWindow {
             save_review_search,
             save_review_page: 0,
             save_review_expanded: None,
+            save_review_show_ignored: false,
             activity_min_level: 0,
             activity_follow_log: true,
             activity_search,
@@ -1257,9 +1261,12 @@ impl RommfsWindow {
                             .child(section_heading("Save sync"))
                             .child(status_marker(sync_kind, sync_text, cx)),
                     )
-                    .when_some(self.state.save_sync_problem.clone(), |this, problem| {
-                        this.child(muted(problem, cx))
-                    })
+                    .when_some(
+                        self.state
+                            .save_sync_attention()
+                            .or_else(|| self.state.save_sync_off_hint().map(str::to_owned)),
+                        |this, problem| this.child(muted(problem, cx)),
+                    )
                     .when(
                         self.state.save_sync_summary() == SaveSyncSummary::NoLinkedFiles
                             && unlinked > 0,

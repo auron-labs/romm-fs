@@ -360,6 +360,9 @@ pub struct EventSink {
     tx: mpsc::Sender<AppEvent>,
     active: Option<Arc<std::sync::atomic::AtomicBool>>,
     diagnostic_log: Option<Arc<Mutex<crate::diagnostics::DiagnosticLog>>>,
+    /// Shared by every clone so progress is throttled per kind, not per worker.
+    progress_throttle: Arc<Mutex<crate::diagnostics::ProgressThrottle>>,
+    started: std::time::Instant,
 }
 
 impl EventSink {
@@ -385,7 +388,89 @@ impl EventSink {
         }
         // Do not Debug arbitrary events: browser approval URLs contain pairing
         // codes. Persist only allowlisted facts and explicit credential-free logs.
-        let diagnostic_line = match &event {
+        let diagnostic_line = if self.throttled_progress(&event) {
+            None
+        } else {
+            self.diagnostic_line(&event)
+        };
+        if let (Some(log), Some(line)) = (&self.diagnostic_log, &diagnostic_line) {
+            if let Ok(mut log) = log.lock() {
+                if let Err(error) = log.append(line) {
+                    let _ = self.tx.send(AppEvent::log(
+                        Level::Error,
+                        "diagnostics",
+                        format!("Diagnostic log write failed: {error}"),
+                    ));
+                }
+            }
+        }
+        // Never block or panic a worker on UI backpressure.
+        let _ = self.tx.send(event);
+    }
+
+    /// True for a progress tick that the durable log should skip. The UI
+    /// still receives every event.
+    fn throttled_progress(&self, event: &AppEvent) -> bool {
+        use crate::diagnostics::ProgressSample;
+        let (kind, sample) = match event {
+            AppEvent::RetroBatInstaller {
+                running,
+                ready,
+                received,
+                total,
+                detail,
+                error,
+            } => (
+                "RetroBatInstaller",
+                ProgressSample {
+                    running: *running,
+                    ready: *ready,
+                    error: error.as_deref(),
+                    detail,
+                    fraction: total
+                        .filter(|total| *total > 0)
+                        .map(|total| *received as f64 / total as f64),
+                },
+            ),
+            AppEvent::AuxiliaryStatus {
+                running,
+                detail,
+                error,
+                ..
+            } => (
+                "AuxiliaryStatus",
+                ProgressSample {
+                    running: *running,
+                    ready: false,
+                    error: error.as_deref(),
+                    detail,
+                    fraction: count_fraction(detail),
+                },
+            ),
+            AppEvent::RetroBatSetup {
+                running,
+                detail,
+                error,
+            } => (
+                "RetroBatSetup",
+                ProgressSample {
+                    running: *running,
+                    ready: false,
+                    error: error.as_deref(),
+                    detail,
+                    fraction: count_fraction(detail),
+                },
+            ),
+            _ => return false,
+        };
+        let now_ms = self.started.elapsed().as_millis() as u64;
+        self.progress_throttle
+            .lock()
+            .is_ok_and(|mut throttle| !throttle.admit(kind, &sample, now_ms))
+    }
+
+    fn diagnostic_line(&self, event: &AppEvent) -> Option<LogLine> {
+        match event {
             // MountProgress is deliberately not persisted: it fires per small
             // batch and dominated the diagnostic log (2MB+ per session). Mount
             // start/finish/failure timestamps still bound every stage.
@@ -409,20 +494,7 @@ impl EventSink {
                 message: format!("{event:?}"),
             }),
             _ => None,
-        };
-        if let (Some(log), Some(line)) = (&self.diagnostic_log, &diagnostic_line) {
-            if let Ok(mut log) = log.lock() {
-                if let Err(error) = log.append(line) {
-                    let _ = self.tx.send(AppEvent::log(
-                        Level::Error,
-                        "diagnostics",
-                        format!("Diagnostic log write failed: {error}"),
-                    ));
-                }
-            }
         }
-        // Never block or panic a worker on UI backpressure.
-        let _ = self.tx.send(event);
     }
 
     /// Append a line to the durable diagnostic file only — never the UI's
@@ -451,6 +523,8 @@ pub fn channel() -> (EventSink, mpsc::Receiver<AppEvent>) {
             tx,
             active: None,
             diagnostic_log: None,
+            progress_throttle: Default::default(),
+            started: std::time::Instant::now(),
         },
         rx,
     )
@@ -511,4 +585,22 @@ impl LogBuffer {
     pub fn lines(&self) -> impl Iterator<Item = &LogLine> {
         self.lines.iter()
     }
+}
+
+/// "… 32 / 146" → 32/146 as a fraction, when the detail carries counts.
+fn count_fraction(detail: &str) -> Option<f64> {
+    let (left, right) = detail.split_once('/')?;
+    let done: f64 = left
+        .trim_end()
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    let total: f64 = right
+        .trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    (total > 0.0).then_some(done / total)
 }

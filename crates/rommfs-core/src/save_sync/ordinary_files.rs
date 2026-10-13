@@ -32,6 +32,11 @@ pub struct UnmatchedFile {
     /// structural exclusions (unsafe paths, shared saves/cards) that must stay
     /// unmatched no matter which game is chosen.
     pub mappable: bool,
+    /// True when no game in the catalogue is a candidate owner at all (stock
+    /// emulator files, other tools' data). Ambiguous files, where several
+    /// games could own the file, are never flagged: they need a decision.
+    /// Presentation only; the file is still never uploaded or deleted.
+    pub no_candidate: bool,
 }
 
 impl UnmatchedFile {
@@ -145,12 +150,19 @@ impl SaveFileRules {
         self.mapping(rom_id, path, root).map(Some)
     }
     pub fn associate(&self, path: &Path, root: &Path) -> Result<Option<SaveMapping>> {
+        self.associate_counted(path, root)
+            .map(|(mapping, _)| mapping)
+    }
+    /// `associate` plus the number of candidate owner games found when the
+    /// file was matched by convention (0 means nothing in the catalogue
+    /// could own it; more than 1 is ambiguous).
+    fn associate_counted(&self, path: &Path, root: &Path) -> Result<(Option<SaveMapping>, usize)> {
         let relative = portable_save_path(path)?;
         if shared_path(&relative) {
-            return Ok(None);
+            return Ok((None, 1));
         }
         if let Some(id) = self.explicit.get(&relative) {
-            return self.mapping(*id, path, root).map(Some);
+            return self.mapping(*id, path, root).map(|m| (Some(m), 1));
         }
         let lower = relative.to_lowercase();
         let components: Vec<_> = lower.split('/').collect();
@@ -194,10 +206,10 @@ impl SaveFileRules {
             }
         }
         if owners.len() != 1 {
-            return Ok(None);
+            return Ok((None, owners.len()));
         }
         self.mapping(*owners.iter().next().expect("one owner"), path, root)
-            .map(Some)
+            .map(|m| (Some(m), 1))
     }
     pub fn scan(&self, root: &Path) -> Result<SaveFilePlan> {
         super::ensure_no_reparse_components(root)?;
@@ -211,6 +223,7 @@ impl SaveFileRules {
                     path: PathBuf::from(path),
                     reason: format!("associated game {id} is unavailable; select another game"),
                     mappable: true,
+                    no_candidate: false,
                 })
                 .collect(),
         };
@@ -242,6 +255,7 @@ impl SaveFileRules {
                         path: relative.to_path_buf(),
                         reason: "redirected or unsafe path".into(),
                         mappable: false,
+                        no_candidate: false,
                     });
                     continue;
                 }
@@ -250,6 +264,7 @@ impl SaveFileRules {
                         path: relative.to_path_buf(),
                         reason: "shared saves/cards are not supported".into(),
                         mappable: false,
+                        no_candidate: false,
                     });
                     continue;
                 }
@@ -263,17 +278,19 @@ impl SaveFileRules {
                     {
                         continue;
                     }
-                    match self.associate(relative, root) {
-                        Ok(Some(mapping)) => plan.report.mappings.push(mapping),
-                        Ok(None) => plan.unmatched.push(UnmatchedFile {
+                    match self.associate_counted(relative, root) {
+                        Ok((Some(mapping), _)) => plan.report.mappings.push(mapping),
+                        Ok((None, candidates)) => plan.unmatched.push(UnmatchedFile {
                             path: relative.to_path_buf(),
                             reason: "select the owning game".into(),
                             mappable: true,
+                            no_candidate: candidates == 0,
                         }),
                         Err(error) => plan.unmatched.push(UnmatchedFile {
                             path: relative.to_path_buf(),
                             reason: error.to_string(),
                             mappable: false,
+                            no_candidate: false,
                         }),
                     }
                 }

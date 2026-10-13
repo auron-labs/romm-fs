@@ -11,5 +11,6 @@ mod save_sync_agent;
 mod save_sync_native;
 #[cfg(feature = "ui")]
 mod session;
+mod trace_bridge;
 #[cfg(feature = "ui")]
 pub mod window;

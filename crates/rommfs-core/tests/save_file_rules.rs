@@ -33,6 +33,16 @@ fn scan_associates_multiple_files_by_unique_stem_or_server_target_and_reports_am
     let plan = rules.scan(dir.path()).unwrap();
     assert_eq!(plan.report.mappings.len(), 4);
     assert_eq!(plan.unmatched.len(), 3);
+    let flag = |name: &str| {
+        plan.unmatched
+            .iter()
+            .find(|file| file.path == Path::new(name))
+            .unwrap_or_else(|| panic!("{name} should be unmatched"))
+            .no_candidate
+    };
+    // No game could own it: ignorable. Structural exclusions are not.
+    assert!(flag("switch/unknown.dat"));
+    assert!(!flag("switch/memcards"));
     let explicit = BTreeMap::from([("switch/unknown.dat".into(), 2)]);
     let rules = SaveFileRules::from_catalogue(&catalogue, &roms, explicit).unwrap();
     assert_eq!(rules.scan(dir.path()).unwrap().report.mappings.len(), 5);

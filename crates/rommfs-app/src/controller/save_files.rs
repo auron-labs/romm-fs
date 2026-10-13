@@ -375,7 +375,7 @@ impl Worker {
             profile_version: profile.map(|p| p.version.clone()),
             account_id: self.save_sync_identity.as_ref().map(|i| i.account_id),
             mapped_targets: report.map_or(0, |r| r.mappings.len()),
-            catalogue_unmapped: unmatched.len(),
+            catalogue_unmapped: unmatched.iter().filter(|file| !file.no_candidate).count(),
             existing_saves: None,
             preview_saves: report
                 .map(|r| {

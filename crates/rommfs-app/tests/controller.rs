@@ -878,3 +878,31 @@ fn progress_counts_are_parsed_from_status_lines() {
     assert_eq!(parse_progress_counts("Starting"), None);
     assert_eq!(parse_progress_counts("0 / 0"), None);
 }
+
+#[test]
+fn save_sync_is_silent_until_enabled() {
+    let mut ui = linked_ui();
+    ui.save_sync_problem = Some("Choose a save-data folder.".into());
+    assert_eq!(ui.save_sync_attention(), None);
+    assert!(ui.save_sync_off_hint().is_some());
+    ui.save_sync_enabled = true;
+    assert_eq!(
+        ui.save_sync_attention().as_deref(),
+        Some("Choose a save-data folder.")
+    );
+    assert_eq!(ui.save_sync_off_hint(), None);
+}
+
+#[test]
+fn files_matching_no_game_are_counted_as_ignored() {
+    use rommfs_core::save_sync::UnmatchedFile;
+    let mut ui = linked_ui();
+    let file = |name: &str, no_candidate| UnmatchedFile {
+        path: name.into(),
+        reason: "select the owning game".into(),
+        mappable: true,
+        no_candidate,
+    };
+    ui.save_file_unmatched = vec![file("a.nvmem", true), file("b.sav", false)];
+    assert_eq!(ui.save_files_ignored(), 1);
+}

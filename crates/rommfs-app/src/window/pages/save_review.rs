@@ -99,7 +99,7 @@ struct ReviewRow {
 
 /// One flat review list: queue failures and incoming saves first, then
 /// unlinked files, linked games, and structural exclusions.
-fn collect_review_rows(state: &UiState) -> Vec<ReviewRow> {
+fn collect_review_rows(state: &UiState, show_ignored: bool) -> Vec<ReviewRow> {
     let mut rows = Vec::new();
 
     // Folder scope for AssociateSaveFolder: mappable files per save-root dir.
@@ -116,6 +116,9 @@ fn collect_review_rows(state: &UiState) -> Vec<ReviewRow> {
     }
 
     for file in &state.save_file_unmatched {
+        if file.no_candidate && !show_ignored {
+            continue;
+        }
         let path = file.path.display().to_string();
         let dir = file
             .path
@@ -319,9 +322,13 @@ impl RommfsWindow {
             .child(muted_xs(scope, cx))
             .child(muted_xs(
                 format!(
-                    "{} mapped files · {} unmatched files",
+                    "{} mapped files · {} unmatched files{}",
                     fmt_count(self.state.save_sync_mapped_targets),
                     fmt_count(self.state.save_sync_catalogue_unmapped),
+                    match self.state.save_files_ignored() {
+                        0 => String::new(),
+                        ignored => format!(" · {} ignored", fmt_count(ignored)),
+                    },
                 ),
                 cx,
             ))
@@ -330,20 +337,31 @@ impl RommfsWindow {
                 existing_save_inventory_summary(self.state.save_sync_existing_saves.as_ref()),
                 cx,
             ));
-        if !enabled && !self.state.save_sync_available {
+        if let Some(hint) = self.state.save_sync_off_hint() {
+            card = card.child(muted_xs(hint, cx)).child(self.nav_button(
+                "save-sync-open-settings",
+                "Open Settings",
+                3,
+                false,
+                cx,
+            ));
+        } else if !enabled && !self.state.save_sync_available {
             card = card.child(muted_xs(
                 "Save sync needs a configured save folder — set one up in Settings.",
                 cx,
             ));
         }
-        if let Some(problem) = self.state.save_sync_problem.clone() {
-            card = card.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().warning)
-                    .child(format!("Paused: {problem}")),
-            );
+        if enabled {
+            if let Some(problem) = self.state.save_sync_problem.clone() {
+                card = card.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().warning)
+                        .child(format!("Paused: {problem}")),
+                );
+            }
         }
+        let failure = failure.filter(|_| enabled);
         if let Some(failure) = failure {
             card = card.child(error_line(format!("Last failure: {failure}"), cx));
         }
@@ -818,7 +836,7 @@ pub fn render(
         .value()
         .to_string()
         .to_lowercase();
-    let rows = collect_review_rows(&view.state);
+    let rows = collect_review_rows(&view.state, view.save_review_show_ignored);
     let total_rows = rows.len();
     let filtered: Vec<&ReviewRow> = rows
         .iter()
@@ -896,6 +914,33 @@ pub fn render(
         table = table.child(view.save_review_manual_row(window, cx));
     }
 
+    let ignored = view.state.save_files_ignored();
+    let ignored_row = (ignored > 0).then(|| {
+        let shown = view.save_review_show_ignored;
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(muted_xs(
+                format!(
+                    "{} file{} don't belong to games in your library \u{2014} {}.",
+                    fmt_count(ignored),
+                    if ignored == 1 { "" } else { "s" },
+                    if shown { "shown below" } else { "ignored" }
+                ),
+                cx,
+            ))
+            .child(
+                Button::new("save-review-toggle-ignored")
+                    .label(if shown { "Hide" } else { "Show" })
+                    .outline()
+                    .small()
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.save_review_show_ignored = !view.save_review_show_ignored;
+                        view.save_review_page = 0;
+                        cx.notify();
+                    })),
+            )
+    });
     let mut section = v_flex()
         .gap_2()
         .child(
@@ -925,6 +970,7 @@ pub fn render(
                     )),
                 ),
         )
+        .children(ignored_row)
         .child(
             div()
                 .rounded(cx.theme().radius)

@@ -140,17 +140,7 @@ fn attention_section(
         };
         rows.push(attention_row(message, None, cx).into_any_element());
     }
-    let save_sync_error = state
-        .save_sync_failure
-        .as_ref()
-        .or(state.save_sync_problem.as_ref())
-        .or_else(|| {
-            state
-                .save_sync_queue
-                .as_ref()
-                .and_then(|queue| queue.failure.as_ref())
-        })
-        .cloned();
+    let save_sync_error = state.save_sync_attention();
     if let Some(error) = save_sync_error {
         rows.push(
             attention_row(
@@ -162,10 +152,11 @@ fn attention_section(
             )
             .into_any_element(),
         );
-    } else if state
-        .save_sync_queue
-        .as_ref()
-        .is_some_and(|queue| queue.actor_failed)
+    } else if state.save_sync_enabled
+        && state
+            .save_sync_queue
+            .as_ref()
+            .is_some_and(|queue| queue.actor_failed)
     {
         rows.push(
             attention_row(
