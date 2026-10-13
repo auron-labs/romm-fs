@@ -13,7 +13,7 @@ Shared saves/cards are excluded. RetroBat 8.2.1 is a research reference, never
 an exact-version compatibility gate.
 
 This is **required scope**, not a claim that every feature is implemented.
-See [implementation status](../IMPLEMENTATION-STATUS.md) for outstanding work.
+See [implementation status](../../docs/validation/2026-10-12.md) for outstanding work.
 Complete applicable Linux checks; Windows runtime and human validation remain
 deferred and do not block implementation. The original PoC baseline below is
 retained for historical context, not as authority for conflicting restrictions.

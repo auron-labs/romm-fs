@@ -13,16 +13,13 @@ record the blocked case rather than silently skipping it. Do not modify the
 application or a real RetroBat installation to make acceptance pass; report
 reproducible defects separately.
 
-**Current validation status:** all Windows runtime and human cases remain
-pending on the Linux implementation host. Do not run them as a prerequisite for
-continuing implementation. [Implementation status](../.planning/IMPLEMENTATION-STATUS.md)
-separates implemented code from deferred runtime acceptance.
+**Current validation status:** the Linux portable suite and a Windows Server 2022 diagnostic run are recorded in the [dated validation record](../validation/2026-10-12.md). Windows 10/11 client acceptance and the specific manual cases listed in that record remain open. The sections below are the repeatable procedure and evidence template. The dated record identifies executed cases; update it when new evidence is collected. Do not infer a pass from a command that ran zero tests.
 Portable ordinary-file fixtures and the full Windows UI cross-target check are
 not evidence of emulator, tray, installer or native save-lock behavior.
 
 ## Start a local demo server
 
-For a quick desktop test, use the root [compose.dev.yaml](../compose.dev.yaml).
+For a quick desktop test, use the root [compose.dev.yaml](../../compose.dev.yaml).
 It pins RomM 5.3.1 and MariaDB 11.8, matching the existing harness versions.
 RomM rejects SQLite as a database backend; see its
 [database configuration](https://github.com/rommapp/romm/blob/5.3.1/backend/config/config_manager.py).
@@ -350,11 +347,11 @@ $null = Invoke-LoggedCommand 'NATIVE-DIRECTORY-GUARD' { cargo test --locked -p r
 $null = Invoke-LoggedCommand 'NATIVE-CANONICAL-PATHS' { cargo test --locked -p rommfs-core --lib save_sync::path::tests::windows_canonicalized_paths_accept_existing_and_missing_children -- --exact --nocapture --test-threads=1 }
 $null = Invoke-LoggedCommand 'NATIVE-ANCESTOR-JUNCTION' { cargo test --locked -p rommfs-core --lib save_sync::path::tests::windows_canonicalized_ancestor_junction_is_rejected -- --exact --nocapture --test-threads=1 }
 $null = Invoke-LoggedCommand 'NATIVE-CANONICAL-PUBLISH' { cargo test --locked -p rommfs-app --no-default-features --lib save_sync_agent::files::tests::windows_canonicalized_save_paths_publish_without_replacing -- --exact --nocapture --test-threads=1 }
-$null = Invoke-LoggedCommand 'NATIVE-CANONICAL-EXPORT' { cargo test --locked -p rommfs-app --no-default-features --lib save_sync_agent::tests::canonicalized_export_parent_accepts_save_export -- --exact --nocapture --test-threads=1 }
+$null = Invoke-LoggedCommand 'NATIVE-CANONICAL-EXPORT' { cargo test --locked -p rommfs-app --no-default-features --lib save_sync_agent::tests::exports::canonicalized_export_parent_accepts_save_export -- --exact --nocapture --test-threads=1 }
 $null = Invoke-LoggedCommand 'NATIVE-NO-CLOBBER-BOUNDARY' { cargo test --locked -p rommfs-app --no-default-features --lib save_sync_agent::files::tests::windows_publication_does_not_replace_a_file_created_at_the_boundary -- --exact --nocapture --test-threads=1 }
-$null = Invoke-LoggedCommand 'NATIVE-FILESYSTEM-WATCHER' { cargo test --locked -p rommfs-app --no-default-features --lib save_sync_agent::tests::real_filesystem_notification_drives_the_agent_without_waiting_for_fallback_scan -- --exact --nocapture --test-threads=1 }
-$null = Invoke-LoggedCommand 'PROFILE-VERSION-MARKERS' { cargo test --locked -p rommfs-core --lib save_sync::profile::tests::version_markers_are_diagnostics_not_compatibility_gates -- --exact --nocapture --test-threads=1 }
-$null = Invoke-LoggedCommand 'PROFILE-STOCK-821' { cargo test --locked -p rommfs-core --lib save_sync::profile::tests::verifies_stock_821_gambatte_and_resolves_uncreated_saves_root -- --exact --nocapture --test-threads=1 }
+$null = Invoke-LoggedCommand 'NATIVE-FILESYSTEM-WATCHER' { cargo test --locked -p rommfs-app --no-default-features --lib save_sync_agent::tests::lifecycle::real_filesystem_notification_drives_the_agent_without_waiting_for_fallback_scan -- --exact --nocapture --test-threads=1 }
+$null = Invoke-LoggedCommand 'PROFILE-VERSION-MARKERS' { cargo test --locked -p rommfs-core --lib save_sync::legacy_gb_profile::tests::version_markers_are_diagnostics_not_compatibility_gates -- --exact --nocapture --test-threads=1 }
+$null = Invoke-LoggedCommand 'PROFILE-STOCK-821' { cargo test --locked -p rommfs-core --lib save_sync::legacy_gb_profile::tests::verifies_stock_821_gambatte_and_resolves_uncreated_saves_root -- --exact --nocapture --test-threads=1 }
 ```
 
 Each `NATIVE-*` and `PROFILE-*` command must execute exactly one test. If it
@@ -391,7 +388,7 @@ If a failure occurs, retain the first log. Re-run the failing test alone to
 investigate; record both outcomes if it is intermittent. A build failure blocks
 downstream runtime checks and must not be described as a failed runtime assertion.
 
-### New setup/metadata acceptance cases — all pending
+### Setup and metadata acceptance cases
 
 Use disposable installs and roots, never a real game/save library. Run the
 native CFAPI regression above as a standard user; it now publishes writable
@@ -409,7 +406,7 @@ exceptions rather than treating skipped protection checks as passes.
 | `META-ACTIVITY` | Refresh while EmulationStation or a Switch emulator runs, then exit. Also exercise unavailable access permissions. | Ready metadata waits, does not clobber in-memory history, publishes after safe exclusive access, and reports access/capability failures. |
 | `META-NETWORK` | Trace listing, XML generation and artwork requests separately. Include missing artwork and a rejected session. | No ROM bodies/detail requests; missing artwork nonfatal, authentication rejection requires sign-in, local references load in RetroBat. |
 
-### Installer, ordinary files, auxiliaries and lifecycle — all pending
+### Installer, ordinary files, auxiliaries and lifecycle acceptance cases
 
 | Case | Procedure | Required evidence |
 | --- | --- | --- |
@@ -428,7 +425,7 @@ exceptions rather than treating skipped protection checks as passes.
 
 ## 3. Test a real RomM through CFAPI
 
-Use the [local harness](romm-harness/README.md) with Docker Desktop running Linux
+Use the [local harness](../../testing/romm-harness/README.md) with Docker Desktop running Linux
 containers. From the repository root:
 
 ```powershell
@@ -758,7 +755,7 @@ not a complete zero-file result. Legacy GB-profile tests cover migration only.
 
 Run these after the basic mount checks. Use either the generated demo server or
 the committed harness, and record which URL/account/root each case uses. These
-cases cover [UI-PLAN tasks 1–6](../.planning/archived/UI-PLAN.md#7-implementation-order)
+cases cover [UI-PLAN tasks 1–6](../../.planning/archived/UI-PLAN.md#7-implementation-order)
 and the final folder/session fixes in the merged branch. They are acceptance
 targets, not a claim that the current checkout passes them.
 
@@ -985,6 +982,6 @@ backing up valid saves/configuration. Stop at deadlines, report residual
 blockers, and do not give an overall `PASS` while a required runtime case is
 blocked or not run.
 
-Use [the approved save-sync scope](../.planning/archived/PLAN.md#step-6--generalize-save-synchronization) for acceptance contracts
-and [README.md](../README.md) for supported behavior. Preserve historical
+Use [the approved save-sync scope](../../.planning/archived/PLAN.md#step-6--generalize-save-synchronization) for acceptance contracts
+and [user guide](../user-guide.md) for supported behavior. Preserve historical
 verification statements unless this run supplies evidence to update them.

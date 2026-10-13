@@ -16,7 +16,7 @@ Input: [NOTES.md](NOTES.md), including the original findings, production logs, a
 - [x] Focused desktop views, packaged/tray icon, single instance and optional ordered login startup.
 - [x] Final full-scope verification/review and reconciled evidence ledger: 242 portable passes, warning-denied Linux/Windows UI checks, dependency/secret scans, formatting and local documentation links.
 
-Detailed evidence and compatibility limits: [implementation status](../IMPLEMENTATION-STATUS.md).
+Detailed evidence and compatibility limits: [implementation status](../../docs/validation/2026-10-12.md).
 The Windows/human checks in section 5 remain unchecked; implemented does not mean runtime-validated.
 
 ## 1. Target outcome
@@ -27,7 +27,7 @@ The RetroBat support statement will be:
 
 > The RetroBat integration requires a fresh installation configured through RomMFS setup. Its ROM directory must be empty or already managed by RomMFS.
 
-RetroBat 8.2.1 is a source/package reference, not an enforced version requirement or a claim of completed runtime testing. Accept other releases, including patch upgrades, when the required layout and settings are present. Version numbers are diagnostic information; never reject an installation solely because it differs from 8.2.1. Report a specific missing capability when it prevents an operation. RomM 5.3.1 is the existing API baseline in [API-CONTRACT.md](../API-CONTRACT.md).
+RetroBat 8.2.1 is a source/package reference, not an enforced version requirement or a claim of completed runtime testing. Accept other releases, including patch upgrades, when the required layout and settings are present. Version numbers are diagnostic information; never reject an installation solely because it differs from 8.2.1. Report a specific missing capability when it prevents an operation. RomM 5.3.1 is the existing API baseline in [RomM API contract](../../docs/contracts/romm-api.md).
 
 Implementation is being done on Linux. Complete source research, implementation, and applicable automated Linux checks here. All real Windows execution and all human testing are deferred to section 5; they do not block implementation or require the user to run checks during this work. Keep those outcomes explicitly unverified.
 
@@ -92,7 +92,7 @@ ROM byte cache, catalogue cache, artwork, and save snapshots have separate lifec
 
 ### Step 1 — Close the specific contract gaps
 
-**Primary files:** `.planning/API-CONTRACT.md`, `.planning/PRD.md`; release investigation feeds the following steps.
+**Primary files:** `docs/contracts/romm-api.md`, `.planning/PRD.md`; release investigation feeds the following steps.
 
 - Inspect the official installer/source for installation arguments, directory layout, and launcher/frontend configuration. Record the release examined for reproducibility and available integrity/signature evidence. Make compatibility depend on required files/settings rather than exact version equality; installer execution is deferred.
 - Verify Eden and Citron's save-location setting from source/configuration samples: config file, serialized key/value, override precedence, and resulting directory. Current launcher source uses `yuzu_mutualize`; do not assume the final serialized key from that name alone. Emulator runtime confirmation is deferred.
@@ -227,7 +227,7 @@ Switch BIOS content consists of firmware and keys in this integration. RetroBat 
 
 ### Step 8 — Finish the desktop workflow and release documentation
 
-**Primary files:** `rommfs-app/src/window.rs`, `controller.rs`, `main.rs`, Windows packaging/resources; `README.md`, `testing/WINDOWS-TESTING.md`.
+**Primary files:** `rommfs-app/src/window.rs`, `controller.rs`, `main.rs`, Windows packaging/resources; `README.md`, `docs/testing/windows.md`.
 
 - Use focused views for **Library/Mount**, **Save sync**, **Activity**, and **Settings**. Keep connection/mount status visible and all content reachable at supported window sizes. Give logs a usable independent scrolling area.
 - Show actual mounting stages from step 2, counts/timings, last catalogue refresh, staged changes, and actionable failures.
@@ -262,7 +262,7 @@ Writing this plan does not run tests. During implementation, use applicable Linu
 - [ ] Desktop: visual/interaction review, small-window scrolling, real browser approval, Credential Manager, taskbar/tray icons, hide/open/quit, and Windows login startup.
 - [ ] Native reliability/performance: actual repeated mount/remount, the reported HTTP 500 reproduction if it recurs, and cold/warm Windows mount timings.
 
-Document procedures in `testing/WINDOWS-TESTING.md` for later execution. Leave these checkboxes pending and report the implementation as awaiting native/manual validation. Do not ask the user to perform them as a prerequisite for continuing work on Linux.
+Document procedures in `docs/testing/windows.md` for later execution. Leave these checkboxes pending and report the implementation as awaiting native/manual validation. Do not ask the user to perform them as a prerequisite for continuing work on Linux.
 
 ## 6. Sources and remaining contract checks
 

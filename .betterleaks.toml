@@ -22,7 +22,7 @@ filter = '''
     finding["secret"] == "private-secret"
 ) || (
     finding["rule_id"] == "generic-password" &&
-    filter.matchesAny(attributes["path"], [`(?:^|/)testing/WINDOWS-TESTING\.md$`]) &&
+    filter.matchesAny(attributes["path"], [`(?:^|/)docs/testing/windows\.md$`]) &&
     finding["secret"] == "[Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPtr)"
 ) || (
     finding["rule_id"] == "generic-api-key" &&
