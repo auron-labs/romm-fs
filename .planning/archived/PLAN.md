@@ -16,7 +16,7 @@ Input: [NOTES.md](NOTES.md), including the original findings, production logs, a
 - [x] Focused desktop views, packaged/tray icon, single instance and optional ordered login startup.
 - [x] Final full-scope verification/review and reconciled evidence ledger: 242 portable passes, warning-denied Linux/Windows UI checks, dependency/secret scans, formatting and local documentation links.
 
-Detailed evidence and compatibility limits: [implementation status](../.planning/IMPLEMENTATION-STATUS.md).
+Detailed evidence and compatibility limits: [implementation status](../IMPLEMENTATION-STATUS.md).
 The Windows/human checks in section 5 remain unchecked; implemented does not mean runtime-validated.
 
 ## 1. Target outcome
@@ -27,7 +27,7 @@ The RetroBat support statement will be:
 
 > The RetroBat integration requires a fresh installation configured through RomMFS setup. Its ROM directory must be empty or already managed by RomMFS.
 
-RetroBat 8.2.1 is a source/package reference, not an enforced version requirement or a claim of completed runtime testing. Accept other releases, including patch upgrades, when the required layout and settings are present. Version numbers are diagnostic information; never reject an installation solely because it differs from 8.2.1. Report a specific missing capability when it prevents an operation. RomM 5.3.1 is the existing API baseline in [API-CONTRACT.md](../.planning/API-CONTRACT.md).
+RetroBat 8.2.1 is a source/package reference, not an enforced version requirement or a claim of completed runtime testing. Accept other releases, including patch upgrades, when the required layout and settings are present. Version numbers are diagnostic information; never reject an installation solely because it differs from 8.2.1. Report a specific missing capability when it prevents an operation. RomM 5.3.1 is the existing API baseline in [API-CONTRACT.md](../API-CONTRACT.md).
 
 Implementation is being done on Linux. Complete source research, implementation, and applicable automated Linux checks here. All real Windows execution and all human testing are deferred to section 5; they do not block implementation or require the user to run checks during this work. Keep those outcomes explicitly unverified.
 
@@ -44,7 +44,7 @@ Implementation is being done on Linux. Complete source research, implementation,
 - When enabled, Windows startup launches RomMFS in the tray, reconnects, mounts, and resumes previously enabled save sync.
 - Cover Switch updates/DLC, cheats, and other library files through explicit API and destination checks followed by implementation for the supported contract.
 
-The approved scope supersedes conflicting PoC restrictions in [PRD.md](../.planning/PRD.md), including memory-only authentication, no tray/autostart, ROM-only metadata, and reload-on-every-mount. Keep one application, one configured server, and one mount; retain the existing Rust crates, GPUI Kit, CFAPI, and SQLite infrastructure.
+The approved scope supersedes conflicting PoC restrictions in [PRD.md](PRD.md), including memory-only authentication, no tray/autostart, ROM-only metadata, and reload-on-every-mount. Keep one application, one configured server, and one mount; retain the existing Rust crates, GPUI Kit, CFAPI, and SQLite infrastructure.
 
 ## 2. Starting evidence
 

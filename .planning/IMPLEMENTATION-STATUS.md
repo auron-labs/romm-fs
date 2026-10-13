@@ -1,6 +1,6 @@
 # Approved-scope implementation status
 
-Updated 2026-10-12. Scope authority: [approved plan](../.scratch/PLAN.md).
+Updated 2026-10-12. Scope authority: [approved plan](archived/PLAN.md).
 This file records implementation, not release or native
 acceptance. `.scratch/STATE.md` is generated separately and is not edited here.
 
@@ -76,7 +76,7 @@ acceptance. `.scratch/STATE.md` is generated separately and is not edited here.
 
 ## Next steps after the UI merge
 
-The [UI plan](../.scratch/UI-PLAN.md) landed in merge `6643626`. The branch adds
+The [UI plan](archived/UI-PLAN.md) landed in merge `6643626`. The branch adds
 Overview, state-specific sign-in and folder actions, reorganized Settings,
 searchable save review with 50-row pages, and Activity operation summaries.
 Its final fixes preserve folder settings across reconnect/reauthentication,
