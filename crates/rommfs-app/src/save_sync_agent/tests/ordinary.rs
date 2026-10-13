@@ -121,7 +121,11 @@ fn clean_agent_discovers_all_file_slots_once_and_keeps_per_file_status() {
         }
     }
     agent.stop();
-    assert!(uploaded,"new ordinary file must be discovered, mapped and uploaded without waiting for the 60-second fallback: {trace:?}; requests={:?}",fx.requests());
+    assert!(
+        uploaded,
+        "new ordinary file must be discovered, mapped and uploaded without waiting for the 60-second fallback: {trace:?}; requests={:?}",
+        fx.requests()
+    );
     let slot = file_slot(new_path).unwrap();
     let saves = fx.saved_saves();
     let found: Vec<_> = saves.iter().filter(|s| s.slot == slot).collect();
