@@ -14,8 +14,8 @@ application or a real RetroBat installation to make acceptance pass; report
 reproducible defects separately.
 
 **Current validation status:** the Linux portable suite and a Windows Server 2022 diagnostic run are recorded in the [dated validation record](../validation/2026-10-12.md). Windows 10/11 client acceptance and the specific manual cases listed in that record remain open. The sections below are the repeatable procedure and evidence template. The dated record identifies executed cases; update it when new evidence is collected. Do not infer a pass from a command that ran zero tests.
-Portable ordinary-file fixtures and the full Windows UI cross-target check are
-not evidence of emulator, tray, installer or native save-lock behavior.
+Portable ordinary-file fixtures and the UI compilation check are not evidence
+of emulator, tray, installer or native save-lock behavior.
 
 ## Start a local demo server
 
@@ -205,13 +205,15 @@ EmulationStation's version as corroborating evidence, not as a replacement for
 so rather than infer a version. On the test host, use the real install root:
 
 ```powershell
+. ./scripts/windows-test-support.ps1
 $RunId = '{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), ([guid]::NewGuid().ToString('N').Substring(0, 8))
-$Evidence = Join-Path $env:TEMP "rommfs-test-$RunId"
-New-Item -ItemType Directory -Path $Evidence | Out-Null
-@('commands', 'native', 'harness', 'desktop', 'saves', 'screenshots') | ForEach-Object {
-    New-Item -ItemType Directory -Path (Join-Path $Evidence $_) | Out-Null
-}
+$EvidencePath = Join-Path $env:TEMP "rommfs-test-$RunId"
+$Evidence = Initialize-RommFsEvidence -EvidencePath $EvidencePath
 ```
+
+The dot-sourced [Windows test helper](../../scripts/windows-test-support.ps1)
+creates only the requested evidence directory and its case subdirectories.
+Choose a new path for each run; it refuses to reuse an existing evidence path.
 
 ```powershell
 $RetroBatRoot = 'C:\RetroBat' # Replace with the real, unmodified installation root.
@@ -244,21 +246,11 @@ attempted; `PARTIAL` means only part of the contract was exercised; and
 Never turn a blocked or unverified assertion into a pass by relying on source
 inspection, a screenshot alone, or a test with zero executions.
 
-Capture every native command's combined output and exit code in its own file.
-Define this helper once in the PowerShell session and use it for native commands
-throughout the run; the exit code is written immediately after each command:
-
-```powershell
-function Invoke-LoggedCommand {
-    param([Parameter(Mandatory)][string]$Id, [Parameter(Mandatory)][scriptblock]$Command)
-    $log = Join-Path (Join-Path $Evidence 'commands') "$Id.txt"
-    "COMMAND: $Command" | Set-Content -LiteralPath $log
-    & $Command 2>&1 | Tee-Object -FilePath $log -Append
-    $exitCode = $LASTEXITCODE
-    "EXIT_CODE: $exitCode" | Tee-Object -FilePath $log -Append
-    return $exitCode
-}
-```
+Capture every native command's combined output and exit code in its own file
+with `Invoke-LoggedCommand`, defined by the dot-sourced helper above. It reads
+the caller's `$Evidence` variable, so keep that variable in the current
+PowerShell session. The helper records `$LASTEXITCODE` immediately after the
+scriptblock and is intended for native commands.
 
 Create the mount root and capture environment details after defining the helper.
 PowerShell cmdlet results/errors go to `ENV-HOST.txt`; native commands each get
@@ -319,7 +311,12 @@ evidence that the RetroBat version marker is unsupported.
 
 ## 2. Run automated checks
 
-Run each command from the repository root and record its result independently:
+Run each command from the repository root and record its result independently.
+The optional mise aliases `mise run test:portable` and `mise run check:ui` map to
+the portable/headless suite and host-native UI compilation. On a native Windows
+host, `mise run test:native` maps to the workspace suite; it fails with an
+explicit message on other operating systems. Mise is optional, and the direct
+commands below remain the evidence commands for this procedure:
 
 ```powershell
 $null = Invoke-LoggedCommand 'AUTO-FMT' { cargo fmt --all -- --check }

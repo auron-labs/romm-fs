@@ -96,9 +96,14 @@ they are repository-relative.
 
 - Format: `cargo fmt --all --check`.
 - Portable/headless tests: `cargo test --locked -p rommfs-core -p rommfs-fixture -p rommfs-cfapi -p rommfs-app --no-default-features -- --test-threads=1`.
+- Native-host UI compilation: `cargo check --locked -p rommfs-app --all-targets`.
 - Portable lint: `cargo clippy --locked -p rommfs-core -p rommfs-fixture -p rommfs-cfapi -p rommfs-app --no-default-features --all-targets -- -D warnings`.
 - Windows workspace tests: `cargo test --locked --workspace -- --test-threads=1`; native acceptance procedure:
   `docs/testing/windows.md`.
+- Optional mise aliases: `mise run test:portable`, `mise run check:ui`, and
+  Windows-only `mise run test:native` provide the portable suite, host UI
+  compilation, and native Windows workspace tests respectively. `test:native`
+  fails clearly on non-Windows hosts.
 - Keep `--locked` on Cargo checks and run test binaries serially where
   supported to reduce pressure on native filesystem watchers. These commands
   are starting points, not proof of native Windows behavior. Record platform

@@ -16,12 +16,18 @@ From the repository root:
 cargo fmt --all --check
 cargo test --locked -p rommfs-core -p rommfs-fixture -p rommfs-cfapi -p rommfs-app --no-default-features -- --test-threads=1
 cargo clippy --locked -p rommfs-core -p rommfs-fixture -p rommfs-cfapi -p rommfs-app --no-default-features --all-targets -- -D warnings
+cargo check --locked -p rommfs-app --all-targets
 ```
 
-On Windows, use `cargo test --locked --workspace -- --test-threads=1` for UI and native CFAPI coverage.
-The native acceptance procedure, including live and manual cases, is in
-[Windows testing](testing/windows.md). A cross-target build or portable fixture
-is not native runtime evidence.
+The optional mise aliases are `mise run test:portable` for the headless suite,
+`mise run check:ui` for host-native UI compilation, and `mise run test:native`
+for the Windows workspace suite. `test:native` refuses to run on non-Windows
+hosts. The direct equivalents are shown above and below; mise is not required.
+
+On Windows, `cargo test --locked --workspace -- --test-threads=1` exercises UI
+and native CFAPI tests. The native acceptance procedure, including live and
+manual cases, is in [Windows testing](testing/windows.md). Compilation and
+portable fixtures do not establish native runtime behavior.
 
 ## Where to change and verify
 
