@@ -5,14 +5,14 @@ mod installation;
 mod journal;
 mod links;
 pub use links::{path_is_symbolic_link, remove_symbolic_link};
+mod legacy_gb_profile;
 mod mapping;
 mod ordinary_files;
 pub use ordinary_files::{ensure_distinct, SaveFilePlan, SaveFileRules, UnmatchedFile};
 mod path;
 mod preview;
-mod profile;
-pub(crate) use profile::resolve_auxiliary_root;
-pub(crate) use profile::resolve_retrobat_paths;
+mod retrobat_paths;
+pub(crate) use retrobat_paths::{resolve_auxiliary_root, resolve_retrobat_paths};
 mod scheduler;
 mod settings;
 
@@ -25,6 +25,7 @@ pub use journal::{
     IncomingSaveRecord, JournalSlot, LocalObservation, SaveSyncJournal, SnapshotRecord,
     SnapshotState,
 };
+pub use legacy_gb_profile::{resolve_retrobat_gb_profile, RetroBatGbProfile};
 pub use mapping::{
     map_catalogue, MappingIssue, MappingReport, SaveMapping, SaveProfile, UnmappedEntry,
     RETROBAT_GB_SRM_PROFILE,
@@ -38,7 +39,6 @@ pub use preview::{
     preview_existing_saves, ExistingSavePreview, ExistingSaveScanStatus, ExistingSaveSkipCount,
     ExistingSaveSkipReason, MAX_EXISTING_SAVE_SCAN_DEPTH, MAX_EXISTING_SAVE_SCAN_ENTRIES,
 };
-pub use profile::{resolve_retrobat_gb_profile, RetroBatGbProfile};
 pub use scheduler::{DueSnapshot, ObserveResult, RestoreReport, SaveSyncScheduler};
 pub use settings::{
     paths_overlap, ConsentSettings, SaveSyncScope, SaveSyncSettingsStore, DEFAULT_DEBOUNCE_SECS,
