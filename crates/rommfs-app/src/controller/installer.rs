@@ -1,10 +1,10 @@
-use rommfs_core::events::{AppEvent, EventSink};
+use rommfs_core::events::{AppEvent, EventSink, Level};
 use rommfs_core::retrobat::{
-    discover_installer, download_installer, launch_installer, InstallerRelease,
+    describe_launch_failure, discover_installer, download_installer, launch_installer,
+    InstallerRelease,
 };
 use rommfs_core::{Error, Result};
 use std::path::PathBuf;
-use std::process::Child;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc,
@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 pub(super) struct InstallerJob {
     download: Option<DownloadJob>,
     ready: Option<(InstallerRelease, PathBuf)>,
-    child: Option<Child>,
+    /// Exit code of the launched wizard, delivered by its waiting thread.
+    running: Option<mpsc::Receiver<Result<u32>>>,
 }
 struct DownloadJob {
     active: Arc<AtomicBool>,
@@ -41,7 +42,7 @@ fn emit(
 }
 impl InstallerJob {
     pub(super) fn is_running(&self) -> bool {
-        self.download.is_some() || self.child.is_some()
+        self.download.is_some() || self.running.is_some()
     }
     pub(super) fn download(&mut self, directory: Option<PathBuf>, sink: &EventSink) {
         if self.is_running() {
@@ -97,7 +98,8 @@ impl InstallerJob {
             result: rx,
         });
     }
-    pub(super) fn poll(&mut self, sink: &EventSink) {
+    /// Returns true when a launched installer just exited with code 0.
+    pub(super) fn poll(&mut self, sink: &EventSink) -> bool {
         let result = self
             .download
             .as_ref()
@@ -115,7 +117,7 @@ impl InstallerJob {
             match result {
                 Ok((release, path)) => {
                     sink.emit(AppEvent::log(
-                        rommfs_core::events::Level::Info,
+                        Level::Info,
                         "retrobat-installer",
                         format!(
                             "Official RetroBat {} package verified: {} bytes, SHA-256 {}",
@@ -139,18 +141,27 @@ impl InstallerJob {
                 ),
             }
         }
-        if let Some(child) = &mut self.child {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    self.child = None;
+        let mut exited_ok = false;
+        if let Some(rx) = &self.running {
+            let outcome = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(Error::Transport(
+                    "Installer wait thread stopped unexpectedly".into(),
+                ))),
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            match outcome {
+                None => {}
+                Some(Ok(code)) => {
+                    self.running = None;
+                    exited_ok = code == 0;
                     // A zero exit code is not proof of completed installation: the
                     // wizard can exit after cancellation. Probe the selected folder
                     // through the existing setup workflow instead of guessing.
-                    emit(sink, false, self.ready.is_some(), "Installer closed. Select the installed folder and run Set up RetroBat; existing files will be checked before linking.", (!status.success()).then(|| format!("Installer exited with {status}; partial files were left untouched")));
+                    emit(sink, false, self.ready.is_some(), "Installer closed. Select the installed folder and run Set up RetroBat; existing files will be checked before linking.", (!exited_ok).then(|| format!("Installer exited with code {code}; partial files were left untouched")));
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    self.child = None;
+                Some(Err(error)) => {
+                    self.running = None;
                     emit(
                         sink,
                         false,
@@ -160,6 +171,38 @@ impl InstallerJob {
                     );
                 }
             }
+        }
+        exited_ok
+    }
+    pub(super) fn is_ready(&self) -> bool {
+        self.ready.is_some()
+    }
+    /// Open Explorer with the downloaded installer selected so it can be run by hand.
+    pub(super) fn show_file(&self, sink: &EventSink) {
+        let Some((_, path)) = &self.ready else {
+            return;
+        };
+        #[cfg(windows)]
+        let result = {
+            use std::os::windows::process::CommandExt;
+            std::process::Command::new("explorer.exe")
+                .raw_arg(format!("/select,\"{}\"", path.display()))
+                .spawn()
+                .map(|_| ())
+        };
+        #[cfg(not(windows))]
+        let result: std::io::Result<()> = Err(std::io::Error::other(format!(
+            "showing {} is available on Windows only",
+            path.display()
+        )));
+        if let Err(error) = result {
+            emit(
+                sink,
+                false,
+                true,
+                "Couldn't open the installer's folder",
+                Some(error.to_string()),
+            );
         }
     }
     pub(super) fn launch(&mut self, sink: &EventSink) {
@@ -177,17 +220,32 @@ impl InstallerJob {
             None,
         );
         match launch_installer(release, path) {
-            Ok(child) => {
-                self.child = Some(child);
+            Ok(process) => {
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(process.wait());
+                });
+                self.running = Some(rx);
                 emit(sink, true, false, "Official installer is running. Use Cancel inside its wizard to cancel installation. RomMFS does not terminate an installer while it writes files.", None);
             }
-            Err(error) => emit(
-                sink,
-                false,
-                true,
-                "Installer could not be launched",
-                Some(error.to_string()),
-            ),
+            Err(error) => {
+                let failure = describe_launch_failure(&error);
+                if failure.cancelled {
+                    sink.emit(AppEvent::log(
+                        Level::Info,
+                        "retrobat-installer",
+                        "Installer launch cancelled at the Windows permission prompt",
+                    ));
+                    emit(sink, false, true, failure.detail, None);
+                } else {
+                    sink.emit(AppEvent::log(
+                        Level::Error,
+                        "retrobat-installer",
+                        format!("Installer launch failed: {error}"),
+                    ));
+                    emit(sink, false, true, failure.detail, failure.explanation);
+                }
+            }
         }
     }
     pub(super) fn cancel(&mut self, sink: &EventSink) {
@@ -201,7 +259,7 @@ impl InstallerJob {
                 "Installer download cancelled; partial download removed",
                 None,
             );
-        } else if self.child.is_some() {
+        } else if self.running.is_some() {
             emit(sink, true, false, "Cancel installation inside the official wizard; partial installation files will not be removed by RomMFS", None);
         }
     }
@@ -212,7 +270,7 @@ impl Drop for InstallerJob {
             job.active.store(false, Ordering::Release);
             let _ = job.handle.join();
         }
-        // Dropping Child leaves the independent wizard running. Never kill an
+        // Dropping the wait receiver leaves the independent wizard running. Never kill an
         // installer (or its prerequisite installers) as part of app shutdown.
     }
 }

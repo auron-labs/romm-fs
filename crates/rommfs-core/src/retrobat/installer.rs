@@ -8,7 +8,6 @@ use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -276,9 +275,66 @@ fn verify_bytes(release: &InstallerRelease, file: &mut File) -> Result<()> {
     Ok(())
 }
 
-/// Launch the official wizard without guessing unsupported unattended flags.
+/// A launched installer process. The wizard is independent of RomMFS; this
+/// handle only lets a worker thread wait for it to exit.
+pub struct LaunchedInstaller {
+    #[cfg(windows)]
+    process: ProcessHandle,
+}
+
+impl LaunchedInstaller {
+    /// Block until the installer exits and return its exit code.
+    pub fn wait(self) -> Result<u32> {
+        #[cfg(windows)]
+        {
+            self.process.wait()
+        }
+        #[cfg(not(windows))]
+        {
+            Err(Error::Unsupported(
+                "RetroBat installer execution is available on Windows only".into(),
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ProcessHandle(windows_sys::Win32::Foundation::HANDLE);
+// A process handle may be used and closed from any thread.
+#[cfg(windows)]
+unsafe impl Send for ProcessHandle {}
+#[cfg(windows)]
+impl ProcessHandle {
+    fn wait(&self) -> Result<u32> {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, WaitForSingleObject, INFINITE,
+        };
+        // SAFETY: the handle is a valid process handle owned by `self`.
+        unsafe {
+            if WaitForSingleObject(self.0, INFINITE) != WAIT_OBJECT_0 {
+                return Err(Error::Io(std::io::Error::last_os_error()));
+            }
+            let mut code = 0u32;
+            if GetExitCodeProcess(self.0, &mut code) == 0 {
+                return Err(Error::Io(std::io::Error::last_os_error()));
+            }
+            Ok(code)
+        }
+    }
+}
+#[cfg(windows)]
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle is owned by `self` and closed exactly once.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// Launch the official wizard elevated (it requires administrator rights, which
+/// CreateProcess cannot grant) without guessing unsupported unattended flags.
 /// Its own Cancel action controls installation; RomMFS never kills it mid-write.
-pub fn launch_installer(release: &InstallerRelease, path: &Path) -> Result<Child> {
+pub fn launch_installer(release: &InstallerRelease, path: &Path) -> Result<LaunchedInstaller> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::Unsupported("Installer has no parent folder".into()))?;
@@ -287,17 +343,89 @@ pub fn launch_installer(release: &InstallerRelease, path: &Path) -> Result<Child
     verify_bytes(release, &mut file)?;
     #[cfg(windows)]
     {
-        Command::new(path)
-            .current_dir(parent)
-            .spawn()
-            .map_err(Error::Io)
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::{
+            ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        };
+        fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
+            value.encode_wide().chain(std::iter::once(0)).collect()
+        }
+        const SW_SHOWNORMAL: i32 = 1;
+        let verb = wide(std::ffi::OsStr::new("runas"));
+        let file_name = wide(path.as_os_str());
+        let directory = wide(parent.as_os_str());
+        // SAFETY: zeroed is a valid initial SHELLEXECUTEINFOW (null pointers,
+        // zero fields); the NUL-terminated buffers outlive the call.
+        let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_NOCLOSEPROCESS;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file_name.as_ptr();
+        info.lpDirectory = directory.as_ptr();
+        info.nShow = SW_SHOWNORMAL;
+        // SAFETY: `info` is fully initialised and its pointers stay valid.
+        if unsafe { ShellExecuteExW(&mut info) } == 0 {
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
+        if info.hProcess.is_null() {
+            return Err(Error::Unsupported(
+                "Windows did not return a handle for the installer process".into(),
+            ));
+        }
+        Ok(LaunchedInstaller {
+            process: ProcessHandle(info.hProcess),
+        })
     }
     #[cfg(not(windows))]
     {
-        let _ = Command::new(path);
         Err(Error::Unsupported(
             "RetroBat installer execution is available on Windows only".into(),
         ))
+    }
+}
+
+/// Plain-language outcome of a failed installer launch.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LaunchFailure {
+    /// The user declined the Windows permission prompt; not a real failure.
+    pub cancelled: bool,
+    pub detail: String,
+    /// Plain cause first, raw OS text last; `None` when cancelled.
+    pub explanation: Option<String>,
+}
+
+const ERROR_CANCELLED: i32 = 1223;
+
+pub fn describe_launch_failure(error: &Error) -> LaunchFailure {
+    match error {
+        Error::Io(io) => launch_failure_for_os_code(io.raw_os_error(), &io.to_string()),
+        other => LaunchFailure {
+            cancelled: false,
+            detail: "Couldn't start the RetroBat installer".into(),
+            explanation: Some(other.to_string()),
+        },
+    }
+}
+
+pub fn launch_failure_for_os_code(code: Option<i32>, raw: &str) -> LaunchFailure {
+    if code == Some(ERROR_CANCELLED) {
+        return LaunchFailure {
+            cancelled: true,
+            detail: "Installation was cancelled \u{2014} Windows needs your permission to run the RetroBat installer.".into(),
+            explanation: None,
+        };
+    }
+    let cause = match code {
+        Some(2 | 3) => "The installer file could not be found.",
+        Some(5) => "Windows denied access to the installer file.",
+        Some(740) => "The installer needs administrator permission.",
+        Some(1260 | 1261) => "A Windows policy blocked the installer.",
+        _ => "Windows could not run the installer.",
+    };
+    LaunchFailure {
+        cancelled: false,
+        detail: "Couldn't start the RetroBat installer".into(),
+        explanation: Some(format!("{cause} Technical detail: {raw}")),
     }
 }
 
@@ -379,5 +507,28 @@ mod tests {
         ] {
             assert!(validate_download_url(url).is_err(), "{url}");
         }
+    }
+    #[test]
+    fn launch_failures_are_described_in_plain_language() {
+        let declined = launch_failure_for_os_code(Some(1223), "cancelled by the user");
+        assert!(declined.cancelled);
+        assert!(declined.detail.starts_with("Installation was cancelled"));
+        assert_eq!(declined.explanation, None);
+        let elevation = launch_failure_for_os_code(Some(740), "raw elevation text");
+        assert!(!elevation.cancelled);
+        assert_eq!(elevation.detail, "Couldn't start the RetroBat installer");
+        assert_eq!(
+            elevation.explanation.as_deref(),
+            Some("The installer needs administrator permission. Technical detail: raw elevation text")
+        );
+        let unknown = launch_failure_for_os_code(None, "odd");
+        assert!(unknown
+            .explanation
+            .unwrap()
+            .starts_with("Windows could not"));
+        let io = describe_launch_failure(&Error::Io(std::io::Error::from_raw_os_error(1223)));
+        assert!(io.cancelled);
+        let other = describe_launch_failure(&Error::Unsupported("integrity".into()));
+        assert_eq!(other.explanation.as_deref(), Some("integrity"));
     }
 }

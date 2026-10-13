@@ -20,7 +20,10 @@ mod xml;
 
 pub use artwork::{cache_artwork, cache_artwork_cancellable, ArtworkBatch};
 pub use config::{configure_switch_saves, switch_save_setting};
-pub use installer::{discover_installer, download_installer, launch_installer, InstallerRelease};
+pub use installer::{
+    describe_launch_failure, discover_installer, download_installer, launch_installer,
+    InstallerRelease, LaunchFailure, LaunchedInstaller,
+};
 pub use metadata::{generate_gamelists, MetadataIndex, MetadataPublication};
 pub use setup::{setup_roms_link, verify_setup_link, SetupOutcome, SetupRecord};
 

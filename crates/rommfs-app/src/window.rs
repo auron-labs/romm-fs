@@ -1675,6 +1675,14 @@ impl RommfsWindow {
                                 cx.notify();
                             })),
                     )
+                    .child(
+                        Button::new("show-retrobat-installer")
+                            .label("Show installer file")
+                            .disabled(!self.state.installer_ready)
+                            .on_click(cx.listener(|view, _, _, _| {
+                                view.controller.send(Command::ShowRetroBatInstaller);
+                            })),
+                    )
                     .when(self.state.installer_running, |this| {
                         this.child(
                             Button::new("cancel-retrobat-installer")

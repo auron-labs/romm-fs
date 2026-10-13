@@ -27,4 +27,4 @@ rommfs-fixture.workspace = true
 tempfile.workspace = true
 
 [target."cfg(windows)".dependencies]
-windows-sys = { workspace = true, features = ["Win32_Security_Credentials", "Win32_System_SystemServices"] }
+windows-sys = { workspace = true, features = ["Win32_Security_Credentials", "Win32_System_Registry", "Win32_System_SystemServices", "Win32_UI_Shell"] }

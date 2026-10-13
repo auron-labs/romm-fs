@@ -938,6 +938,7 @@ pub enum Command {
     DownloadRetroBatInstaller,
     CancelRetroBatInstaller,
     LaunchRetroBatInstaller,
+    ShowRetroBatInstaller,
     SetupRetroBat {
         installation: PathBuf,
         managed_root: PathBuf,
@@ -2541,6 +2542,41 @@ impl Worker {
         }
     }
 
+    /// After the installer exits successfully: when discovery finds exactly one
+    /// RetroBat installation and none is selected, select it like Browse does.
+    fn preselect_installed_retrobat(&mut self) {
+        let selected = self
+            .preferences
+            .as_ref()
+            .is_some_and(|p| p.retrobat_root.is_some());
+        if selected || self.preferences.is_none() || self.mount.is_some() {
+            return;
+        }
+        let report = discover_installations(save_sync_discovery_input());
+        let [candidate] = report.candidates.as_slice() else {
+            return;
+        };
+        let root = candidate.info.install_root.clone();
+        self.set_integration(IntegrationMode::RetroBat, Some(root.clone()));
+        if self
+            .preferences
+            .as_ref()
+            .and_then(|p| p.retrobat_root.as_ref())
+            == Some(&root)
+        {
+            self.sink.emit(AppEvent::RetroBatInstaller {
+                running: false,
+                ready: self.installer.is_ready(),
+                received: 0,
+                total: None,
+                detail: format!(
+                    "RetroBat installed at {}. Next: Set up RetroBat.",
+                    root.display()
+                ),
+                error: None,
+            });
+        }
+    }
     fn set_integration(&mut self, mode: IntegrationMode, root: Option<PathBuf>) {
         self.cancel_auxiliary();
         let previous = self.preferences.clone();
@@ -3232,7 +3268,9 @@ fn worker_loop_with_interval_from(
         worker.poll_pairing();
         worker.poll_catalogue_refresh();
         worker.poll_metadata();
-        worker.installer.poll(&worker.sink);
+        if worker.installer.poll(&worker.sink) {
+            worker.preselect_installed_retrobat();
+        }
         worker.poll_auxiliary();
         let received = if worker.refresh_result.is_some()
             || worker.auxiliary_job.is_some()
@@ -3304,6 +3342,7 @@ fn worker_loop_with_interval_from(
             }
             Command::CancelRetroBatInstaller => worker.installer.cancel(&worker.sink),
             Command::LaunchRetroBatInstaller => worker.installer.launch(&worker.sink),
+            Command::ShowRetroBatInstaller => worker.installer.show_file(&worker.sink),
             Command::SetupRetroBat {
                 installation,
                 managed_root,
@@ -3388,7 +3427,8 @@ fn worker_loop_with_interval_from(
                 Command::SetStartAtLogin { .. } => {}
                 Command::DownloadRetroBatInstaller
                 | Command::CancelRetroBatInstaller
-                | Command::LaunchRetroBatInstaller => {}
+                | Command::LaunchRetroBatInstaller
+                | Command::ShowRetroBatInstaller => {}
             }
         }
         if shutdown {
