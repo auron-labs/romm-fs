@@ -927,10 +927,12 @@ impl UiState {
         };
         let support = if self.auxiliary_running {
             StepStatus::Running
-        } else if !self.retrobat_setup_ok {
-            StepStatus::Blocked("Connect RetroBat to your games folder first.")
+        } else if self.retrobat_root.is_none() {
+            StepStatus::Blocked("Install RetroBat first.")
         } else if !connected {
             StepStatus::Blocked("Connect to RomM first.")
+        } else if self.catalogue.is_none() {
+            StepStatus::Blocked("Wait for your game library to load.")
         } else if folder_running {
             StepStatus::Blocked("Stop the games folder first.")
         } else if self.auxiliary_error.is_some() {

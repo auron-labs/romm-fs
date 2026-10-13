@@ -777,6 +777,10 @@ fn retrobat_steps_unlock_in_order_with_one_primary() {
     });
     let steps = ui.retrobat_steps();
     assert_eq!(steps.link, StepStatus::Done);
+    // Support files also need the library to be loaded.
+    assert!(matches!(steps.support, StepStatus::Blocked(_)));
+    ui.catalogue = Some((3, 10, 0));
+    let steps = ui.retrobat_steps();
     assert_eq!(steps.support, StepStatus::Ready);
     assert_eq!(steps.primary(), Some(RetroBatStep::Support));
     assert!(ui.integration_notice.is_none());
@@ -814,6 +818,29 @@ fn retrobat_steps_unlock_in_order_with_one_primary() {
         ui.retrobat_steps().support,
         StepStatus::Blocked(_)
     ));
+}
+
+#[test]
+fn support_files_do_not_wait_for_the_games_folder_link() {
+    use rommfs_app::controller::{RetroBatStep, StepStatus};
+    let mut ui = linked_ui();
+    ui.catalogue = Some((3, 10, 0));
+    ui.apply(&AppEvent::IntegrationUpdated {
+        mode: IntegrationMode::RetroBat,
+        retrobat_root: Some("C:\\RetroBat".into()),
+        setup_complete: false,
+        error: None,
+    });
+    ui.apply(&AppEvent::RetroBatSetup {
+        running: false,
+        detail: "failed".into(),
+        error: Some("denied".into()),
+    });
+    let steps = ui.retrobat_steps();
+    assert_eq!(steps.link, StepStatus::Failed);
+    assert_eq!(steps.support, StepStatus::Ready);
+    // The failed step stays the one primary action.
+    assert_eq!(steps.primary(), Some(RetroBatStep::Link));
 }
 
 #[test]
