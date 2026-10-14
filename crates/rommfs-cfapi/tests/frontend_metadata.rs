@@ -16,6 +16,45 @@ fn sources() -> (Vec<PlatformDto>, Vec<RomDto>) {
 }
 
 #[test]
+fn existing_gamelist_without_identity_index_can_be_published() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("roms");
+    fs::create_dir(&root).unwrap();
+    claim_mount_root(&root, "s").unwrap();
+    fs::create_dir(root.join("gb")).unwrap();
+    check_mount_root(&root, "s").unwrap();
+    let path = root.join("gb/gamelist.xml");
+    let xml = "<gameList><game><path>./Game.gb</path><name>Old name</name></game></gameList>";
+    fs::write(&path, xml).unwrap();
+
+    let (index, existing) = read_frontend_metadata(&root, "s").unwrap();
+    assert_eq!(existing.get("gb").unwrap(), xml);
+    let (platforms, roms) = sources();
+    let catalogue = build_catalogue("s", &platforms, &roms, |_| {}).unwrap();
+    let publication = generate_gamelists(
+        &catalogue,
+        &roms,
+        "s",
+        7,
+        &index,
+        &existing,
+        &HashMap::new(),
+    )
+    .unwrap();
+    publish_frontend_metadata(&root, "s", &publication, &BTreeMap::new()).unwrap();
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        publication.gamelists()["gb/gamelist.xml"]
+    );
+    let index_path = root.join(".rommfs-metadata/index.json");
+    assert!(index_path.is_file());
+    read_frontend_metadata(&root, "s").unwrap();
+
+    fs::write(index_path, b"invalid JSON").unwrap();
+    assert!(read_frontend_metadata(&root, "s").is_err());
+}
+
+#[test]
 fn writable_frontend_state_remains_owned_and_survives_repeat_publication() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("roms");

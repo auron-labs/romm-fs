@@ -280,6 +280,7 @@ fn verify_entry(path: &Path, entry: &OwnedEntry) -> anyhow::Result<()> {
 
 /// Read only previously claimed generated files; no filename-based acquisition
 /// of unrelated gamelists or state. Missing local files can be regenerated.
+/// Existing gamelists without an identity index start with a default index.
 pub fn read_frontend_metadata(
     root: &Path,
     server: &str,
@@ -290,7 +291,6 @@ pub fn read_frontend_metadata(
     check_mount_root(root, server)?;
     let manifest = read_manifest(root)?;
     let mut index = rommfs_core::retrobat::MetadataIndex::default();
-    let mut index_found = false;
     let mut gamelists = std::collections::BTreeMap::new();
     for entry in manifest
         .entries
@@ -311,13 +311,8 @@ pub fn read_frontend_metadata(
             gamelists.insert(platform.into(), String::from_utf8(bytes)?);
         } else if entry.path == ".rommfs-metadata/index.json" {
             index = serde_json::from_slice(&bytes).context("invalid frontend identity index")?;
-            index_found = true;
         }
     }
-    anyhow::ensure!(
-        index_found || gamelists.is_empty(),
-        "frontend identity index is missing; existing gamelists were preserved"
-    );
     Ok((index, gamelists))
 }
 
