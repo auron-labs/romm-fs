@@ -658,7 +658,7 @@ impl ContentSource for ClientSource {
 
 /// Deny setup/publication while Windows has a frontend or Switch emulator image
 /// open. Exclusive writable handles also prevent launch during the operation.
-fn stopped_retrobat_guard(installation: &Path) -> anyhow::Result<Vec<std::fs::File>> {
+pub(crate) fn stopped_retrobat_guard(installation: &Path) -> anyhow::Result<Vec<std::fs::File>> {
     rommfs_core::save_sync::ensure_no_reparse_components(installation)?;
     #[cfg(windows)]
     {
@@ -687,7 +687,7 @@ fn stopped_retrobat_guard(installation: &Path) -> anyhow::Result<Vec<std::fs::Fi
     }
 }
 
-fn check_mount_root(root: &Path, server_id: &str) -> Result<()> {
+pub(crate) fn check_mount_root(root: &Path, server_id: &str) -> Result<()> {
     let parent = root
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -756,7 +756,7 @@ fn create_mount_dir_chain(existing: &Path, root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn claim_mount_root(root: &Path, server_id: &str) -> Result<()> {
+pub(crate) fn claim_mount_root(root: &Path, server_id: &str) -> Result<()> {
     rommfs_cfapi::claim_mount_root(root, server_id).map_err(mount_root_error)
 }
 

@@ -22,8 +22,8 @@ pub struct UserProblem {
     pub technical: Option<String>,
 }
 
-const NEEDS_ADMIN: &str = "Windows needs administrator permission for this. Approve the Windows prompt, or run RomMFS as administrator, then try again.";
-const LINK_PRIVILEGE: &str = "Windows didn't allow RomMFS to create folder links. Turn on Developer Mode in Windows Settings \u{203a} For developers, or run setup as administrator, then retry.";
+const NEEDS_ADMIN: &str = "Windows needs permission to finish this operation. Retry and approve the Windows permission prompt.";
+const LINK_PRIVILEGE: &str = "Windows didn't allow RomMFS to create folder links. Retry Set up RetroBat and approve the Windows permission prompt.";
 const ACCESS_DENIED: &str = "Windows denied access to a file or folder. Close RetroBat and its emulators, make sure you can change that folder, then retry.";
 const FILE_IN_USE: &str =
     "A file is in use by another program. Close RetroBat and its emulators, then retry.";
@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(p.cause.as_deref(), Some(NEEDS_ADMIN));
         assert!(p.technical.as_deref().unwrap().contains("os error 740"));
         let p = UserProblem::from_text("t", "create link: A required privilege (os error 1314)");
-        assert!(p.cause.unwrap().contains("Developer Mode"));
+        assert!(p.cause.unwrap().contains("Windows permission prompt"));
         assert!(UserProblem::from_text("t", "x (os error 5)")
             .cause
             .unwrap()

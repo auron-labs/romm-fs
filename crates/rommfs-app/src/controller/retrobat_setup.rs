@@ -259,26 +259,20 @@ impl Worker {
                 .server_id
                 .as_deref()
                 .context("connect before setting up RetroBat")?;
-            let _stopped = stopped_retrobat_guard(installation)?;
-            if let Err(e) = check_mount_root(managed_root, server) {
+            let result = crate::retrobat_setup::setup(installation, managed_root, server);
+            #[cfg(windows)]
+            let result = crate::retrobat_setup::retry_elevated(result, || {
+                self.sink.emit(AppEvent::RetroBatSetup {
+                    running: true,
+                    detail: "Waiting for Windows permission to finish RetroBat setup".into(),
+                    error: None,
+                });
+                crate::retrobat_setup::windows::run_elevated(installation, managed_root, server)
+            });
+            if result.is_err() {
                 self.emit_foreign_entries(managed_root);
-                return Err(e.into());
             }
-            if let Err(e) = claim_mount_root(managed_root, server) {
-                self.emit_foreign_entries(managed_root);
-                return Err(e.into());
-            }
-            // Validate the proposed settings before linking so an override error
-            // never leaves an unexpectedly reconfigured ROM directory.
-            let (home, _) = rommfs_core::retrobat::launcher_paths(installation)?;
-            rommfs_core::retrobat::switch_save_setting(&std::fs::read_to_string(
-                home.join("es_settings.cfg"),
-            )?)?;
-            let outcome =
-                rommfs_core::retrobat::setup_roms_link(installation, managed_root, server)?;
-            let mut messages = vec![outcome.summary()];
-            messages.extend(rommfs_core::retrobat::configure_switch_saves(installation)?);
-            Ok(messages)
+            result
         })();
         match result {
             Ok(messages) => {

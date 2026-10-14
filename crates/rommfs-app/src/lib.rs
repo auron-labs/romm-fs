@@ -8,6 +8,8 @@ mod icon;
 pub mod problem;
 #[cfg(windows)]
 mod retrobat_discovery_windows;
+#[doc(hidden)]
+pub mod retrobat_setup;
 mod save_sync_agent;
 #[cfg(feature = "ui")]
 mod session;

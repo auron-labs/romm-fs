@@ -2,10 +2,10 @@
 betterleaks = "1.9.0"
 "cargo:cargo-deny" = "0.20.2"
 "github:rui314/mold" = "3.0.0"
-hk = "2.5.0"
+hk = { version = "2.6.0", workflow = "release.yml" }
 "npm:dclint" = "3.1.0"
 pkl = "0.32.1"
-tombi = "1.7.2"
+tombi = "1.8.4"
 
 [tools.rust]
 version = "1.99.0"

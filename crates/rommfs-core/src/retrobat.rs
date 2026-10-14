@@ -25,7 +25,7 @@ pub use installer::{
     InstallerRelease, LaunchFailure, LaunchedInstaller,
 };
 pub use metadata::{generate_gamelists, MetadataIndex, MetadataPublication};
-pub use setup::{setup_roms_link, verify_setup_link, SetupOutcome, SetupRecord};
+pub use setup::{inspect_setup, setup_roms_link, verify_setup_link, SetupOutcome, SetupRecord};
 
 /// Resolve effective frontend home/save directories through launcher settings.
 pub fn launcher_paths(

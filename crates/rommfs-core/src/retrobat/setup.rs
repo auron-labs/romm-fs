@@ -175,6 +175,39 @@ pub fn verify_setup_link(installation: &Path, managed: &Path, server: &str) -> a
     Ok(())
 }
 
+/// Read the current setup result without creating links or changing settings.
+/// Used by the unelevated app after the Windows setup helper exits.
+pub fn inspect_setup(
+    installation: &Path,
+    managed: &Path,
+    server: &str,
+) -> anyhow::Result<SetupOutcome> {
+    verify_setup_link(installation, managed, server)?;
+    let record = load_record(installation)?.context("missing RetroBat setup record")?;
+    let roms = installation.join("roms");
+    let legacy_whole_link = path_is_reparse_point(&fs::symlink_metadata(&roms)?);
+    let mut linked = Vec::new();
+    let mut skipped = Vec::new();
+    if !legacy_whole_link {
+        for name in RetroBatSystems::from_installation(installation)?.folders() {
+            let path = roms.join(name);
+            if fs::read_link(&path)
+                .is_ok_and(|target| same_target(&target, &record.managed_root.join(name)))
+            {
+                linked.push(name.to_owned());
+            } else {
+                skipped.push(name.to_owned());
+            }
+        }
+    }
+    Ok(SetupOutcome {
+        record,
+        linked,
+        skipped,
+        legacy_whole_link,
+    })
+}
+
 fn validate_link_name(name: &str) -> anyhow::Result<()> {
     crate::save_sync::validate_windows_path_component(name)
         .map_err(|e| anyhow::anyhow!("invalid recorded system name {name:?}: {e}"))
@@ -308,9 +341,8 @@ pub fn setup_roms_link(
             }
             let target = expected.managed_root.join(&name);
             #[cfg(windows)]
-            std::os::windows::fs::symlink_dir(&target, &link).context(
-                "create RetroBat ROM directory link (Windows Developer Mode or link privilege is required)",
-            )?;
+            std::os::windows::fs::symlink_dir(&target, &link)
+                .context("create RetroBat ROM directory link")?;
             #[cfg(unix)]
             std::os::unix::fs::symlink(&target, &link)?;
         }

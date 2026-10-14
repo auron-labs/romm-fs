@@ -1,0 +1,102 @@
+//! Local setup shared by the controller and the short-lived Windows UAC helper.
+#[cfg(any(windows, test))]
+use anyhow::Context;
+use std::path::Path;
+
+#[cfg(windows)]
+pub mod windows;
+
+pub(crate) fn setup(
+    installation: &Path,
+    managed_root: &Path,
+    server: &str,
+) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(
+        installation.is_absolute() && managed_root.is_absolute(),
+        "choose absolute RetroBat and managed ROM folder paths"
+    );
+    let _stopped = crate::controller::stopped_retrobat_guard(installation)?;
+    crate::controller::check_mount_root(managed_root, server)?;
+    crate::controller::claim_mount_root(managed_root, server)?;
+    // Reject overrides before making any links, including in the elevated helper.
+    let (home, _) = rommfs_core::retrobat::launcher_paths(installation)?;
+    rommfs_core::retrobat::switch_save_setting(&std::fs::read_to_string(
+        home.join("es_settings.cfg"),
+    )?)?;
+    let outcome = rommfs_core::retrobat::setup_roms_link(installation, managed_root, server)?;
+    let mut messages = vec![outcome.summary()];
+    messages.extend(rommfs_core::retrobat::configure_switch_saves(installation)?);
+    Ok(messages)
+}
+
+/// Retry only Windows permission failures, after the first attempt's guards drop.
+/// The helper executes once and never recursively requests elevation.
+#[cfg(any(windows, test))]
+pub(crate) fn retry_elevated<T>(
+    result: anyhow::Result<T>,
+    elevate: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    match result {
+        Err(error)
+            if error.chain().any(|cause| {
+                let io = cause
+                    .downcast_ref::<std::io::Error>()
+                    .or_else(|| match cause.downcast_ref::<rommfs_core::Error>() {
+                        Some(rommfs_core::Error::Io(io)) => Some(io),
+                        _ => None,
+                    });
+                io.is_some_and(|io| {
+                    matches!(io.raw_os_error(), Some(5 | 740 | 1314))
+                        || (io.raw_os_error().is_none()
+                            && io.kind() == std::io::ErrorKind::PermissionDenied)
+                })
+            }) =>
+        {
+            elevate().context("finish RetroBat setup with Windows permission")
+        }
+        result => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_errors_retry_once_including_wrapped_core_errors() {
+        for code in [5, 740, 1314] {
+            let error = anyhow::Error::new(rommfs_core::Error::Io(
+                std::io::Error::from_raw_os_error(code),
+            ))
+            .context("create link");
+            let mut calls = 0;
+            let result = retry_elevated::<()>(Err(error), || {
+                calls += 1;
+                Err(std::io::Error::from_raw_os_error(code).into())
+            });
+            assert!(result.is_err());
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn success_busy_files_and_ownership_errors_do_not_elevate() {
+        assert_eq!(
+            retry_elevated(Ok(7), || panic!("already succeeded")).unwrap(),
+            7
+        );
+        for code in [32, 33, 1223] {
+            assert!(retry_elevated::<()>(
+                Err(std::io::Error::from_raw_os_error(code).into()),
+                || panic!("busy files and cancellation must not elevate")
+            )
+            .is_err());
+        }
+        assert!(
+            retry_elevated::<()>(Err(anyhow::anyhow!("foreign files")), || panic!(
+                "ownership rejection must not elevate"
+            ))
+            .is_err()
+        );
+    }
+}

@@ -20,7 +20,6 @@ local linters = new Mapping<String, Step> {
   ["mixed_line_ending"] = Builtins.mixed_line_ending
   ["newlines"] = Builtins.newlines
   ["pkl_format"] = Builtins.pkl_format
-  ["tombi_format"] = Builtins.tombi_format
   ["trailing_whitespace"] = Builtins.trailing_whitespace
 }
 
