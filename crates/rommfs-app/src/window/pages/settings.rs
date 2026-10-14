@@ -452,7 +452,7 @@ impl RommfsWindow {
         v_flex()
             .gap_2()
             .child(muted(
-                "Adds a link in RetroBat's roms folder for each system, pointing at your games folder, and configures Switch saves. Systems that already have files there are left as they are. Stop RetroBat and its emulators first; nothing existing is moved or removed.",
+                "Connects RetroBat's system folders to your games folder and configures Switch saves. Existing system folders are preserved in RetroBat's .rommfs-original-roms folder before linking; no files are deleted. Stop RetroBat and its emulators first.",
                 cx,
             ))
             .child(

@@ -334,7 +334,15 @@ pub fn publish_frontend_metadata(
         index_path,
         OwnedKind::FrontendState,
         &serde_json::to_vec(&publication.index().staged())?,
+        false,
     )?;
+    // Claim the whole artwork batch before writing bytes, not one manifest rewrite per image.
+    for path in artwork.keys() {
+        publish_local(root, &mut manifest, path, OwnedKind::Artwork, &[], true)?;
+    }
+    if !artwork.is_empty() {
+        write_manifest(root, &manifest)?;
+    }
     for (path, source) in artwork {
         rommfs_core::save_sync::ensure_no_reparse_components(source)?;
         anyhow::ensure!(
@@ -347,10 +355,11 @@ pub fn publish_frontend_metadata(
             path,
             OwnedKind::Artwork,
             &fs::read(source)?,
+            false,
         )?;
     }
     for (path, bytes) in publication.gamelists() {
-        publish_local(root, &mut manifest, path, OwnedKind::Gamelist, bytes)?;
+        publish_local(root, &mut manifest, path, OwnedKind::Gamelist, bytes, false)?;
     }
     publish_local(
         root,
@@ -358,6 +367,7 @@ pub fn publish_frontend_metadata(
         index_path,
         OwnedKind::FrontendState,
         &serde_json::to_vec(publication.index())?,
+        false,
     )?;
     Ok(())
 }
@@ -368,6 +378,7 @@ fn publish_local(
     relative: &str,
     kind: OwnedKind,
     bytes: &[u8],
+    claim_only: bool,
 ) -> anyhow::Result<()> {
     let _guard = rommfs_core::save_sync::hold_save_directory_chain(
         root.parent().context("missing mount parent")?,
@@ -457,7 +468,12 @@ fn publish_local(
             );
         }
         manifest.entries.push(local_entry(relative, kind, false));
-        write_manifest(root, manifest)?;
+        if !claim_only {
+            write_manifest(root, manifest)?;
+        }
+    }
+    if claim_only {
+        return Ok(());
     }
     // A named, claimed staging file makes interruption recoverable even when
     // the volume root refuses sibling files (e.g. a standard user's C:\ROMs).

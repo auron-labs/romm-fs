@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 const MAX_ARTWORK_BYTES: u64 = 32 * 1024 * 1024;
-const CONCURRENCY: usize = 4;
+const CONCURRENCY: usize = 8;
 
+#[derive(Default)]
 pub struct ArtworkBatch {
     references: HashMap<(i64, &'static str), String>,
     files: BTreeMap<String, PathBuf>,
@@ -30,7 +31,7 @@ impl ArtworkBatch {
     }
 }
 
-/// Cache supplied cover/screenshot resources with four bounded workers. Files
+/// Cache supplied cover/screenshot resources with eight bounded workers. Files
 /// are addressed by resource/version, and ROM bodies/detail endpoints are never
 /// involved. Failed/missing images do not prevent complete gamelist generation.
 pub fn cache_artwork(

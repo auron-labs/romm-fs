@@ -33,6 +33,102 @@ fn application_owner_keeps_worker_alive_after_view_handle_drops_and_quit_joins_o
 use std::time::Duration;
 
 #[test]
+fn first_gamelists_publish_while_artwork_is_still_pending() {
+    use rommfs_core::retrobat::ArtworkBatch;
+    use rommfs_fixture::contract;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("roms");
+    let installation = tmp.path().join("retrobat");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&installation).unwrap();
+    rommfs_cfapi::claim_mount_root(&root, "s").unwrap();
+    let platforms: Vec<PlatformDto> =
+        serde_json::from_str(&contract::platforms(&[(1, "gb", "gb", "Game Boy")])).unwrap();
+    let roms = vec![serde_json::from_value(contract::rom(1, "gb", "Game.gb", 3, "hash")).unwrap()];
+    let catalogue =
+        rommfs_core::catalogue::build_catalogue("s", &platforms, &roms, |_| {}).unwrap();
+    let (sink, events) = rommfs_core::events::channel();
+    let mut worker = Worker::new(sink);
+    worker.server_id = Some("s".into());
+    worker.preferences = Some(ConnectionPreferences {
+        server: "s".into(),
+        account_id: 7,
+        device_identifier: "id".into(),
+        mount_root: Some(root.clone()),
+        integration: IntegrationMode::RetroBat,
+        retrobat_root: Some(installation),
+        start_at_login: false,
+        save_root: None,
+    });
+    worker.mount = Some(ActiveMount {
+        root: root.clone(),
+        stop_fn: Box::new(|| {}),
+    });
+    worker.metadata_source = Some((
+        catalogue,
+        CatalogueSnapshot {
+            platforms,
+            roms,
+            refreshed_at: 0,
+        },
+    ));
+    let (tx, rx) = mpsc::channel();
+    worker.metadata_job = Some(rx);
+    worker.metadata_ready = Some(ArtworkBatch::default());
+    worker.poll_metadata();
+    assert!(std::fs::read_to_string(root.join("gb/gamelist.xml"))
+        .unwrap()
+        .contains("./Game.gb"));
+    assert!(worker.metadata_job.is_some());
+    assert!(worker.metadata_ready.is_none());
+    assert!(events.try_iter().any(|event| matches!(event,
+        AppEvent::Log(line) if line.message == "Gamelists published; caching frontend artwork")));
+
+    tx.send(Ok(ArtworkBatch::default())).unwrap();
+    worker.poll_metadata();
+    assert!(worker.metadata_job.is_none());
+    assert!(worker.metadata_source.is_none());
+    assert!(events.try_iter().any(|event| matches!(
+        event,
+        AppEvent::FrontendMetadata {
+            pending: false,
+            error: None,
+            ..
+        }
+    )));
+
+    // A prior publication can leave its index behind without any gamelist.
+    std::fs::remove_file(root.join("gb/gamelist.xml")).unwrap();
+    assert!(root.join(".rommfs-metadata/index.json").is_file());
+    let platforms =
+        serde_json::from_str(&contract::platforms(&[(1, "gb", "gb", "Game Boy")])).unwrap();
+    let roms = vec![serde_json::from_value(contract::rom(1, "gb", "Game.gb", 3, "hash")).unwrap()];
+    let snapshot = CatalogueSnapshot {
+        platforms,
+        roms,
+        refreshed_at: 0,
+    };
+    worker.catalogue = Some(
+        rommfs_core::catalogue::build_catalogue("s", &snapshot.platforms, &snapshot.roms, |_| {})
+            .unwrap(),
+    );
+    worker.source_snapshot = Some(snapshot);
+    worker.rom_cache_directory = Some(tmp.path().join("rom-cache"));
+    let client = Arc::new(RommClient::new("http://unused.invalid").unwrap());
+    worker.fs = Some(
+        worker
+            .build_fs(&client, &root, Arc::new(NoopHydratedRemover))
+            .unwrap(),
+    );
+    worker.client = Some(client);
+    worker.queue_metadata();
+    assert!(worker.metadata_ready.is_some());
+    worker.poll_metadata();
+    assert!(root.join("gb/gamelist.xml").is_file());
+    worker.cancel_metadata();
+}
+
+#[test]
 fn stopping_cancels_artwork_and_discards_late_metadata_results() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let (sink, events) = rommfs_core::events::channel();

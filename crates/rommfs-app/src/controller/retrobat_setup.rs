@@ -35,9 +35,11 @@ impl Worker {
         detail: impl Into<String>,
         error: Option<String>,
     ) {
+        let detail = detail.into();
+        self.log(Level::Info, "metadata", detail.clone());
         self.sink.emit(AppEvent::FrontendMetadata {
             pending,
-            detail: detail.into(),
+            detail,
             error,
         });
     }
@@ -97,6 +99,16 @@ impl Worker {
         let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
         self.metadata_active = Some(active.clone());
         self.metadata_source = Some((catalogue.clone(), snapshot));
+        // Missing gamelists must not wait for artwork, even after an interrupted publication.
+        if self.mount.as_ref().is_some_and(|mount| {
+            !mount.root.join(".rommfs-metadata/index.json").exists()
+                || catalogue.platforms.iter().any(|platform| {
+                    platform != "switchupdates"
+                        && !mount.root.join(platform).join("gamelist.xml").exists()
+                })
+        }) {
+            self.metadata_ready = Some(rommfs_core::retrobat::ArtworkBatch::default());
+        }
         let (tx, rx) = mpsc::channel();
         self.metadata_job = Some(rx);
         self.metadata_status(
@@ -114,34 +126,36 @@ impl Worker {
     pub(super) fn poll_metadata(&mut self) {
         if let Some(rx) = &self.metadata_job {
             let result = match rx.try_recv() {
-                Ok(result) => result,
-                Err(mpsc::TryRecvError::Empty) => return,
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    Err(Error::Transport("artwork worker stopped".into()))
+                    Some(Err(Error::Transport("artwork worker stopped".into())))
                 }
             };
-            self.metadata_job = None;
-            if let Some(handle) = self.metadata_handle.take() {
-                let _ = handle.join();
-            }
-            match result {
-                Ok(artwork) => self.metadata_ready = Some(artwork),
-                Err(error) => {
-                    self.cancel_metadata();
-                    if error.needs_sign_in() {
-                        self.stop_save_sync_agent();
-                        self.stop_mount();
-                        self.sink.emit(AppEvent::SignInRequired {
-                            reason: Some(error.to_string()),
-                        });
+            if let Some(result) = result {
+                self.metadata_job = None;
+                if let Some(handle) = self.metadata_handle.take() {
+                    let _ = handle.join();
+                }
+                match result {
+                    Ok(artwork) => self.metadata_ready = Some(artwork),
+                    Err(error) => {
+                        self.cancel_metadata();
+                        if error.needs_sign_in() {
+                            self.stop_save_sync_agent();
+                            self.stop_mount();
+                            self.sink.emit(AppEvent::SignInRequired {
+                                reason: Some(error.to_string()),
+                            });
+                        }
+                        self.log(Level::Error, "metadata", error.to_string());
+                        self.metadata_status(
+                            false,
+                            "Frontend metadata was not published",
+                            Some(error.to_string()),
+                        );
+                        return;
                     }
-                    self.log(Level::Error, "metadata", error.to_string());
-                    self.metadata_status(
-                        false,
-                        "Frontend metadata was not published",
-                        Some(error.to_string()),
-                    );
-                    return;
                 }
             }
         }
@@ -213,6 +227,16 @@ impl Worker {
                 &existing,
                 artwork.references(),
             )?;
+            self.metadata_status(
+                true,
+                format!(
+                    "Publishing {} gamelists and {} artwork files to {}",
+                    publication.gamelists().len(),
+                    artwork.files().len(),
+                    root.display()
+                ),
+                None,
+            );
             rommfs_cfapi::publish_frontend_metadata(root, server, &publication, artwork.files())?;
             self.log(
                 Level::Info,
@@ -225,10 +249,17 @@ impl Worker {
             Ok(())
         })();
         drop(guard);
-        self.cancel_metadata();
         match result {
-            Ok(()) => self.metadata_status(false, "Frontend metadata is up to date", None),
+            Ok(()) if self.metadata_job.is_some() => {
+                self.metadata_ready = None;
+                self.metadata_status(true, "Gamelists published; caching frontend artwork", None);
+            }
+            Ok(()) => {
+                self.cancel_metadata();
+                self.metadata_status(false, "Frontend metadata is up to date", None);
+            }
             Err(error) => {
+                self.cancel_metadata();
                 self.log(Level::Error, "metadata", format!("{error:#}"));
                 self.metadata_status(
                     false,

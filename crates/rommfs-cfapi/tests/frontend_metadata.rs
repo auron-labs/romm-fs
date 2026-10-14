@@ -16,6 +16,49 @@ fn sources() -> (Vec<PlatformDto>, Vec<RomDto>) {
 }
 
 #[test]
+fn artwork_batch_is_owned_before_publication_and_reusable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("roms");
+    fs::create_dir(&root).unwrap();
+    claim_mount_root(&root, "s").unwrap();
+    let (platforms, roms) = sources();
+    let catalogue = build_catalogue("s", &platforms, &roms, |_| {}).unwrap();
+    let publication = generate_gamelists(
+        &catalogue,
+        &roms,
+        "s",
+        7,
+        &MetadataIndex::default(),
+        &BTreeMap::new(),
+        &HashMap::new(),
+    )
+    .unwrap();
+    let source = tmp.path().join("cached.png");
+    fs::write(&source, b"cached artwork").unwrap();
+    let artwork = BTreeMap::from([
+        ("gb/.rommfs-artwork/cover.png".into(), source.clone()),
+        ("gb/.rommfs-artwork/screenshot.png".into(), source.clone()),
+    ]);
+    publish_frontend_metadata(&root, "s", &publication, &artwork).unwrap();
+    check_mount_root(&root, "s").unwrap();
+    publish_frontend_metadata(&root, "s", &publication, &artwork).unwrap();
+    for path in artwork.keys() {
+        assert_eq!(fs::read(root.join(path)).unwrap(), b"cached artwork");
+    }
+
+    let foreign = "gb/.rommfs-artwork/user.png";
+    fs::write(root.join(foreign), b"user artwork").unwrap();
+    assert!(publish_frontend_metadata(
+        &root,
+        "s",
+        &publication,
+        &BTreeMap::from([(foreign.into(), source)]),
+    )
+    .is_err());
+    assert_eq!(fs::read(root.join(foreign)).unwrap(), b"user artwork");
+}
+
+#[test]
 fn existing_gamelist_without_identity_index_can_be_published() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("roms");

@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const RECORD: &str = ".rommfs-setup.json";
+const ORIGINAL_ROMS: &str = ".rommfs-original-roms";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[non_exhaustive]
@@ -29,8 +30,10 @@ pub struct SetupOutcome {
     pub record: SetupRecord,
     /// Systems now linked to the managed library (new or already present).
     pub linked: Vec<String>,
-    /// Systems whose `roms/<name>` already has content and was left as-is.
+    /// Systems whose paths are foreign links or files and were left as-is.
     pub skipped: Vec<String>,
+    /// Where original system directories were preserved, if present.
+    pub original_roms: Option<PathBuf>,
     /// Setup predates per-system links: `roms` itself is the managed link.
     pub legacy_whole_link: bool,
 }
@@ -41,9 +44,15 @@ impl SetupOutcome {
             return "RetroBat's roms folder is already linked to the managed folder".into();
         }
         let mut text = format!("{} system folder(s) linked", self.linked.len());
+        if let Some(original_roms) = &self.original_roms {
+            text.push_str(&format!(
+                "; original system folders preserved in {}",
+                original_roms.display()
+            ));
+        }
         if !self.skipped.is_empty() {
             text.push_str(&format!(
-                "; {} system(s) already have content in RetroBat's roms folder and were left as-is: {}",
+                "; {} system(s) have foreign links or files and were left as-is: {}",
                 self.skipped.len(),
                 self.skipped.join(", ")
             ));
@@ -204,6 +213,10 @@ pub fn inspect_setup(
         record,
         linked,
         skipped,
+        original_roms: installation
+            .join(ORIGINAL_ROMS)
+            .try_exists()?
+            .then(|| installation.join(ORIGINAL_ROMS)),
         legacy_whole_link,
     })
 }
@@ -213,32 +226,9 @@ fn validate_link_name(name: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid recorded system name {name:?}: {e}"))
 }
 
-/// Returns the directories (parents first) of `root` when it contains nothing
-/// but empty ordinary directories, or `None` as soon as any file or link shows
-/// up. Only an entirely empty tree may be replaced by a link.
-fn empty_directory_tree(root: &Path) -> anyhow::Result<Option<Vec<PathBuf>>> {
-    let mut directories = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        let _parent_guard =
-            hold_save_directory_chain(path.parent().context("ROM entry has no parent")?)?;
-        let metadata = fs::symlink_metadata(&path)?;
-        if path_is_reparse_point(&metadata) || !metadata.is_dir() {
-            return Ok(None);
-        }
-        directories.push(path.clone());
-        for entry in fs::read_dir(path)? {
-            pending.push(entry?.path());
-        }
-    }
-    Ok(Some(directories))
-}
-
-/// Coexist with whatever is already in RetroBat's `roms` directory: keep it a
-/// real directory and add `roms/<system>` links to the managed library for each
-/// system RetroBat knows. A system whose folder already has content (stock or
-/// user) is left untouched and reported as skipped. Nothing is ever deleted,
-/// moved or overwritten; only empty directories are replaced by a link.
+/// Link `roms/<system>` to the managed library for each system RetroBat knows.
+/// Original directories are moved intact to `.rommfs-original-roms/<system>`;
+/// existing backups are never overwritten. Foreign links and files stay untouched.
 ///
 /// The caller must validate native root ownership and establish that RetroBat
 /// is stopped. The record (listing intended links) is persisted before the
@@ -267,6 +257,7 @@ pub fn setup_roms_link(
                 record: previous.unwrap_or(expected),
                 linked: Vec::new(),
                 skipped: Vec::new(),
+                original_roms: None,
                 legacy_whole_link: true,
             });
         }
@@ -282,8 +273,10 @@ pub fn setup_roms_link(
 
     enum Plan {
         Adopt,
-        Create(Vec<PathBuf>),
+        Create,
+        Preserve,
     }
+    let original_roms = installation.join(ORIGINAL_ROMS);
     let mut plans = Vec::new();
     let mut skipped = Vec::new();
     for name in systems.folders() {
@@ -298,13 +291,20 @@ pub fn setup_roms_link(
                     skipped.push(name.to_owned());
                 }
             }
-            Ok(m) if m.is_dir() => match empty_directory_tree(&link)? {
-                Some(directories) => plans.push((name.to_owned(), Plan::Create(directories))),
-                None => skipped.push(name.to_owned()),
-            },
+            Ok(m) if m.is_dir() => {
+                ensure_no_reparse_components(&original_roms)?;
+                let backup = original_roms.join(name);
+                anyhow::ensure!(
+                    fs::symlink_metadata(&backup)
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+                    "original ROM backup already exists; both folders were preserved: {}",
+                    backup.display()
+                );
+                plans.push((name.to_owned(), Plan::Preserve));
+            }
             Ok(_) => skipped.push(name.to_owned()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                plans.push((name.to_owned(), Plan::Create(Vec::new())));
+                plans.push((name.to_owned(), Plan::Create));
             }
             Err(e) => return Err(e.into()),
         }
@@ -326,18 +326,31 @@ pub fn setup_roms_link(
         file.persist(&record_path).map_err(|error| error.error)?;
     }
 
+    let _roms_guard = hold_save_directory_chain(&roms)?;
+    let _backup_guard = if plans.iter().any(|(_, plan)| matches!(plan, Plan::Preserve)) {
+        if !original_roms.try_exists()? {
+            fs::create_dir(&original_roms)?;
+        }
+        Some(hold_save_directory_chain(&original_roms)?)
+    } else {
+        None
+    };
     let mut linked = Vec::new();
     for (name, plan) in plans {
         let link = roms.join(&name);
-        if let Plan::Create(directories) = plan {
-            // Only empty ordinary directories. remove_dir refuses a concurrent
-            // new file. No recursive deletion, backups, or migration.
-            for directory in directories.into_iter().rev() {
-                let _parent_guard = hold_save_directory_chain(
-                    directory.parent().context("ROM directory has no parent")?,
-                )?;
-                ensure_no_reparse_components(&directory)?;
-                fs::remove_dir(directory)?;
+        if !matches!(plan, Plan::Adopt) {
+            if matches!(plan, Plan::Preserve) {
+                ensure_no_reparse_components(&link)?;
+                let backup = original_roms.join(&name);
+                anyhow::ensure!(
+                    fs::symlink_metadata(&backup)
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+                    "original ROM backup already exists: {}",
+                    backup.display()
+                );
+                fs::rename(&link, &backup).with_context(|| {
+                    format!("preserve original ROM folder in {}", backup.display())
+                })?;
             }
             let target = expected.managed_root.join(&name);
             #[cfg(windows)]
@@ -353,6 +366,7 @@ pub fn setup_roms_link(
         record: expected,
         linked,
         skipped,
+        original_roms: original_roms.try_exists()?.then_some(original_roms),
         legacy_whole_link: false,
     })
 }

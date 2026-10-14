@@ -71,19 +71,16 @@ fn write_stock_roms(install: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 
 #[cfg(unix)]
 #[test]
-fn stock_retrobat_roms_content_coexists_with_managed_links() {
+fn stock_retrobat_roms_are_preserved_and_managed_gamelists_are_visible() {
     let dir = tempfile::tempdir().unwrap();
     let (install, managed) = installation(dir.path());
     let existing = write_stock_roms(&install);
     let outcome = setup_roms_link(&install, &managed, "s").unwrap();
-    // Systems with content are left alone and reported, not errors.
-    assert_eq!(outcome.skipped, ["halflife", "ports", "singe"]);
-    assert!(outcome
-        .summary()
-        .contains("left as-is: halflife, ports, singe"));
-    // Empty or absent system folders became links to the managed library.
-    assert_eq!(outcome.linked, ["gb", "snes"]);
-    for system in ["gb", "snes"] {
+    assert!(outcome.skipped.is_empty());
+    let backup = outcome.original_roms.as_ref().unwrap();
+    assert!(outcome.summary().contains(&backup.display().to_string()));
+    assert_eq!(outcome.linked, ["gb", "halflife", "ports", "singe", "snes"]);
+    for system in &outcome.linked {
         assert!(path_is_link(&install.join("roms").join(system)));
         assert_eq!(
             fs::read_link(install.join("roms").join(system)).unwrap(),
@@ -92,15 +89,64 @@ fn stock_retrobat_roms_content_coexists_with_managed_links() {
     }
     assert!(!path_is_link(&install.join("roms")));
     for (path, bytes) in &existing {
-        assert_eq!(&fs::read(path).unwrap(), bytes, "{}", path.display());
+        let relative = path.strip_prefix(install.join("roms")).unwrap();
+        let system = relative.components().next().unwrap().as_os_str();
+        let preserved = if outcome.linked.iter().any(|name| name.as_str() == system) {
+            backup.join(relative)
+        } else {
+            path.clone()
+        };
+        assert_eq!(
+            &fs::read(&preserved).unwrap(),
+            bytes,
+            "{}",
+            preserved.display()
+        );
     }
+    fs::create_dir(managed.join("ports")).unwrap();
+    fs::write(managed.join("ports/gamelist.xml"), b"managed gamelist").unwrap();
+    assert_eq!(
+        fs::read(install.join("roms/ports/gamelist.xml")).unwrap(),
+        b"managed gamelist"
+    );
     let record = fs::read_to_string(install.join(".rommfs-setup.json")).unwrap();
-    assert!(record.contains("\"schema\":2") && record.contains("\"links\":[\"gb\",\"snes\"]"));
-    // Re-running is idempotent and verification passes.
+    assert!(record.contains("\"schema\":2"));
+    // An interrupted link step is recoverable without overwriting the backup.
+    fs::remove_file(install.join("roms/ports")).unwrap();
     let again = setup_roms_link(&install, &managed, "s").unwrap();
-    assert_eq!(again.linked, ["gb", "snes"]);
-    assert_eq!(again.skipped, ["halflife", "ports", "singe"]);
+    assert_eq!(again.linked, outcome.linked);
+    assert!(again.skipped.is_empty());
+    assert_eq!(again.original_roms, outcome.original_roms);
+    assert_eq!(
+        fs::read(install.join("roms/ports/gamelist.xml")).unwrap(),
+        b"managed gamelist"
+    );
+    assert_eq!(
+        fs::read(backup.join("ports/gamelist.xml")).unwrap(),
+        b"stock bytes of roms/ports/gamelist.xml"
+    );
     verify_setup_link(&install, &managed, "s").unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn original_rom_backups_are_never_overwritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let (install, managed) = installation(dir.path());
+    let backup = install.join(".rommfs-original-roms/gb");
+    fs::create_dir_all(&backup).unwrap();
+    fs::write(backup.join("original.gb"), b"original game").unwrap();
+    fs::write(install.join("roms/gb/new.gb"), b"new game").unwrap();
+    assert!(setup_roms_link(&install, &managed, "s").is_err());
+    assert_eq!(
+        fs::read(backup.join("original.gb")).unwrap(),
+        b"original game"
+    );
+    assert_eq!(
+        fs::read(install.join("roms/gb/new.gb")).unwrap(),
+        b"new game"
+    );
+    assert!(!path_is_link(&install.join("roms/gb")));
 }
 
 #[cfg(unix)]

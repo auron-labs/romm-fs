@@ -27,6 +27,52 @@ fn sources(resource: &str) -> (Vec<PlatformDto>, Vec<RomDto>) {
 }
 
 #[test]
+fn eight_artwork_downloads_can_run_concurrently() {
+    use rommfs_fixture::FixtureBodyBarrier;
+    use std::time::Duration;
+    let fixture = FixtureServer::start();
+    let (platforms, _) = sources("unused");
+    let mut roms = Vec::new();
+    let mut barriers = Vec::new();
+    for id in 1..=8 {
+        let resource = format!("/assets/romm/resources/cover{id}.png");
+        let barrier = FixtureBodyBarrier::new();
+        fixture.on(
+            "GET",
+            &resource,
+            ResponseSpec::HeldBytes {
+                status: 200,
+                bytes: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+                barrier: barrier.clone(),
+            },
+        );
+        barriers.push(barrier);
+        let mut rom = contract::rom(id, "gb", &format!("Game{id}.gb"), 3, "hash");
+        rom["path_cover_large"] = json!(resource);
+        roms.push(serde_json::from_value(rom).unwrap());
+    }
+    let client = client(&fixture);
+    let catalogue = build_catalogue(fixture.url(), &platforms, &roms, |_| {}).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::thread::scope(|scope| {
+        let download = scope.spawn(|| cache_artwork(&client, &catalogue, &roms, cache.path()));
+        let all_started = barriers
+            .iter()
+            .all(|barrier| barrier.wait_until_blocked(Duration::from_secs(5)));
+        for barrier in &barriers {
+            barrier.release();
+        }
+        let batch = download.join().unwrap().unwrap();
+        assert!(
+            all_started,
+            "all eight requests should start before any completes"
+        );
+        assert_eq!(batch.files().len(), 8);
+        assert!(batch.warnings().is_empty());
+    });
+}
+
+#[test]
 fn artwork_is_deduplicated_cached_and_never_requests_rom_bodies() {
     let fixture = FixtureServer::start();
     let resource = "/assets/romm/resources/roms/1/cover/big.png?ts=3";

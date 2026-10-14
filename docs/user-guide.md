@@ -144,8 +144,10 @@ instant (metadata only); the first launch of a game downloads its file once.
 
 ## Set up RetroBat
 
-> The RetroBat integration coexists with whatever is already in RetroBat's
-> `roms` folder; existing content is never moved, replaced or deleted.
+> Existing RetroBat system folders are preserved in
+> `<RetroBat>/.rommfs-original-roms` before linking the managed library.
+> No files are deleted or overwritten. These original games are kept in the
+> backup, not merged into the managed library.
 
 In **Settings → RetroBat**, use **Download official installer** and then
 **Launch installer…**, or select an installation you installed separately. Start RetroBat once and
@@ -161,12 +163,11 @@ not version equality; 8.2.1 is the source/package research reference.
 In **Settings**, select RetroBat, choose its installation and a separate managed
 ROM folder, then choose **Set up RetroBat**. `<RetroBat>/roms` stays a real
 directory; setup adds a link `roms/<system>` → `<managed folder>/<system>` for
-each system RetroBat defines whose folder is absent or empty. A system folder
-that already has files (RetroBat's stock `singe`, `ports` or `halflife`, or your
-own ROMs) is left untouched and reported as skipped. Windows directory symlink
-creation requires Developer Mode or the appropriate link privilege; RomMFS does
-not elevate. Nothing is migrated, backed up, overwritten or deleted. Other
-RetroBat folders remain in place.
+each system RetroBat defines. Existing system directories, including stock ROMs,
+gamelists and artwork, are moved intact to `.rommfs-original-roms/<system>` first.
+Existing backups are never overwritten; foreign links and files are left in
+place and reported as skipped. Windows can request permission through UAC to
+create the directory links. Other RetroBat folders remain in place.
 
 Setup records the links it created in `<RetroBat>/.rommfs-setup.json`. Rerunning
 with the same server/root verifies them, adds links for newly available
@@ -177,8 +178,12 @@ The system-level Switch save option is enabled; RetroBat's Eden/Citron launchers
 then generate their distinct save-location keys. Missing emulators are reported
 separately. Existing per-game overrides that disable that option prevent setup.
 
-Mounting generates per-platform `gamelist.xml` with local artwork and actual
-projected filenames. Existing favourites/play history are captured by stable
+Mounting generates per-platform `gamelist.xml` with actual projected filenames.
+Missing gamelists are written before artwork finishes downloading, including
+when recovering an interrupted publication;
+artwork is added afterward. Artwork caching uses eight concurrent downloads, and
+publication status is reported in the activity log.
+Existing favourites/play history are captured by stable
 ROM/file identity before publication. Complete XML files are replaced atomically
 while the frontend is stopped; ready publication waits while it is running.
 Stop/remount retains these ordinary writable files and their identity index.
