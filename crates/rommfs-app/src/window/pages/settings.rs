@@ -203,22 +203,25 @@ fn step_progress(id: &'static str, counts: Option<(u64, u64)>) -> impl IntoEleme
     }
 }
 
-/// Splits the setup result into a headline and the per-system notes that
-/// the earlier setup recorded as non-fatal (systems left as they are).
+/// Splits the setup result into a headline and per-system notes when some
+/// systems were skipped or restored.
 fn setup_result_notes(detail: &str) -> (Option<&'static str>, Vec<String>) {
     let body = detail.split_once(": ").map_or(detail, |(_, rest)| rest);
-    if !body.contains("left as-is") {
+    if !body.contains("skipped") && !body.contains("restored") {
         return (None, Vec::new());
     }
     let lines = body
         .split("; ")
+        .flat_map(|part| part.split(". "))
         .map(|part| part.trim().to_string())
         .filter(|part| !part.is_empty())
         .collect();
-    (
-        Some("Some systems already had files in RetroBat's roms folder and were left as they are."),
-        lines,
-    )
+    let headline = if body.contains("skipped") {
+        "Some systems couldn't be linked. Nothing in them was changed."
+    } else {
+        "Folders an earlier version moved aside are back in RetroBat's roms folder."
+    };
+    (Some(headline), lines)
 }
 
 impl RommfsWindow {
@@ -452,7 +455,7 @@ impl RommfsWindow {
         v_flex()
             .gap_2()
             .child(muted(
-                "Connects RetroBat's system folders to your games folder and configures Switch saves. Existing system folders are preserved in RetroBat's .rommfs-original-roms folder before linking; no files are deleted. Stop RetroBat and its emulators first.",
+                "Adds a RomM folder to each RetroBat system, next to your own games. Your files are never moved or changed. Close RetroBat first.",
                 cx,
             ))
             .child(

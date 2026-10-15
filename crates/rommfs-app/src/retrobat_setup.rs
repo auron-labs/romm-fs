@@ -18,15 +18,35 @@ pub(crate) fn setup(
     let _stopped = crate::controller::stopped_retrobat_guard(installation)?;
     crate::controller::check_mount_root(managed_root, server)?;
     crate::controller::claim_mount_root(managed_root, server)?;
-    // Reject overrides before making any links, including in the elevated helper.
-    let (home, _) = rommfs_core::retrobat::launcher_paths(installation)?;
-    rommfs_core::retrobat::switch_save_setting(&std::fs::read_to_string(
-        home.join("es_settings.cfg"),
-    )?)?;
     let outcome = rommfs_core::retrobat::setup_roms_link(installation, managed_root, server)?;
     let mut messages = vec![outcome.summary()];
-    messages.extend(rommfs_core::retrobat::configure_switch_saves(installation)?);
+    messages.push(configure_switch(installation));
     Ok(messages)
+}
+
+/// Switch save settings are optional: a problem is reported, never a reason
+/// to undo or block linking the games.
+fn configure_switch(installation: &Path) -> String {
+    match rommfs_core::retrobat::configure_switch_saves(installation) {
+        Ok(notes) if notes.is_empty() => "Switch saves configured".into(),
+        Ok(notes) => format!("Switch saves configured ({})", notes.join("; ")),
+        Err(error) => format!("Switch saves not configured: {error:#}"),
+    }
+}
+
+/// Read-only check after the elevated helper: is the Switch setting in place?
+#[cfg(windows)]
+pub(crate) fn switch_status(installation: &Path) -> String {
+    let configured = (|| -> anyhow::Result<bool> {
+        let (home, _) = rommfs_core::retrobat::launcher_paths(installation)?;
+        let current = std::fs::read_to_string(home.join("es_settings.cfg"))?;
+        Ok(rommfs_core::retrobat::switch_save_setting(&current)? == current)
+    })();
+    match configured {
+        Ok(true) => "Switch saves configured".into(),
+        Ok(false) => "Switch saves not configured".into(),
+        Err(error) => format!("Switch saves not configured: {error:#}"),
+    }
 }
 
 /// Retry only Windows permission failures, after the first attempt's guards drop.

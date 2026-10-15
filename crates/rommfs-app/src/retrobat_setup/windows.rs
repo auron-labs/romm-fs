@@ -102,7 +102,7 @@ pub(crate) fn run_elevated(
     if unsafe { ShellExecuteExW(&mut info) } == 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(1223) {
-            anyhow::bail!("Windows permission was declined. Retry Set up RetroBat and approve the Windows prompt to finish");
+            anyhow::bail!("Windows permission was declined, so nothing was changed. Retry and approve the Windows prompt to link RomM games into RetroBat");
         }
         return Err(error).context("request Windows permission for RetroBat setup");
     }
@@ -128,10 +128,7 @@ pub(crate) fn run_elevated(
     anyhow::ensure!(code == 0, "Elevated RetroBat setup did not complete. Close RetroBat and its emulators, check folder access, then retry (helper exit code {code})");
     // Inspect only: the normal app never repeats privileged mutations.
     let outcome = rommfs_core::retrobat::inspect_setup(installation, managed, server)?;
-    Ok(vec![
-        outcome.summary(),
-        "Switch save settings configured".into(),
-    ])
+    Ok(vec![outcome.summary(), super::switch_status(installation)])
 }
 
 struct Process(windows_sys::Win32::Foundation::HANDLE);

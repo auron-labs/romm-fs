@@ -1,6 +1,6 @@
-#[cfg(unix)]
-use rommfs_core::retrobat::verify_setup_link;
 use rommfs_core::retrobat::{configure_switch_saves, setup_roms_link, switch_save_setting};
+#[cfg(unix)]
+use rommfs_core::retrobat::{verify_setup_link, ROMM_FOLDER};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -69,84 +69,80 @@ fn write_stock_roms(install: &Path) -> Vec<(PathBuf, Vec<u8>)> {
         .collect()
 }
 
-#[cfg(unix)]
-#[test]
-fn stock_retrobat_roms_are_preserved_and_managed_gamelists_are_visible() {
-    let dir = tempfile::tempdir().unwrap();
-    let (install, managed) = installation(dir.path());
-    let existing = write_stock_roms(&install);
-    let outcome = setup_roms_link(&install, &managed, "s").unwrap();
-    assert!(outcome.skipped.is_empty());
-    let backup = outcome.original_roms.as_ref().unwrap();
-    assert!(outcome.summary().contains(&backup.display().to_string()));
-    assert_eq!(outcome.linked, ["gb", "halflife", "ports", "singe", "snes"]);
-    for system in &outcome.linked {
-        assert!(path_is_link(&install.join("roms").join(system)));
-        assert_eq!(
-            fs::read_link(install.join("roms").join(system)).unwrap(),
-            fs::canonicalize(&managed).unwrap().join(system)
-        );
+/// Every stock file, byte for byte, plus the folders that held them.
+fn assert_untouched(existing: &[(PathBuf, Vec<u8>)]) {
+    for (path, bytes) in existing {
+        assert_eq!(&fs::read(path).unwrap(), bytes, "{}", path.display());
     }
-    assert!(!path_is_link(&install.join("roms")));
-    for (path, bytes) in &existing {
-        let relative = path.strip_prefix(install.join("roms")).unwrap();
-        let system = relative.components().next().unwrap().as_os_str();
-        let preserved = if outcome.linked.iter().any(|name| name.as_str() == system) {
-            backup.join(relative)
-        } else {
-            path.clone()
-        };
-        assert_eq!(
-            &fs::read(&preserved).unwrap(),
-            bytes,
-            "{}",
-            preserved.display()
-        );
-    }
-    fs::create_dir(managed.join("ports")).unwrap();
-    fs::write(managed.join("ports/gamelist.xml"), b"managed gamelist").unwrap();
-    assert_eq!(
-        fs::read(install.join("roms/ports/gamelist.xml")).unwrap(),
-        b"managed gamelist"
-    );
-    let record = fs::read_to_string(install.join(".rommfs-setup.json")).unwrap();
-    assert!(record.contains("\"schema\":2"));
-    // An interrupted link step is recoverable without overwriting the backup.
-    fs::remove_file(install.join("roms/ports")).unwrap();
-    let again = setup_roms_link(&install, &managed, "s").unwrap();
-    assert_eq!(again.linked, outcome.linked);
-    assert!(again.skipped.is_empty());
-    assert_eq!(again.original_roms, outcome.original_roms);
-    assert_eq!(
-        fs::read(install.join("roms/ports/gamelist.xml")).unwrap(),
-        b"managed gamelist"
-    );
-    assert_eq!(
-        fs::read(backup.join("ports/gamelist.xml")).unwrap(),
-        b"stock bytes of roms/ports/gamelist.xml"
-    );
-    verify_setup_link(&install, &managed, "s").unwrap();
 }
 
 #[cfg(unix)]
 #[test]
-fn original_rom_backups_are_never_overwritten() {
+fn romm_games_are_linked_alongside_stock_roms_without_touching_them() {
     let dir = tempfile::tempdir().unwrap();
     let (install, managed) = installation(dir.path());
-    let backup = install.join(".rommfs-original-roms/gb");
-    fs::create_dir_all(&backup).unwrap();
-    fs::write(backup.join("original.gb"), b"original game").unwrap();
-    fs::write(install.join("roms/gb/new.gb"), b"new game").unwrap();
-    assert!(setup_roms_link(&install, &managed, "s").is_err());
+    let existing = write_stock_roms(&install);
+    let outcome = setup_roms_link(&install, &managed, "s").unwrap();
+    assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+    assert_eq!(outcome.linked, ["gb", "halflife", "ports", "singe", "snes"]);
+    let canonical = fs::canonicalize(&managed).unwrap();
+    for system in &outcome.linked {
+        let folder = install.join("roms").join(system);
+        assert!(!path_is_link(&folder), "{system} must stay a real folder");
+        assert_eq!(
+            fs::read_link(folder.join(ROMM_FOLDER)).unwrap(),
+            canonical.join(system)
+        );
+    }
+    assert_untouched(&existing);
+    assert!(!install.join(".rommfs-original-roms").exists());
+    // snes had no folder: RomMFS created it and recorded that.
+    assert!(outcome.record.created_dirs.contains(&"snes".to_string()));
+    let record = fs::read_to_string(install.join(".rommfs-setup.json")).unwrap();
+    assert!(record.contains("\"schema\":3"));
+    verify_setup_link(&install, &managed, "s").unwrap();
+
+    // Repeatable, and a removed link is restored on the next run.
+    fs::remove_file(install.join("roms/ports").join(ROMM_FOLDER)).unwrap();
+    let again = setup_roms_link(&install, &managed, "s").unwrap();
+    assert_eq!(again.linked, outcome.linked);
+    assert!(path_is_link(&install.join("roms/ports").join(ROMM_FOLDER)));
+    assert_untouched(&existing);
+}
+
+#[cfg(unix)]
+#[test]
+fn one_system_that_cannot_be_linked_does_not_stop_the_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let (install, managed) = installation(dir.path());
+    fs::write(
+        install.join("emulationstation/.emulationstation/es_systems.cfg"),
+        STOCK_SYSTEMS,
+    )
+    .unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    // A user's own link, a file where a folder should be, and an existing RomM entry.
+    std::os::unix::fs::symlink(&elsewhere, install.join("roms/snes")).unwrap();
+    fs::write(install.join("roms/singe"), b"not a folder").unwrap();
+    fs::create_dir_all(install.join("roms/ports/RomM")).unwrap();
+    fs::write(install.join("roms/ports/RomM/mine.txt"), b"user file").unwrap();
+    let outcome = setup_roms_link(&install, &managed, "s").unwrap();
+    let skipped: Vec<_> = outcome.skipped.iter().map(|s| s.system.as_str()).collect();
+    assert_eq!(skipped, ["ports", "singe", "snes"]);
+    assert!(outcome.skipped.iter().all(|s| !s.reason.is_empty()));
+    assert_eq!(outcome.linked, ["gb", "halflife"]);
+    assert!(outcome.summary().contains("3 skipped"));
+    assert_eq!(fs::read_link(install.join("roms/snes")).unwrap(), elsewhere);
     assert_eq!(
-        fs::read(backup.join("original.gb")).unwrap(),
-        b"original game"
+        fs::read(install.join("roms/singe")).unwrap(),
+        b"not a folder"
     );
     assert_eq!(
-        fs::read(install.join("roms/gb/new.gb")).unwrap(),
-        b"new game"
+        fs::read(install.join("roms/ports/RomM/mine.txt")).unwrap(),
+        b"user file"
     );
-    assert!(!path_is_link(&install.join("roms/gb")));
+    assert!(!path_is_link(&install.join("roms/ports/RomM")));
 }
 
 #[cfg(unix)]
@@ -163,12 +159,12 @@ fn rerun_adds_links_for_systems_that_become_available() {
     .unwrap();
     let outcome = setup_roms_link(&install, &managed, "s").unwrap();
     assert!(outcome.linked.contains(&"snes".to_string()));
-    assert!(path_is_link(&install.join("roms/snes")));
+    assert!(path_is_link(&install.join("roms/snes").join(ROMM_FOLDER)));
 }
 
 #[cfg(unix)]
 #[test]
-fn empty_system_directories_are_replaced_and_foreign_links_are_kept() {
+fn earlier_layouts_are_converted_and_moved_folders_come_back() {
     let dir = tempfile::tempdir().unwrap();
     let (install, managed) = installation(dir.path());
     fs::write(
@@ -176,15 +172,61 @@ fn empty_system_directories_are_replaced_and_foreign_links_are_kept() {
         STOCK_SYSTEMS,
     )
     .unwrap();
-    let elsewhere = dir.path().join("elsewhere");
-    fs::create_dir(&elsewhere).unwrap();
-    std::os::unix::fs::symlink(&elsewhere, install.join("roms/snes")).unwrap();
+    let canonical = fs::canonicalize(&managed).unwrap();
+    // Schema 2: whole-system links, with an original folder moved aside.
+    fs::remove_dir_all(install.join("roms/gb")).unwrap();
+    std::os::unix::fs::symlink(canonical.join("gb"), install.join("roms/gb")).unwrap();
+    let backup = install.join(".rommfs-original-roms/ports");
+    fs::create_dir_all(&backup).unwrap();
+    fs::write(backup.join("2048.libretro"), b"stock game").unwrap();
+    std::os::unix::fs::symlink(canonical.join("ports"), install.join("roms/ports")).unwrap();
+    fs::write(
+        install.join(".rommfs-setup.json"),
+        format!(
+            "{{\"schema\":2,\"server_id\":\"s\",\"managed_root\":{:?},\"version\":null,\"links\":[\"gb\",\"ports\"]}}",
+            canonical.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    assert!(verify_setup_link(&install, &managed, "s").is_err());
     let outcome = setup_roms_link(&install, &managed, "s").unwrap();
-    // roms/gb/empty was an empty directory tree: replaced by the link.
-    assert!(outcome.linked.contains(&"gb".to_string()));
-    assert!(path_is_link(&install.join("roms/gb")));
-    assert!(outcome.skipped.contains(&"snes".to_string()));
-    assert_eq!(fs::read_link(install.join("roms/snes")).unwrap(), elsewhere);
+    assert_eq!(outcome.restored, ["ports"]);
+    assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+    for system in ["gb", "ports"] {
+        assert!(!path_is_link(&install.join("roms").join(system)));
+        assert!(path_is_link(
+            &install.join("roms").join(system).join(ROMM_FOLDER)
+        ));
+    }
+    assert_eq!(
+        fs::read(install.join("roms/ports/2048.libretro")).unwrap(),
+        b"stock game"
+    );
+    assert!(!install.join(".rommfs-original-roms").exists());
+    verify_setup_link(&install, &managed, "s").unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_backup_that_cannot_go_back_is_left_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let (install, managed) = installation(dir.path());
+    let backup = install.join(".rommfs-original-roms/gb");
+    fs::create_dir_all(&backup).unwrap();
+    fs::write(backup.join("original.gb"), b"original game").unwrap();
+    fs::write(install.join("roms/gb/new.gb"), b"new game").unwrap();
+    let outcome = setup_roms_link(&install, &managed, "s").unwrap();
+    // RetroBat recreated roms/gb meanwhile: both folders are kept as they are.
+    assert!(outcome.restored.is_empty());
+    assert_eq!(outcome.linked, ["gb"]);
+    assert_eq!(
+        fs::read(backup.join("original.gb")).unwrap(),
+        b"original game"
+    );
+    assert_eq!(
+        fs::read(install.join("roms/gb/new.gb")).unwrap(),
+        b"new game"
+    );
 }
 
 #[test]
@@ -209,47 +251,53 @@ fn path_is_link(path: &Path) -> bool {
 
 #[cfg(unix)]
 #[test]
-fn setup_accepts_compatible_versions_is_repeatable_and_rejects_wrong_ownership() {
+fn setup_retargets_its_own_links_when_the_games_folder_or_server_changes() {
     let dir = tempfile::tempdir().unwrap();
     let (install, managed) = installation(dir.path());
     let outcome = setup_roms_link(&install, &managed, "s").unwrap();
     assert_eq!(outcome.record.version.as_deref(), Some("9.0.1-compatible"));
-    assert_eq!(
-        fs::read_link(install.join("roms/gb")).unwrap(),
-        fs::canonicalize(&managed).unwrap().join("gb")
-    );
     setup_roms_link(&install, &managed, "s").unwrap();
-    assert!(setup_roms_link(&install, &managed, "other").is_err());
+    assert!(verify_setup_link(&install, &managed, "other").is_err());
     let other = dir.path().join("other");
     fs::create_dir(&other).unwrap();
-    assert!(setup_roms_link(&install, &other, "s").is_err());
-    // A recorded link retargeted elsewhere is rejected and left untouched.
-    fs::remove_file(install.join("roms/gb")).unwrap();
-    std::os::unix::fs::symlink(&other, install.join("roms/gb")).unwrap();
+    setup_roms_link(&install, &other, "other").unwrap();
+    assert_eq!(
+        fs::read_link(install.join("roms/gb").join(ROMM_FOLDER)).unwrap(),
+        fs::canonicalize(&other).unwrap().join("gb")
+    );
+    verify_setup_link(&install, &other, "other").unwrap();
     assert!(verify_setup_link(&install, &managed, "s").is_err());
-    assert_eq!(fs::read_link(install.join("roms/gb")).unwrap(), other);
 }
 
 #[cfg(unix)]
 #[test]
-fn legacy_whole_roms_link_is_still_accepted() {
+fn legacy_whole_roms_link_becomes_a_real_folder() {
     let dir = tempfile::tempdir().unwrap();
     let (install, managed) = installation(dir.path());
     fs::remove_dir_all(install.join("roms")).unwrap();
     let canonical = fs::canonicalize(&managed).unwrap();
     std::os::unix::fs::symlink(&canonical, install.join("roms")).unwrap();
-    let version = "9.0.1-compatible";
     fs::write(
         install.join(".rommfs-setup.json"),
         format!(
-            "{{\"schema\":1,\"server_id\":\"s\",\"managed_root\":{:?},\"version\":\"{version}\"}}",
+            "{{\"schema\":1,\"server_id\":\"s\",\"managed_root\":{:?},\"version\":\"9.0.1-compatible\"}}",
             canonical.to_str().unwrap()
         ),
     )
     .unwrap();
-    verify_setup_link(&install, &managed, "s").unwrap();
     let outcome = setup_roms_link(&install, &managed, "s").unwrap();
-    assert!(outcome.legacy_whole_link && path_is_link(&install.join("roms")));
+    assert!(!path_is_link(&install.join("roms")));
+    assert_eq!(outcome.linked, ["gb"]);
+    assert!(path_is_link(&install.join("roms/gb").join(ROMM_FOLDER)));
+    // A roms link RomMFS doesn't own is reported, not replaced.
+    let dir = tempfile::tempdir().unwrap();
+    let (install, managed) = installation(dir.path());
+    let elsewhere = dir.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::remove_dir_all(install.join("roms")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, install.join("roms")).unwrap();
+    assert!(setup_roms_link(&install, &managed, "s").is_err());
+    assert_eq!(fs::read_link(install.join("roms")).unwrap(), elsewhere);
 }
 
 #[test]

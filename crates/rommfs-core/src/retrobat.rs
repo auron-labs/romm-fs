@@ -1,5 +1,5 @@
-//! Fresh-installation setup and local frontend metadata. ROM ownership remains
-//! the native adapter's responsibility; setup never migrates an existing library.
+//! RetroBat setup and frontend metadata. RomM games are linked in alongside the
+//! user's own ROMs; setup never moves, replaces or deletes existing files.
 mod artwork;
 mod auxiliary;
 mod config;
@@ -25,7 +25,10 @@ pub use installer::{
     InstallerRelease, LaunchFailure, LaunchedInstaller,
 };
 pub use metadata::{generate_gamelists, MetadataIndex, MetadataPublication};
-pub use setup::{inspect_setup, setup_roms_link, verify_setup_link, SetupOutcome, SetupRecord};
+pub use setup::{
+    inspect_setup, linked_systems, setup_roms_link, verify_setup_link, SetupOutcome, SetupRecord,
+    SkippedSystem, ROMM_FOLDER,
+};
 
 /// Resolve effective frontend home/save directories through launcher settings.
 pub fn launcher_paths(
