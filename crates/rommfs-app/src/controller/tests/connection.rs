@@ -32,6 +32,27 @@ fn application_owner_keeps_worker_alive_after_view_handle_drops_and_quit_joins_o
 }
 use std::time::Duration;
 
+/// A minimal RetroBat installation with one system, set up for `root`.
+#[cfg(unix)]
+fn set_up_retrobat(installation: &std::path::Path, root: &std::path::Path) {
+    let home = installation.join("emulationstation/.emulationstation");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(installation.join("roms/gb")).unwrap();
+    std::fs::write(installation.join("retrobat.exe"), b"fixture").unwrap();
+    std::fs::write(
+        installation.join("emulationstation/emulatorLauncher.cfg"),
+        "home=.\\.emulationstation\nsaves=..\\saves\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("es_systems.cfg"),
+        "<systemList><system><name>gb</name><path>~/../roms/gb</path><extension>.gb</extension></system></systemList>",
+    )
+    .unwrap();
+    rommfs_core::retrobat::setup_roms_link(installation, root, "s").unwrap();
+}
+
+#[cfg(unix)]
 #[test]
 fn first_gamelists_publish_while_artwork_is_still_pending() {
     use rommfs_core::retrobat::ArtworkBatch;
@@ -40,8 +61,15 @@ fn first_gamelists_publish_while_artwork_is_still_pending() {
     let root = tmp.path().join("roms");
     let installation = tmp.path().join("retrobat");
     std::fs::create_dir(&root).unwrap();
-    std::fs::create_dir(&installation).unwrap();
     rommfs_cfapi::claim_mount_root(&root, "s").unwrap();
+    set_up_retrobat(&installation, &root);
+    let gamelist = installation.join("roms/gb/gamelist.xml");
+    // RetroBat's own entries stay; RomM games are merged in alongside them.
+    std::fs::write(
+        &gamelist,
+        "<?xml version=\"1.0\"?>\n<gameList><game><path>./Local.gb</path><favorite>true</favorite></game></gameList>",
+    )
+    .unwrap();
     let platforms: Vec<PlatformDto> =
         serde_json::from_str(&contract::platforms(&[(1, "gb", "gb", "Game Boy")])).unwrap();
     let roms = vec![serde_json::from_value(contract::rom(1, "gb", "Game.gb", 3, "hash")).unwrap()];
@@ -56,7 +84,7 @@ fn first_gamelists_publish_while_artwork_is_still_pending() {
         device_identifier: "id".into(),
         mount_root: Some(root.clone()),
         integration: IntegrationMode::RetroBat,
-        retrobat_root: Some(installation),
+        retrobat_root: Some(installation.clone()),
         start_at_login: false,
         save_root: None,
     });
@@ -76,9 +104,12 @@ fn first_gamelists_publish_while_artwork_is_still_pending() {
     worker.metadata_job = Some(rx);
     worker.metadata_ready = Some(ArtworkBatch::default());
     worker.poll_metadata();
-    assert!(std::fs::read_to_string(root.join("gb/gamelist.xml"))
-        .unwrap()
-        .contains("./Game.gb"));
+    let published = std::fs::read_to_string(&gamelist).unwrap();
+    assert!(
+        published.contains("<path>./RomM/Game.gb</path>"),
+        "{published}"
+    );
+    assert!(published.contains("<path>./Local.gb</path><favorite>true</favorite>"));
     assert!(worker.metadata_job.is_some());
     assert!(worker.metadata_ready.is_none());
     assert!(events.try_iter().any(|event| matches!(event,
@@ -98,7 +129,7 @@ fn first_gamelists_publish_while_artwork_is_still_pending() {
     )));
 
     // A prior publication can leave its index behind without any gamelist.
-    std::fs::remove_file(root.join("gb/gamelist.xml")).unwrap();
+    std::fs::remove_file(&gamelist).unwrap();
     assert!(root.join(".rommfs-metadata/index.json").is_file());
     let platforms =
         serde_json::from_str(&contract::platforms(&[(1, "gb", "gb", "Game Boy")])).unwrap();
@@ -124,7 +155,9 @@ fn first_gamelists_publish_while_artwork_is_still_pending() {
     worker.queue_metadata();
     assert!(worker.metadata_ready.is_some());
     worker.poll_metadata();
-    assert!(root.join("gb/gamelist.xml").is_file());
+    assert!(std::fs::read_to_string(&gamelist)
+        .unwrap()
+        .contains("./RomM/Game.gb"));
     worker.cancel_metadata();
 }
 
@@ -471,4 +504,25 @@ fn reauthentication_republishes_the_remembered_folder() {
         "reauthentication must restore the remembered folder to the UI"
     );
     assert_eq!(state.folder_summary(), FolderSummary::Stopped);
+}
+
+#[test]
+fn a_metadata_failure_is_logged_once_with_its_error() {
+    let (sink, events) = rommfs_core::events::channel();
+    let worker = Worker::new(sink);
+    worker.metadata_status(
+        false,
+        "Frontend metadata was not published",
+        Some("boom".into()),
+    );
+    let logs: Vec<_> = events
+        .try_iter()
+        .filter_map(|event| match event {
+            AppEvent::Log(line) => Some(line),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].level, Level::Error);
+    assert!(logs[0].message.contains("boom"));
 }

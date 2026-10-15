@@ -36,7 +36,14 @@ impl Worker {
         error: Option<String>,
     ) {
         let detail = detail.into();
-        self.log(Level::Info, "metadata", detail.clone());
+        // One log line per status: a failure carries its own error text.
+        match &error {
+            Some(error) if pending => {
+                self.log(Level::Warn, "metadata", format!("{detail}: {error}"))
+            }
+            Some(error) => self.log(Level::Error, "metadata", format!("{detail}: {error}")),
+            None => self.log(Level::Info, "metadata", detail.clone()),
+        }
         self.sink.emit(AppEvent::FrontendMetadata {
             pending,
             detail,
@@ -99,16 +106,10 @@ impl Worker {
         let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
         self.metadata_active = Some(active.clone());
         self.metadata_source = Some((catalogue.clone(), snapshot));
-        // Missing gamelists must not wait for artwork, even after an interrupted publication.
-        if self.mount.as_ref().is_some_and(|mount| {
-            !mount.root.join(".rommfs-metadata/index.json").exists()
-                || catalogue.platforms.iter().any(|platform| {
-                    platform != "switchupdates"
-                        && !mount.root.join(platform).join("gamelist.xml").exists()
-                })
-        }) {
-            self.metadata_ready = Some(rommfs_core::retrobat::ArtworkBatch::default());
-        }
+        // Publish gamelists straight away rather than waiting for artwork.
+        // Entries keep the artwork they already show, so this never strips
+        // images; a second publication adds new artwork once it is cached.
+        self.metadata_ready = Some(rommfs_core::retrobat::ArtworkBatch::default());
         let (tx, rx) = mpsc::channel();
         self.metadata_job = Some(rx);
         self.metadata_status(
@@ -148,10 +149,9 @@ impl Worker {
                                 reason: Some(error.to_string()),
                             });
                         }
-                        self.log(Level::Error, "metadata", error.to_string());
                         self.metadata_status(
                             false,
-                            "Frontend metadata was not published",
+                            "Artwork could not be cached; gamelists keep their existing artwork",
                             Some(error.to_string()),
                         );
                         return;
@@ -165,12 +165,12 @@ impl Worker {
         let Some(installation) = self
             .preferences
             .as_ref()
-            .and_then(|p| p.retrobat_root.as_deref())
+            .and_then(|p| p.retrobat_root.clone())
         else {
             self.cancel_metadata();
             return;
         };
-        let guard = match stopped_retrobat_guard(installation) {
+        let guard = match stopped_retrobat_guard(&installation) {
             Ok(guard) => guard,
             Err(error)
                 if !error
@@ -178,7 +178,6 @@ impl Worker {
                     .is_some_and(|io| matches!(io.raw_os_error(), Some(5 | 32 | 33))) =>
             {
                 self.cancel_metadata();
-                self.log(Level::Error, "metadata", format!("{error:#}"));
                 self.metadata_status(
                     false,
                     "Frontend metadata cannot be published safely",
@@ -188,13 +187,18 @@ impl Worker {
             }
             Err(error) => {
                 if !self.metadata_wait_reported {
-                    self.metadata_status(true, "Frontend metadata is ready; waiting for exclusive frontend/emulator access. Stop RetroBat and check the reported access error", Some(format!("{error:#}")));
+                    self.metadata_status(
+                        true,
+                        "Gamelists are ready; waiting for RetroBat and its emulators to close",
+                        Some(format!("{error:#}")),
+                    );
                     self.metadata_wait_reported = true;
                 }
                 return;
             }
         };
-        let result = (|| -> anyhow::Result<()> {
+        let mut problems = Vec::new();
+        let result = (|| -> anyhow::Result<usize> {
             let root = &self
                 .mount
                 .as_ref()
@@ -217,50 +221,84 @@ impl Worker {
             for warning in artwork.warnings() {
                 self.log(Level::Warn, "artwork", warning.clone());
             }
-            let (index, existing) = rommfs_cfapi::read_frontend_metadata(root, server)?;
+            let linked = rommfs_core::retrobat::linked_systems(&installation, root, server)?;
+            let frontend = rommfs_core::retrobat::read_gamelists(&installation, &linked);
+            let (index, legacy) = rommfs_cfapi::read_frontend_metadata(root, server)?;
             let publication = rommfs_core::retrobat::generate_gamelists(
                 catalogue,
                 &snapshot.roms,
                 server,
                 account,
                 &index,
-                &existing,
+                &frontend,
+                &legacy,
                 artwork.references(),
             )?;
-            self.metadata_status(
-                true,
-                format!(
-                    "Publishing {} gamelists and {} artwork files to {}",
-                    publication.gamelists().len(),
-                    artwork.files().len(),
-                    root.display()
-                ),
-                None,
-            );
-            rommfs_cfapi::publish_frontend_metadata(root, server, &publication, artwork.files())?;
-            self.log(
-                Level::Info,
-                "metadata",
-                format!(
-                    "Published {} gamelists; frontend favourites and history preserved",
-                    publication.gamelists().len()
-                ),
-            );
-            Ok(())
+            problems.extend(publication.skipped().iter().cloned());
+            let changed = publication.gamelists().len();
+            if changed > 0 || !artwork.files().is_empty() {
+                self.metadata_status(
+                    true,
+                    format!(
+                        "Updating {changed} gamelists and {} artwork files",
+                        artwork.files().len()
+                    ),
+                    None,
+                );
+            }
+            rommfs_cfapi::publish_frontend_metadata(
+                root,
+                server,
+                publication.index(),
+                artwork.files(),
+                || {
+                    let failures = rommfs_core::retrobat::publish_gamelists(
+                        &installation,
+                        &linked,
+                        &publication,
+                    );
+                    let failed = failures.len();
+                    problems.extend(failures);
+                    // Keep the staged index if any XML is still at its old
+                    // paths; recapturing it with the new mapping loses history.
+                    anyhow::ensure!(failed == 0, "{failed} gamelists could not be written; identity state is staged for retry");
+                    Ok(())
+                },
+            )?;
+            Ok(changed)
         })();
         drop(guard);
+        for (system, reason) in &problems {
+            self.log(Level::Warn, "metadata", format!("{system}: {reason}"));
+        }
+        let left_as_is = |text: &str| match problems.len() {
+            0 => text.to_string(),
+            n => format!("{text}; {n} systems left as they were (see the log)"),
+        };
         match result {
-            Ok(()) if self.metadata_job.is_some() => {
+            Ok(changed) if self.metadata_job.is_some() => {
                 self.metadata_ready = None;
-                self.metadata_status(true, "Gamelists published; caching frontend artwork", None);
+                // RetroBat may be started again before artwork finishes.
+                self.metadata_wait_reported = false;
+                self.log(
+                    Level::Info,
+                    "metadata",
+                    format!(
+                        "Published {changed} gamelists; frontend favourites and history preserved"
+                    ),
+                );
+                self.metadata_status(
+                    true,
+                    left_as_is("Gamelists published; caching frontend artwork"),
+                    None,
+                );
             }
-            Ok(()) => {
+            Ok(_) => {
                 self.cancel_metadata();
-                self.metadata_status(false, "Frontend metadata is up to date", None);
+                self.metadata_status(false, left_as_is("Frontend metadata is up to date"), None);
             }
             Err(error) => {
                 self.cancel_metadata();
-                self.log(Level::Error, "metadata", format!("{error:#}"));
                 self.metadata_status(
                     false,
                     "Frontend metadata was not fully published; existing state was retained",

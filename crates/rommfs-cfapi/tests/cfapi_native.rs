@@ -20,7 +20,7 @@ use rommfs_core::cache::{CacheIndex, Evictor, FakeClock, LiveState};
 use rommfs_core::catalogue::{build_catalogue, server_id_of, RomKey};
 use rommfs_core::download::DownloadManager;
 use rommfs_core::filesystem::RommFs;
-use rommfs_core::retrobat::{generate_gamelists, MetadataIndex};
+use rommfs_core::retrobat::{generate_gamelists, FrontendGamelists, MetadataIndex};
 use rommfs_core::romm::{Credentials, RommClient};
 use rommfs_core::tree::RommTree;
 use rommfs_fixture::{contract, FixtureServer, ResponseSpec};
@@ -233,40 +233,36 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
         "failed mutations must not download content"
     );
 
-    // Ordinary metadata must be writable without hydrating ROMs, while parent
-    // delete-child access must still not bypass a ROM's protected descriptor.
+    // Ordinary metadata (artwork, identity index) must be writable without
+    // hydrating ROMs, while parent delete-child access must still not bypass a
+    // ROM's protected descriptor. Gamelists live in RetroBat's own folders.
     let publication = generate_gamelists(
         fs.catalogue(),
         &roms,
         &server_id,
         1,
         &MetadataIndex::default(),
+        &FrontendGamelists::default(),
         &BTreeMap::new(),
         &HashMap::new(),
     )
     .unwrap();
-    publish_frontend_metadata(&root, &server_id, &publication, &BTreeMap::new()).unwrap();
-    let gamelist = root.join("nes/gamelist.xml");
-    let updated = std::fs::read_to_string(&gamelist).unwrap().replace(
-        "</game>",
-        "<favorite>true</favorite><playcount>7</playcount></game>",
-    );
-    std::fs::write(&gamelist, &updated).unwrap();
-    let (index, existing) = read_frontend_metadata(&root, &server_id).unwrap();
-    let refreshed = generate_gamelists(
-        fs.catalogue(),
-        &roms,
-        &server_id,
-        1,
-        &index,
-        &existing,
-        &HashMap::new(),
-    )
+    let cached = workspace.path().join("cached-artwork.png");
+    std::fs::write(&cached, b"cached artwork").unwrap();
+    let artwork = BTreeMap::from([("nes/.rommfs-artwork/cover.png".to_string(), cached)]);
+    let mut wrote_gamelists = false;
+    publish_frontend_metadata(&root, &server_id, publication.index(), &artwork, || {
+        wrote_gamelists = true;
+        Ok(())
+    })
     .unwrap();
-    publish_frontend_metadata(&root, &server_id, &refreshed, &BTreeMap::new()).unwrap();
-    assert!(std::fs::read_to_string(&gamelist)
-        .unwrap()
-        .contains("<playcount>7</playcount>"));
+    assert!(wrote_gamelists);
+    assert_eq!(
+        std::fs::read(root.join("nes/.rommfs-artwork/cover.png")).unwrap(),
+        b"cached artwork"
+    );
+    let (index, _legacy) = read_frontend_metadata(&root, &server_id).unwrap();
+    publish_frontend_metadata(&root, &server_id, &index, &artwork, || Ok(())).unwrap();
     assert_eq!(server.route_hit_count("GET", "/api/roms/"), 0);
     assert_read_only(&root, &rom_path);
 

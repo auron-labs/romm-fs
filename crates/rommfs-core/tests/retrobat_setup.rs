@@ -339,3 +339,76 @@ fn config_backup_is_local_repeatable_and_missing_emulators_are_not_setting_error
     configure_switch_saves(&install).unwrap();
     assert_eq!(backups().len(), 1);
 }
+
+#[cfg(unix)]
+#[test]
+fn publication_excludes_missing_replaced_and_redirected_links() {
+    use rommfs_core::retrobat::{
+        generate_gamelists, inspect_setup, linked_systems, publish_gamelists, read_gamelists,
+        MetadataIndex,
+    };
+    use std::collections::{BTreeMap, HashMap};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (install, managed) = installation(dir.path());
+    write_stock_roms(&install);
+    setup_roms_link(&install, &managed, "s").unwrap();
+    let folder = install.join("roms/ports");
+    let link = folder.join(ROMM_FOLDER);
+    let xml =
+        "<gameList><game><path>./RomM/Mine.libretro</path><name>User game</name></game></gameList>";
+    fs::write(folder.join("gamelist.xml"), xml).unwrap();
+    fs::remove_file(&link).unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let empty = rommfs_core::catalogue::build_catalogue("s", &[], &[], |_| {}).unwrap();
+
+    for state in ["missing", "directory", "foreign link", "foreign parent"] {
+        match state {
+            "directory" => {
+                fs::create_dir(&link).unwrap();
+                fs::write(link.join("Mine.libretro"), b"user game").unwrap();
+            }
+            "foreign link" => {
+                fs::remove_file(link.join("Mine.libretro")).unwrap();
+                fs::remove_dir(&link).unwrap();
+                std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+            }
+            "foreign parent" => {
+                fs::rename(&folder, dir.path().join("original-ports")).unwrap();
+                fs::write(elsewhere.join("gamelist.xml"), xml).unwrap();
+                std::os::unix::fs::symlink(managed.join("ports"), elsewhere.join(ROMM_FOLDER))
+                    .unwrap();
+                std::os::unix::fs::symlink(&elsewhere, &folder).unwrap();
+            }
+            _ => {}
+        }
+        let linked = linked_systems(&install, &managed, "s").unwrap();
+        assert!(!linked.iter().any(|s| s == "ports"), "{state}");
+        // Targets need not exist yet: setup precedes mounting the library.
+        assert!(linked.iter().any(|s| s == "gb"), "{state}");
+        assert!(inspect_setup(&install, &managed, "s")
+            .unwrap()
+            .skipped
+            .iter()
+            .any(|s| s.system == "ports"));
+        let frontend = read_gamelists(&install, &linked);
+        let output = generate_gamelists(
+            &empty,
+            &[],
+            "s",
+            7,
+            &MetadataIndex::default(),
+            &frontend,
+            &BTreeMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert!(publish_gamelists(&install, &linked, &output).is_empty());
+        assert_eq!(
+            fs::read_to_string(folder.join("gamelist.xml")).unwrap(),
+            xml,
+            "{state}"
+        );
+    }
+}

@@ -278,9 +278,9 @@ fn verify_entry(path: &Path, entry: &OwnedEntry) -> anyhow::Result<()> {
     }
 }
 
-/// Read only previously claimed generated files; no filename-based acquisition
-/// of unrelated gamelists or state. Missing local files can be regenerated.
-/// Existing gamelists without an identity index start with a default index.
+/// Read the identity index and any gamelists an earlier build published in the
+/// managed folder (only read now, for frontend fields to carry over). Only
+/// previously claimed files are read; a missing index starts a default one.
 pub fn read_frontend_metadata(
     root: &Path,
     server: &str,
@@ -316,14 +316,16 @@ pub fn read_frontend_metadata(
     Ok((index, gamelists))
 }
 
-/// Publish ordinary gamelists/artwork while the caller holds the stopped
-/// frontend guard. Persist captured state first, XML next, then commit its path
-/// index. Native ROM cleanup never removes these files.
+/// Publish artwork and the identity index while the caller holds the stopped
+/// frontend guard. The staged index is persisted first, then artwork, then
+/// `publish_gamelists` writes RetroBat's gamelists, and the final index commits
+/// last. Native ROM cleanup never removes these files.
 pub fn publish_frontend_metadata(
     root: &Path,
     server: &str,
-    publication: &rommfs_core::retrobat::MetadataPublication,
+    index: &rommfs_core::retrobat::MetadataIndex,
     artwork: &std::collections::BTreeMap<String, PathBuf>,
+    publish_gamelists: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     check_mount_root(root, server)?;
     let mut manifest = read_manifest(root)?;
@@ -333,7 +335,7 @@ pub fn publish_frontend_metadata(
         &mut manifest,
         index_path,
         OwnedKind::FrontendState,
-        &serde_json::to_vec(&publication.index().staged())?,
+        &serde_json::to_vec(&index.staged())?,
         false,
     )?;
     // Claim the whole artwork batch before writing bytes, not one manifest rewrite per image.
@@ -358,15 +360,13 @@ pub fn publish_frontend_metadata(
             false,
         )?;
     }
-    for (path, bytes) in publication.gamelists() {
-        publish_local(root, &mut manifest, path, OwnedKind::Gamelist, bytes, false)?;
-    }
+    publish_gamelists()?;
     publish_local(
         root,
         &mut manifest,
         index_path,
         OwnedKind::FrontendState,
-        &serde_json::to_vec(publication.index())?,
+        &serde_json::to_vec(index)?,
         false,
     )?;
     Ok(())

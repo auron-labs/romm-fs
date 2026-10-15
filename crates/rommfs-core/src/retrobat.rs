@@ -24,7 +24,10 @@ pub use installer::{
     describe_launch_failure, discover_installer, download_installer, launch_installer,
     InstallerRelease, LaunchFailure, LaunchedInstaller,
 };
-pub use metadata::{generate_gamelists, MetadataIndex, MetadataPublication};
+pub use metadata::{
+    generate_gamelists, publish_gamelists, read_gamelists, FrontendGamelists, MetadataIndex,
+    MetadataPublication,
+};
 pub use setup::{
     inspect_setup, linked_systems, setup_roms_link, verify_setup_link, SetupOutcome, SetupRecord,
     SkippedSystem, ROMM_FOLDER,
