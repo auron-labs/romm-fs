@@ -46,6 +46,13 @@ pub enum ResponseSpec {
         bytes: Vec<u8>,
         barrier: FixtureBodyBarrier,
     },
+    /// A JSON response that signals `started` on receipt and only answers once
+    /// the barrier is released. Proves concurrent in-flight requests.
+    HeldJson {
+        status: u16,
+        body: String,
+        barrier: FixtureBodyBarrier,
+    },
     /// Stateful subset of RomM's save API. Uploads receive the server's
     /// verified datetime filename tag and are visible to inventory/readback.
     RomMSaveUpload {
@@ -60,6 +67,12 @@ pub enum ResponseSpec {
     },
     RomMSaveInventory,
     RomMSaveContent,
+    /// Stateful subset of RomM's memory-card API: list/create cards, list
+    /// versions, upload a version (multipart `cardFile`) and download version
+    /// content. Covers every method/path under `/api/memory-cards`.
+    RomMMemoryCard {
+        user_id: i64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +149,23 @@ pub struct FixtureSaveRecord {
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixtureMemoryCard {
+    pub id: i64,
+    pub user_id: i64,
+    pub emulator: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixtureMemoryCardVersion {
+    pub id: i64,
+    pub memory_card_id: i64,
+    pub file_name: String,
+    pub content_hash: String,
+    pub bytes: Vec<u8>,
+}
+
 /// Per-test scripted server. Drop/join stops it.
 pub struct FixtureServer {
     base_url: String,
@@ -154,6 +184,10 @@ struct FixtureState {
     requests_seen: Mutex<Vec<CapturedRequest>>,
     saves: Mutex<HashMap<i64, FixtureSaveRecord>>,
     next_save_id: AtomicUsize,
+    memory_cards: Mutex<HashMap<i64, FixtureMemoryCard>>,
+    memory_card_versions: Mutex<Vec<FixtureMemoryCardVersion>>,
+    next_memory_card_id: AtomicUsize,
+    next_memory_card_version_id: AtomicUsize,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -172,6 +206,10 @@ impl FixtureServer {
             requests_seen: Mutex::new(Vec::new()),
             saves: Mutex::new(HashMap::new()),
             next_save_id: AtomicUsize::new(30),
+            memory_cards: Mutex::new(HashMap::new()),
+            memory_card_versions: Mutex::new(Vec::new()),
+            next_memory_card_id: AtomicUsize::new(1),
+            next_memory_card_version_id: AtomicUsize::new(1),
             shutdown: Arc::new(AtomicBool::new(false)),
         });
         let conns: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -305,6 +343,51 @@ impl FixtureServer {
             .collect::<Vec<_>>();
         saves.sort_by_key(|save| save.id);
         saves
+    }
+
+    /// Install the stateful memory-card routes on `/api/memory-cards`.
+    pub fn use_romm_memory_card_store(&self, user_id: i64) {
+        let spec = ResponseSpec::RomMMemoryCard { user_id };
+        self.on("GET", "/api/memory-cards", spec.clone());
+        self.on("POST", "/api/memory-cards", spec);
+    }
+
+    pub fn memory_cards(&self) -> Vec<FixtureMemoryCard> {
+        let mut cards = self
+            .state
+            .memory_cards
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        cards.sort_by_key(|card| card.id);
+        cards
+    }
+
+    pub fn memory_card_versions(&self) -> Vec<FixtureMemoryCardVersion> {
+        self.state.memory_card_versions.lock().unwrap().clone()
+    }
+
+    /// Seed a remote card version without an HTTP upload.
+    pub fn seed_memory_card_version(&self, card_id: i64, bytes: Vec<u8>) -> i64 {
+        let id = self
+            .state
+            .next_memory_card_version_id
+            .fetch_add(1, Ordering::SeqCst) as i64;
+        let content_hash = fixture_content_hash(&bytes);
+        self.state
+            .memory_card_versions
+            .lock()
+            .unwrap()
+            .push(FixtureMemoryCardVersion {
+                id,
+                memory_card_id: card_id,
+                file_name: format!("card [{id}].card.zip"),
+                content_hash,
+                bytes,
+            });
+        id
     }
 
     /// Seed a remote history record without issuing an HTTP POST.
@@ -462,6 +545,19 @@ fn handle_conn(mut stream: TcpStream, state: &FixtureState) {
             }
             let _ = stream.write_all(&bytes);
         }
+        ResponseSpec::HeldJson {
+            status,
+            body,
+            barrier,
+        } => {
+            let _ = barrier.started_tx.send(());
+            if !barrier.wait_for_release(&state.shutdown) {
+                return;
+            }
+            if write_response_head(&mut stream, status, "application/json", body.len()).is_ok() {
+                let _ = stream.write_all(body.as_bytes());
+            }
+        }
         ResponseSpec::RomMSaveUpload { status, user_id } => {
             let Some(save) = store_uploaded_save(&request, user_id, &state.next_save_id) else {
                 let body = r#"{"detail":"fixture: invalid save upload"}"#;
@@ -527,6 +623,9 @@ fn handle_conn(mut stream: TcpStream, state: &FixtureState) {
             {
                 let _ = stream.write_all(&stored.bytes);
             }
+        }
+        ResponseSpec::RomMMemoryCard { user_id } => {
+            respond_memory_card(&mut stream, &request, state, user_id);
         }
     }
 }
@@ -613,6 +712,246 @@ fn save_json_value(save: &FixtureSaveRecord) -> serde_json::Value {
         "emulator": "retroarch-gambatte",
         "slot": save.slot,
     })
+}
+
+fn respond_memory_card(
+    stream: &mut TcpStream,
+    request: &CapturedRequest,
+    state: &FixtureState,
+    user_id: i64,
+) {
+    let method = request.method.to_uppercase();
+    let (path, query) = match request.target.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (request.target.as_str(), ""),
+    };
+    let tail = path
+        .strip_prefix("/api/memory-cards")
+        .unwrap_or("")
+        .trim_end_matches('/');
+
+    if tail.is_empty() && method == "GET" {
+        let emulator = query_value(&format!("?{query}"), "emulator");
+        let cards = state.memory_cards.lock().unwrap();
+        let body = serde_json::Value::Array(
+            cards
+                .values()
+                .filter(|card| card.user_id == user_id)
+                .filter(|card| emulator.as_deref().is_none_or(|name| card.emulator == name))
+                .map(memory_card_json_value)
+                .collect(),
+        )
+        .to_string();
+        write_json(stream, 200, &body);
+        return;
+    }
+    if tail.is_empty() && method == "POST" {
+        let payload = serde_json::from_slice::<serde_json::Value>(&request.body).ok();
+        let name = payload
+            .as_ref()
+            .and_then(|value| value.get("name"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let emulator = payload
+            .as_ref()
+            .and_then(|value| value.get("emulator"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if name.is_empty() || emulator.is_empty() {
+            write_json(
+                stream,
+                400,
+                r#"{"detail":"name and emulator are required"}"#,
+            );
+            return;
+        }
+        let id = state.next_memory_card_id.fetch_add(1, Ordering::SeqCst) as i64;
+        let card = FixtureMemoryCard {
+            id,
+            user_id,
+            emulator,
+            name,
+        };
+        state.memory_cards.lock().unwrap().insert(id, card.clone());
+        write_json(stream, 201, &memory_card_json_value(&card).to_string());
+        return;
+    }
+
+    if let Some(rest) = tail.strip_prefix("/versions/") {
+        if method == "GET" {
+            if let Some(id) = rest
+                .strip_suffix("/content")
+                .and_then(|id| id.parse::<i64>().ok())
+            {
+                let bytes = state
+                    .memory_card_versions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|version| version.id == id)
+                    .map(|version| version.bytes.clone());
+                if let Some(bytes) = bytes {
+                    if write_response_head(stream, 200, "application/octet-stream", bytes.len())
+                        .is_ok()
+                    {
+                        let _ = stream.write_all(&bytes);
+                    }
+                    return;
+                }
+            }
+        }
+        write_json(stream, 404, r#"{"detail":"memory card version not found"}"#);
+        return;
+    }
+
+    let mut parts = tail.trim_start_matches('/').split('/');
+    let Some(card_id) = parts.next().and_then(|id| id.parse::<i64>().ok()) else {
+        write_json(stream, 404, r#"{"detail":"memory card not found"}"#);
+        return;
+    };
+    let action = parts.next().unwrap_or("");
+    match (method.as_str(), action) {
+        ("GET", "") => {
+            let card = state
+                .memory_cards
+                .lock()
+                .unwrap()
+                .get(&card_id)
+                .filter(|card| card.user_id == user_id)
+                .cloned();
+            match card {
+                Some(card) => write_json(stream, 200, &memory_card_json_value(&card).to_string()),
+                None => write_json(stream, 404, r#"{"detail":"memory card not found"}"#),
+            }
+        }
+        ("GET", "versions") => {
+            let owned = state
+                .memory_cards
+                .lock()
+                .unwrap()
+                .get(&card_id)
+                .is_some_and(|card| card.user_id == user_id);
+            if !owned {
+                write_json(stream, 404, r#"{"detail":"memory card not found"}"#);
+                return;
+            }
+            let versions = state.memory_card_versions.lock().unwrap();
+            let body = serde_json::Value::Array(
+                versions
+                    .iter()
+                    .rev()
+                    .filter(|version| version.memory_card_id == card_id)
+                    .map(memory_card_version_json_value)
+                    .collect(),
+            )
+            .to_string();
+            write_json(stream, 200, &body);
+        }
+        ("GET", "content") => {
+            let bytes = {
+                let versions = state.memory_card_versions.lock().unwrap();
+                versions
+                    .iter()
+                    .rev()
+                    .find(|version| version.memory_card_id == card_id)
+                    .map(|version| version.bytes.clone())
+            };
+            match bytes {
+                Some(bytes) => {
+                    if write_response_head(stream, 200, "application/octet-stream", bytes.len())
+                        .is_ok()
+                    {
+                        let _ = stream.write_all(&bytes);
+                    }
+                }
+                None => write_json(
+                    stream,
+                    404,
+                    r#"{"detail":"memory card has no stored data yet"}"#,
+                ),
+            }
+        }
+        ("POST", "versions") => {
+            let owned = state
+                .memory_cards
+                .lock()
+                .unwrap()
+                .get(&card_id)
+                .filter(|card| card.user_id == user_id)
+                .cloned();
+            let Some(card) = owned else {
+                write_json(stream, 404, r#"{"detail":"memory card not found"}"#);
+                return;
+            };
+            let Some((_filename, bytes)) = multipart_save_file(request) else {
+                write_json(stream, 400, r#"{"detail":"invalid memory card upload"}"#);
+                return;
+            };
+            let id = state
+                .next_memory_card_version_id
+                .fetch_add(1, Ordering::SeqCst) as i64;
+            let content_hash = fixture_content_hash(&bytes);
+            let version = FixtureMemoryCardVersion {
+                id,
+                memory_card_id: card_id,
+                file_name: format!("{} [2026-10-05_12-34-56].card.zip", card.name),
+                content_hash,
+                bytes,
+            };
+            let body = memory_card_version_json_value(&version).to_string();
+            state.memory_card_versions.lock().unwrap().push(version);
+            write_json(stream, 201, &body);
+        }
+        _ => write_json(stream, 404, r#"{"detail":"memory card route not found"}"#),
+    }
+}
+
+fn write_json(stream: &mut TcpStream, status: u16, body: &str) {
+    if write_response_head(stream, status, "application/json", body.len()).is_ok() {
+        let _ = stream.write_all(body.as_bytes());
+    }
+}
+
+fn memory_card_json_value(card: &FixtureMemoryCard) -> serde_json::Value {
+    serde_json::json!({
+        "id": card.id,
+        "user_id": card.user_id,
+        "emulator": card.emulator,
+        "platform_id": null,
+        "name": card.name,
+        "slot": 1,
+        "is_public": false,
+        "created_at": "2026-10-05T12:34:56Z",
+        "updated_at": "2026-10-05T12:34:56Z",
+    })
+}
+
+fn memory_card_version_json_value(version: &FixtureMemoryCardVersion) -> serde_json::Value {
+    serde_json::json!({
+        "id": version.id,
+        "memory_card_id": version.memory_card_id,
+        "file_name": version.file_name,
+        "file_size_bytes": version.bytes.len(),
+        "content_hash": version.content_hash,
+        "missing_from_fs": false,
+        "created_at": "2026-10-05T12:34:56Z",
+        "updated_at": "2026-10-05T12:34:56Z",
+    })
+}
+
+/// A stable non-cryptographic stand-in for the server's zip content hash; the
+/// client only ever compares version ids, so this exists for realism and tests.
+fn fixture_content_hash(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn query_value(target: &str, key: &str) -> Option<String> {

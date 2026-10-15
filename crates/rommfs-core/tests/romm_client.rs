@@ -547,3 +547,90 @@ fn expired_save_api_token_is_cleared_like_other_authenticated_routes() {
     assert!(matches!(failure.error, Error::Auth(_)));
     assert!(!client.has_token());
 }
+
+#[test]
+fn roms_page_disables_unused_sidecars_and_requests_total_only_when_asked() {
+    let fx = contract_server(
+        vec![contract::rom(7, "nes", "Example Game.nes", 10, "s")],
+        1,
+    );
+    let client = authed(&fx);
+    client.roms_page(200, 0).unwrap();
+    client.roms_page_flagged(200, 0, false, None).unwrap();
+
+    let targets: Vec<String> = fx
+        .requests()
+        .into_iter()
+        .filter(|request| request.target.starts_with("/api/roms?"))
+        .map(|request| request.target)
+        .collect();
+    assert_eq!(targets.len(), 2, "{targets:?}");
+    for target in &targets {
+        assert!(target.contains("with_char_index=false"), "{target}");
+        assert!(target.contains("with_filter_values=false"), "{target}");
+        assert!(target.contains("with_rom_id_index=false"), "{target}");
+    }
+    assert!(targets[0].contains("with_total=true"), "{}", targets[0]);
+    assert!(targets[1].contains("with_total=false"), "{}", targets[1]);
+}
+
+#[test]
+fn rom_identifiers_and_updated_after_are_sent_as_documented() {
+    let fx = FixtureServer::start();
+    fx.on(
+        "POST",
+        "/api/token",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::token_ok(),
+        },
+    );
+    fx.on(
+        "GET",
+        "/api/roms/identifiers",
+        ResponseSpec::Json {
+            status: 200,
+            body: "[1,2,3]".into(),
+        },
+    );
+    fx.on(
+        "GET",
+        "/api/roms?",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::roms_page(&[], 0, 200, 0),
+        },
+    );
+    let client = authed(&fx);
+
+    assert_eq!(client.rom_identifiers().unwrap(), vec![1, 2, 3]);
+    client
+        .roms_page_flagged(200, 0, true, Some("2026-10-15T00:00:00Z"))
+        .unwrap();
+
+    let request = fx
+        .requests()
+        .into_iter()
+        .find(|request| request.target.contains("updated_after"))
+        .unwrap();
+    assert!(
+        request
+            .target
+            .contains("updated_after=2026-10-15T00%3A00%3A00Z"),
+        "{}",
+        request.target
+    );
+    assert_eq!(
+        fx.auth_headers("GET", "/api/roms/identifiers"),
+        vec![Some("Bearer fixture-access-token".into())]
+    );
+}
+
+#[test]
+fn iso8601_utc_formats_unix_seconds() {
+    assert_eq!(rommfs_core::romm::iso8601_utc(0), "1970-01-01T00:00:00Z");
+    assert_eq!(
+        rommfs_core::romm::iso8601_utc(1_700_000_000),
+        "2023-11-14T22:13:20Z"
+    );
+}

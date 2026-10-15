@@ -100,6 +100,7 @@ fn first_gamelists_publish_while_artwork_is_still_pending() {
         retrobat_root: Some(installation.clone()),
         start_at_login: false,
         save_root: None,
+        hide_owned_copies: true,
     });
     worker.mount = Some(ActiveMount {
         root: root.clone(),
@@ -111,6 +112,7 @@ fn first_gamelists_publish_while_artwork_is_still_pending() {
             platforms,
             roms,
             refreshed_at: 0,
+            full_refreshed_at: 0,
         },
     ));
     let (tx, rx) = mpsc::channel();
@@ -153,6 +155,7 @@ fn first_gamelists_publish_while_artwork_is_still_pending() {
         platforms,
         roms,
         refreshed_at: 0,
+        full_refreshed_at: 0,
     };
     worker.catalogue = Some(
         rommfs_core::catalogue::build_catalogue("s", &snapshot.platforms, &snapshot.roms, |_| {})
@@ -224,6 +227,7 @@ fn a_finished_refresh_publishes_while_artwork_is_blocked_on_a_hanging_route() {
         retrobat_root: Some(installation.clone()),
         start_at_login: false,
         save_root: None,
+        hide_owned_copies: true,
     });
     worker.mount = Some(ActiveMount {
         root: root.clone(),
@@ -233,6 +237,7 @@ fn a_finished_refresh_publishes_while_artwork_is_blocked_on_a_hanging_route() {
         platforms,
         roms,
         refreshed_at: 0,
+        full_refreshed_at: 0,
     };
     worker.source_snapshot = Some(snapshot.clone());
     worker.catalogue = Some(catalogue);
@@ -477,6 +482,7 @@ fn remembered_preferences_never_cross_accounts_or_servers() {
         retrobat_root: None,
         start_at_login: false,
         save_root: None,
+        hide_owned_copies: true,
     };
     worker
         .connection_settings
@@ -521,6 +527,7 @@ fn restore_keeps_the_configured_folder_visible() {
             retrobat_root: None,
             start_at_login: false,
             save_root: None,
+            hide_owned_copies: true,
         })
         .unwrap();
 
@@ -591,6 +598,7 @@ fn reauthentication_republishes_the_remembered_folder() {
             retrobat_root: None,
             start_at_login: false,
             save_root: None,
+            hide_owned_copies: true,
         })
         .unwrap();
 
@@ -632,4 +640,33 @@ fn a_metadata_failure_is_logged_once_with_its_error() {
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].level, Level::Error);
     assert!(logs[0].message.contains("boom"));
+}
+
+#[test]
+fn toggling_hide_owned_copies_persists_and_reports_the_state() {
+    let (sink, events) = rommfs_core::events::channel();
+    let mut worker = Worker::new(sink);
+    worker.preferences = Some(ConnectionPreferences {
+        server: "s".into(),
+        account_id: 7,
+        device_identifier: "id".into(),
+        mount_root: None,
+        integration: IntegrationMode::RetroBat,
+        retrobat_root: Some("/retrobat".into()),
+        start_at_login: false,
+        save_root: None,
+        hide_owned_copies: true,
+    });
+    worker.hide_copies_count = 2;
+
+    worker.set_hide_owned_copies(false);
+
+    assert!(!worker.preferences.as_ref().unwrap().hide_owned_copies);
+    assert!(events.try_iter().any(|event| matches!(
+        event,
+        AppEvent::HideCopies {
+            enabled: false,
+            hidden: 2
+        }
+    )));
 }

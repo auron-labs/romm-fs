@@ -19,8 +19,15 @@ impl Worker {
                 _ => false,
             }
         });
+        // Only the RetroBat layout needs a migration; a leftover root from a
+        // previous selection must not raise the prompt.
+        let setup_migration = preferences
+            .filter(|p| p.integration == IntegrationMode::RetroBat)
+            .and_then(|p| p.retrobat_root.as_deref())
+            .is_some_and(rommfs_core::retrobat::setup_needs_migration);
         self.sink.emit(AppEvent::IntegrationUpdated {
             setup_complete,
+            setup_migration,
             mode: preferences.map(|p| p.integration).unwrap_or_default(),
             retrobat_root: preferences
                 .and_then(|p| p.retrobat_root.as_ref())
@@ -35,10 +42,47 @@ impl Worker {
         detail: impl Into<String>,
         error: Option<String>,
     ) {
-        emit_metadata_status(&self.sink, pending, detail, error);
+        emit_metadata_status(&self.sink, self.metadata_job_id, pending, detail, error);
+    }
+
+    /// The current "hide RomM copies" preference. On unless the user turned it
+    /// off; a plain preference, not a server permission.
+    fn hide_copies_enabled(&self) -> bool {
+        self.preferences
+            .as_ref()
+            .is_none_or(|preferences| preferences.hide_owned_copies)
+    }
+
+    /// Publish the switch state and the count from the last metadata pass.
+    pub(super) fn refresh_hide_copies(&mut self) {
+        self.sink.emit(AppEvent::HideCopies {
+            enabled: self.hide_copies_enabled(),
+            hidden: self.hide_copies_count,
+        });
+    }
+
+    /// Turn hiding off or on, persist it, and re-run metadata so the gamelists
+    /// follow. Turning it off unhides only the entries RomMFS hid.
+    pub(super) fn set_hide_owned_copies(&mut self, enabled: bool) {
+        if let Some(preferences) = self.preferences.as_mut() {
+            preferences.hide_owned_copies = enabled;
+        }
+        if let (Some(settings), Some(preferences)) = (&self.connection_settings, &self.preferences)
+        {
+            if let Err(error) = settings.save(preferences) {
+                self.log(Level::Error, "integration", error.to_string());
+            }
+        }
+        self.refresh_hide_copies();
+        if self.mount.is_some() {
+            self.queue_metadata();
+        }
     }
 
     pub(super) fn cancel_metadata(&mut self) {
+        let had_pass = self.metadata_active.is_some()
+            || self.metadata_job.is_some()
+            || self.metadata_publish.is_some();
         if let Some(active) = self.metadata_active.take() {
             active.store(false, std::sync::atomic::Ordering::Release);
         }
@@ -56,10 +100,20 @@ impl Worker {
         self.metadata_ready = None;
         self.metadata_source = None;
         self.metadata_wait_reported = false;
+        // Tell the UI this pass is gone before a new one starts, so a stale
+        // artwork callback or publication status cannot revive it.
+        if had_pass {
+            self.sink.emit(AppEvent::FrontendMetadataInvalidated {
+                job_id: self.metadata_job_id,
+            });
+        }
     }
 
     pub(super) fn queue_metadata(&mut self) {
         self.cancel_metadata();
+        // A new pass gets a fresh id before any of its statuses are emitted.
+        self.metadata_job_id += 1;
+        let job_id = self.metadata_job_id;
         let Some(preferences) = self
             .preferences
             .as_ref()
@@ -106,14 +160,18 @@ impl Worker {
         self.metadata_ready = Some(rommfs_core::retrobat::ArtworkBatch::default());
         let (tx, rx) = mpsc::channel();
         self.metadata_job = Some(rx);
-        self.metadata_status(
-            true,
-            "Caching frontend artwork without downloading ROMs",
-            None,
-        );
+        self.metadata_status(true, "Downloading artwork", None);
+        let sink = self.sink.clone();
         self.metadata_handle = Some(std::thread::spawn(move || {
+            let progress = move |completed: usize, total: usize| {
+                sink.emit(AppEvent::FrontendMetadataProgress {
+                    job_id,
+                    completed,
+                    total,
+                });
+            };
             let _ = tx.send(rommfs_core::retrobat::cache_artwork_cancellable(
-                &client, &catalogue, &roms, &cache, &active,
+                &client, &catalogue, &roms, &cache, &active, &progress,
             ));
         }));
     }
@@ -211,6 +269,7 @@ impl Worker {
         };
         let client = self.client.clone();
         let play_enabled = self.play_data_ready() && client.is_some();
+        let hide_enabled = self.hide_copies_enabled();
         // A running artwork job owns the cancellation flag; a publication with
         // no artwork job publishes under a live flag.
         let active = self
@@ -218,6 +277,7 @@ impl Worker {
             .clone()
             .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(true)));
         self.spawn_metadata_publication(
+            self.metadata_job_id,
             active,
             guard,
             installation,
@@ -229,12 +289,14 @@ impl Worker {
             artwork,
             client,
             play_enabled,
+            hide_enabled,
         );
     }
 
     #[allow(clippy::too_many_arguments)]
     fn spawn_metadata_publication(
         &mut self,
+        job_id: u64,
         active: Arc<std::sync::atomic::AtomicBool>,
         guard: Vec<std::fs::File>,
         installation: PathBuf,
@@ -246,6 +308,7 @@ impl Worker {
         artwork: rommfs_core::retrobat::ArtworkBatch,
         client: Option<Arc<RommClient>>,
         play_enabled: bool,
+        hide_enabled: bool,
     ) {
         let sink = self.sink.clone();
         let (tx, rx) = mpsc::channel();
@@ -253,6 +316,7 @@ impl Worker {
         self.metadata_publish_handle = Some(std::thread::spawn(move || {
             let _ = tx.send(publish_metadata(
                 &sink,
+                job_id,
                 &active,
                 guard,
                 installation,
@@ -264,6 +328,7 @@ impl Worker {
                 artwork,
                 client,
                 play_enabled,
+                hide_enabled,
             ));
         }));
     }
@@ -278,6 +343,7 @@ impl Worker {
             Err(mpsc::TryRecvError::Disconnected) => MetadataPublication {
                 changed: Err("metadata publisher stopped".into()),
                 problems: Vec::new(),
+                hidden: 0,
             },
         };
         self.metadata_publish = None;
@@ -291,6 +357,8 @@ impl Worker {
         for (system, reason) in &publication.problems {
             self.log(Level::Warn, "metadata", format!("{system}: {reason}"));
         }
+        self.hide_copies_count = publication.hidden;
+        self.refresh_hide_copies();
         let left_as_is = |text: &str| match publication.problems.len() {
             0 => text.to_string(),
             n => format!("{text}; {n} systems left as they were (see the log)"),
@@ -316,7 +384,7 @@ impl Worker {
             }
             Ok(_) => {
                 self.cancel_metadata();
-                self.metadata_status(false, left_as_is("Frontend metadata is up to date"), None);
+                self.metadata_status(false, left_as_is("Artwork & gamelists up to date"), None);
             }
             Err(error) => {
                 self.cancel_metadata();
@@ -334,9 +402,10 @@ impl Worker {
         self.sink.emit(AppEvent::RetroBatSetup {
             running: true,
             detail: "Checking installation and ROM ownership".into(),
+            skipped: Vec::new(),
             error: None,
         });
-        let result = (|| -> anyhow::Result<Vec<String>> {
+        let result = (|| -> anyhow::Result<crate::retrobat_setup::SetupReport> {
             anyhow::ensure!(
                 self.mount.is_none(),
                 "stop the games folder before RetroBat setup"
@@ -355,6 +424,7 @@ impl Worker {
                 self.sink.emit(AppEvent::RetroBatSetup {
                     running: true,
                     detail: "Waiting for Windows permission to finish RetroBat setup".into(),
+                    skipped: Vec::new(),
                     error: None,
                 });
                 crate::retrobat_setup::windows::run_elevated(installation, managed_root, server)
@@ -365,17 +435,18 @@ impl Worker {
             result
         })();
         match result {
-            Ok(messages) => {
+            Ok(report) => {
                 let detail = format!(
                     "RetroBat roms folder set up for {}: {}",
                     managed_root.display(),
-                    messages.join(". ")
+                    report.messages.join(". ")
                 );
                 self.log(Level::Info, "retrobat-setup", detail.clone());
                 self.set_integration(IntegrationMode::RetroBat, Some(installation.to_path_buf()));
                 self.sink.emit(AppEvent::RetroBatSetup {
                     running: false,
                     detail,
+                    skipped: report.skipped,
                     error: None,
                 });
             }
@@ -385,6 +456,7 @@ impl Worker {
                 self.sink.emit(AppEvent::RetroBatSetup {
                     running: false,
                     detail: "RetroBat setup did not complete".into(),
+                    skipped: Vec::new(),
                     error: Some(error),
                 });
             }
@@ -461,13 +533,15 @@ impl Worker {
             if let Some(catalogue) = catalogue {
                 self.sink.emit(AppEvent::CatalogueLoaded {
                     platforms: catalogue.platforms.len(),
-                    roms: catalogue.entries.len(),
+                    games: catalogue.games(),
+                    files: catalogue.entries.len(),
                     skipped_unsupported: catalogue.skipped_unsupported,
                 });
                 self.store_catalogue(catalogue);
             }
             self.refresh_save_sync();
             self.refresh_play_data();
+            self.refresh_hide_copies();
             Ok(())
         })();
         if let Err(error) = result {
@@ -486,16 +560,21 @@ pub(super) struct MetadataPublication {
     pub(super) changed: std::result::Result<usize, String>,
     /// `(system, reason)` for systems left as they were.
     pub(super) problems: Vec<(String, String)>,
+    /// How many entries RomMFS hid because the user already has a copy.
+    pub(super) hidden: usize,
 }
 
 fn emit_metadata_status(
     sink: &EventSink,
+    job_id: u64,
     pending: bool,
     detail: impl Into<String>,
     error: Option<String>,
 ) {
     let detail = detail.into();
-    // One log line per status: a failure carries its own error text.
+    // One log line per status: a failure carries its own error text. The log is
+    // emitted even for a stale pass (it is the durable record); the UI drops
+    // the `FrontendMetadata` event when `job_id` is not the active pass.
     match &error {
         Some(error) if pending => sink.emit(AppEvent::log(
             Level::Warn,
@@ -510,6 +589,7 @@ fn emit_metadata_status(
         None => sink.emit(AppEvent::log(Level::Info, "metadata", detail.clone())),
     }
     sink.emit(AppEvent::FrontendMetadata {
+        job_id,
         pending,
         detail,
         error,
@@ -522,6 +602,7 @@ fn emit_metadata_status(
 #[allow(clippy::too_many_arguments)]
 fn publish_metadata(
     sink: &EventSink,
+    job_id: u64,
     active: &std::sync::atomic::AtomicBool,
     _guard: Vec<std::fs::File>,
     installation: PathBuf,
@@ -533,6 +614,7 @@ fn publish_metadata(
     artwork: rommfs_core::retrobat::ArtworkBatch,
     client: Option<Arc<RommClient>>,
     play_enabled: bool,
+    hide_enabled: bool,
 ) -> MetadataPublication {
     let mut problems = Vec::new();
     for warning in artwork.warnings() {
@@ -564,10 +646,26 @@ fn publish_metadata(
         Some(client) => push_play_data(client, &mut favorite_collection, plan),
         None => Err("play data is unavailable".to_string()),
     };
-    let result = (|| -> anyhow::Result<usize> {
+    let result = (|| -> anyhow::Result<(usize, usize)> {
         let linked = rommfs_core::retrobat::linked_systems(&installation, &root, &server)?;
         let frontend = rommfs_core::retrobat::read_gamelists(&installation, &linked);
         let (index, legacy) = rommfs_cfapi::read_frontend_metadata(&root, &server)?;
+        // The user's own files, read-only, for "hide RomM copies". A system
+        // that can't be read is reported and left visible; the rest proceed.
+        let mut local = hide_enabled.then(|| {
+            rommfs_core::retrobat::LocalFiles::scan(
+                &installation,
+                &linked,
+                Some(cache_dir_for(&server).join("local-hashes.json")),
+            )
+        });
+        let owned = match &mut local {
+            Some(local) => local.owned(&catalogue, &snapshot.roms),
+            None => std::collections::HashSet::new(),
+        };
+        if let Some(local) = &local {
+            problems.extend(local.problems().iter().cloned());
+        }
         let publication = rommfs_core::retrobat::generate_gamelists(
             &catalogue,
             &snapshot.roms,
@@ -577,6 +675,7 @@ fn publish_metadata(
             &frontend,
             &legacy,
             artwork.references(),
+            &owned,
             &mut rommfs_core::retrobat::PlaySync {
                 enabled: play_enabled,
                 remote: &remote_play,
@@ -585,6 +684,10 @@ fn publish_metadata(
             },
         )?;
         problems.extend(publication.skipped().iter().cloned());
+        if let Some(local) = local {
+            local.save_cache();
+        }
+        let hidden = publication.index().auto_hidden_count();
         let changed = publication.gamelists().len();
         // A cancelled job (stop mount, sign-out) must not publish stale state.
         if !active.load(std::sync::atomic::Ordering::Acquire) {
@@ -593,11 +696,9 @@ fn publish_metadata(
         if changed > 0 || !artwork.files().is_empty() {
             emit_metadata_status(
                 sink,
+                job_id,
                 true,
-                format!(
-                    "Updating {changed} gamelists and {} artwork files",
-                    artwork.files().len()
-                ),
+                format!("Writing {changed} gamelists"),
                 None,
             );
         }
@@ -620,11 +721,15 @@ fn publish_metadata(
                 Ok(())
             },
         )?;
-        Ok(changed)
+        Ok((changed, hidden))
     })();
+    let hidden = result.as_ref().map(|(_, hidden)| *hidden).unwrap_or(0);
     MetadataPublication {
-        changed: result.map_err(|error| format!("{error:#}")),
+        changed: result
+            .map_err(|error| format!("{error:#}"))
+            .map(|(changed, _)| changed),
         problems,
+        hidden,
     }
 }
 

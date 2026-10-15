@@ -202,6 +202,12 @@ Artwork and the identity index live in the managed folder. Switch update/DLC
 Actual RetroBat loading and Windows ACL protection remain awaiting native
 validation.
 
+> **RomM games don't appear in a system?** RomM games sit under `RomM/` inside
+> each system. If that folder is missing from the list, turn folders on in
+> EmulationStation: **START → User Interface Settings → Gamelist Options →
+> Show folders**, then refresh with **START → Game Settings → Update Gamelist**.
+> RomMFS never changes EmulationStation settings.
+
 **Install library BIOS, keys and cheats** is an explicit separate action while
 the mount and emulators are stopped. It uses RomM's `firmware.read` inventory for
 ordinary BIOS files, Switch `prod.keys`/`title.keys`, and unpacked `.nca` firmware.
@@ -241,6 +247,25 @@ touched, and an unreadable gamelist is skipped. Because EmulationStation writes
 `lastplayed` without a time zone, it is interpreted as UTC; a non-UTC local time
 is offset.
 
+## Games you already have
+
+When a game in RomM is also in your own `roms/<system>` folder, **Settings →
+RetroBat → Your games** keeps RomM's copy out of RetroBat's list with
+`Hide RomM games you already have` (on by default). Your own entry stays exactly
+as it is; only RomMFS's `./RomM/…` entry gets `<hidden>true</hidden>`, which
+EmulationStation shows again only if "show hidden games" is on.
+
+RomMFS compares name (without the extension), then exact size, then confirms
+with the CRC-32, MD5 or SHA-1 RomM provides, whichever it has. Files larger than
+512 MB are matched on name and size alone. The user's files are read only, and
+local hashes are cached so each file is hashed once. The `RomM` folder is never
+counted as the user's own, a linked folder is never followed, and a file or
+system folder that can't be read is skipped; other systems still match.
+
+Delete your local copy (or turn the switch off) and RomMFS removes only the
+`hidden` flag it added. A game you hid yourself stays hidden, and your play
+history is never affected. With several files per game, the launch file decides.
+
 ## Optional save sync
 
 Save sync is **off by default**. Choose a save-data folder or a RetroBat installation,
@@ -268,8 +293,9 @@ does not make save API requests or require those save scopes.
 All ordinary file formats are accepted, including companions, extensionless,
 empty and large files, and multiple/nested files per game. Bytes are streamed
 without emulator-format conversion or a 1 MiB limit. Select **save data only**,
-not an emulator's entire portable folder. Shared saves and shared memory cards
-remain unsupported; known shared-card folders are conservatively excluded.
+not an emulator's entire portable folder. Shared saves remain unsupported;
+memory cards have their own opt-in (see [Memory cards](#memory-cards-ps1ps2)).
+Known shared-card folders stay excluded from ordinary per-game mapping.
 Automatic association uses a unique game filename or a
 server-provided save target; use **Map an unmatched file** for ambiguous paths.
 Before consent, scanning inspects filenames only, without reading save contents
@@ -300,6 +326,39 @@ restarts in the private `%LOCALAPPDATA%\rommfs\settings\` save-sync database and
 snapshot directory. If sync is offline or the app closes, uploads wait for a
 later enabled session; no background service continues work. ROM cache data is
 stored separately.
+
+### Memory cards (PS1/PS2)
+
+Memory cards are a separate, opt-in sync kind. RomMFS discovers RetroBat's
+DuckStation cards (`saves/psx/duckstation/memcards/*.mcd`) and PCSX2 cards
+(`saves/ps2/pcsx2/memcards/`), where a card is a `.ps2` file or a folder. Each
+discovered card folder is consented to on its own (`PS1 memory cards
+(DuckStation) · 2 cards`); consent is off by default and scoped to that server,
+account, installation and folder, exactly like a save root. A card's identity is
+the emulator and card name, with a baseline of the accepted RomM version and the
+SHA-256 of the local card.
+
+An upload waits for both the quiet period and for the emulator to exit, because
+a shared card is written for the whole session, and sends RomMFS's own safe zip
+of the card (up to 256 MB). RomMFS will not touch a card while DuckStation or
+PCSX2 is open, and if it cannot confirm the emulator is closed it skips that
+pass and says why. A card it cannot read, or one that contains a link, is left
+untouched rather than replaced. A newer remote version is applied only while the
+local card is unchanged since its baseline; the worker rechecks the local card
+just before replacing it, so an edit made while a download runs becomes a
+conflict instead of being overwritten. If both sides changed, the local card is
+kept and the remote copy is written beside it as a version-specific
+`.rommfs-conflict-v<id>` sibling, so each remote version is preserved on its own.
+A card that exists only on RomM (for example after syncing on another machine)
+is restored even when the folder is empty. Each card is independent, so one
+failure skips only that card. Ordinary per-game save mapping still excludes the
+`memcards` folders.
+
+The portable engine and RomM routes for this are implemented and fixture-tested
+(see the [API contract](contracts/romm-api.md)). Each discovered card folder is
+listed in the Saves tab with its own switch. **Windows native validation is
+still owed**: the exact RetroBat card paths and the broker's zip unpack layout
+have not been checked on a real installation (the development host is Linux).
 
 ### Verification evidence and remaining smoke checks
 

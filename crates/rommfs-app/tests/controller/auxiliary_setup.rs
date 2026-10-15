@@ -45,6 +45,7 @@ fn selecting_an_installation_clears_stale_installer_and_setup_state() {
     ui.apply_event(&AppEvent::RetroBatSetup {
         running: false,
         detail: "failed".into(),
+        skipped: Vec::new(),
         error: Some("link failed".into()),
     });
     ui.apply_event(&AppEvent::AuxiliaryStatus {
@@ -59,6 +60,7 @@ fn selecting_an_installation_clears_stale_installer_and_setup_state() {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
+        setup_migration: false,
         error: None,
     });
     assert!(ui.installer_error.is_none());
@@ -69,12 +71,14 @@ fn selecting_an_installation_clears_stale_installer_and_setup_state() {
     ui.apply_event(&AppEvent::RetroBatSetup {
         running: false,
         detail: "failed".into(),
+        skipped: Vec::new(),
         error: Some("link failed".into()),
     });
     ui.apply_event(&AppEvent::IntegrationUpdated {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
+        setup_migration: false,
         error: None,
     });
     assert!(ui.retrobat_setup_error.is_some());
@@ -84,6 +88,7 @@ fn selecting_an_installation_clears_stale_installer_and_setup_state() {
     ui.apply_event(&AppEvent::RetroBatSetup {
         running: true,
         detail: "working".into(),
+        skipped: Vec::new(),
         error: None,
     });
     assert!(ui.installer_error.is_none() && ui.retrobat_setup_error.is_none());

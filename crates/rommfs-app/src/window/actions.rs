@@ -274,4 +274,18 @@ impl RommfsWindow {
         self.settings_tab = 2;
         cx.notify();
     }
+    /// Run RetroBat step 2 (link the games folder) for the selected
+    /// installation and configured games folder — shared by Settings and the
+    /// Overview update action.
+    pub(super) fn run_retrobat_setup(&mut self, cx: &mut Context<Self>) {
+        let Some(installation) = self.settings_install_root(cx) else {
+            return;
+        };
+        let managed_root = PathBuf::from(self.mount_input.read(cx).value().trim());
+        self.controller.send(Command::SetupRetroBat {
+            installation,
+            managed_root,
+        });
+        cx.notify();
+    }
 }

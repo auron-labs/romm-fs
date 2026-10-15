@@ -4,7 +4,12 @@
 //!   scope="platforms.read roms.read") -> Bearer token kept in memory only.
 //! - `GET /api/platforms` -> [PlatformDto]
 //! - `GET /api/roms?limit=&offset=&with_files=true` -> RomsPage; `all_roms`
-//!   pages until the catalogue is complete.
+//!   pages until the catalogue is complete. The unused char-index,
+//!   filter-value and rom-id-index sidecars are disabled and the total is
+//!   requested only when the caller needs it.
+//! - `GET /api/roms/identifiers` -> every visible ROM id, for a delta merge.
+//! - `updated_after=<ISO 8601>` filters `GET /api/roms` to ROMs changed after
+//!   an instant.
 //! - `GET /api/roms/{id}/content/{file_name}` -> streamed body into a caller
 //!   writer with progress callback; connect-timeout + low-speed (no progress)
 //!   timeout, never a total timeout (PRD R3).
@@ -211,11 +216,39 @@ impl RommClient {
         self.get_json("/api/platforms")
     }
 
-    /// One page of `GET /api/roms?with_files=true&limit=&offset=`.
+    /// One page of `GET /api/roms` with the total requested.
     pub fn roms_page(&self, limit: u64, offset: u64) -> Result<RomsPage> {
-        self.get_json(&format!(
-            "/api/roms?limit={limit}&offset={offset}&with_files=true"
-        ))
+        self.roms_page_flagged(limit, offset, true, None)
+    }
+
+    /// One page of `GET /api/roms`. The unused char-index, filter-value and
+    /// rom-id-index sidecars are always disabled (RomFS reads none of them);
+    /// `with_total` asks the server to count the result set (only the first
+    /// page of a paged walk needs it); `updated_after` (ISO 8601, UTC) keeps
+    /// only ROMs changed after that instant.
+    pub fn roms_page_flagged(
+        &self,
+        limit: u64,
+        offset: u64,
+        with_total: bool,
+        updated_after: Option<&str>,
+    ) -> Result<RomsPage> {
+        let mut query = format!(
+            "/api/roms?limit={limit}&offset={offset}&with_files=true\
+             &with_char_index=false&with_filter_values=false&with_rom_id_index=false\
+             &with_total={with_total}"
+        );
+        if let Some(updated_after) = updated_after {
+            query.push_str("&updated_after=");
+            query.push_str(&pct_encode(updated_after));
+        }
+        self.get_json(&query)
+    }
+
+    /// `GET /api/roms/identifiers` — every visible ROM id, respecting hidden
+    /// platforms and ROMs. The authoritative current id set for a delta merge.
+    pub fn rom_identifiers(&self) -> Result<Vec<i64>> {
+        self.get_json("/api/roms/identifiers")
     }
 
     /// The complete ROM list across every page needed.
@@ -468,6 +501,15 @@ fn detail_of(resp: &mut isahc::Response<isahc::Body>) -> String {
 /// are kept, everything else is percent-encoded at the UTF-8 byte level.
 pub(super) fn form_encode(s: &str) -> String {
     pct_encode(s)
+}
+
+/// A Unix timestamp as the ISO 8601 UTC instant (`updated_after`) expects.
+/// An out-of-range timestamp becomes the empty string; the caller then omits
+/// the filter rather than sending a malformed value.
+pub fn iso8601_utc(unix_secs: u64) -> String {
+    chrono::DateTime::from_timestamp(unix_secs as i64, 0)
+        .map(|instant| instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_default()
 }
 
 /// Percent-encode one URL path segment (the `file_name` of a content URL).

@@ -85,6 +85,9 @@ enum RowPayload {
     },
     /// A verified remote save kept in the journal for review/export.
     Incoming(SaveSyncIncomingStatus),
+    /// A card whose local and remote copies both changed; the remote copy is
+    /// kept beside the local card for review.
+    MemoryCard(MemoryCardConflictStatus),
 }
 
 struct ReviewRow {
@@ -184,6 +187,22 @@ fn collect_review_rows(state: &UiState, show_ignored: bool) -> Vec<ReviewRow> {
                 payload: RowPayload::Incoming(incoming.clone()),
             });
         }
+    }
+
+    for conflict in &state.memory_card_conflicts {
+        rows.push(ReviewRow {
+            key: SharedString::from(format!(
+                "memory-card:{}:{}",
+                conflict.emulator, conflict.card_name
+            )),
+            item: format!("{} · {}", conflict.card_name, conflict.emulator),
+            status: RowStatus::NeedsAttention,
+            detail: format!(
+                "local and remote both changed · remote version {}",
+                conflict.remote_version_id
+            ),
+            payload: RowPayload::MemoryCard(conflict.clone()),
+        });
     }
 
     rows.sort_by(|a, b| {
@@ -552,6 +571,20 @@ impl RommfsWindow {
                     ))
                     .child(self.render_incoming_row(incoming, can_export, cx));
             }
+            RowPayload::MemoryCard(conflict) => {
+                detail = detail
+                    .child(muted_xs(
+                        format!("{} · {}", conflict.emulator, conflict.relative_path),
+                        cx,
+                    ))
+                    .child(muted_xs(
+                        format!(
+                            "Your local card was kept. The remote copy (version {}) is beside it as a .rommfs-conflict file or folder; nothing was overwritten.",
+                            conflict.remote_version_id,
+                        ),
+                        cx,
+                    ));
+            }
         }
         detail
             .bg(cx.theme().muted)
@@ -876,7 +909,7 @@ pub fn render(
                 SaveSyncSummary::Checking | SaveSyncSummary::Reconciling => {
                     "Checking saves…".into()
                 }
-                SaveSyncSummary::NoLinkedFiles => "No files ready to sync.".into(),
+                SaveSyncSummary::NoLinkedFiles => "Nothing to sync yet.".into(),
                 _ => "Nothing to review.".into(),
             }
         };

@@ -9,9 +9,39 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const MAX_ARTWORK_BYTES: u64 = 32 * 1024 * 1024;
+/// Artwork workers, kept in step with the named constant in
+/// `docs/architecture.md` (WS4.5).
 const CONCURRENCY: usize = 8;
+/// Minimum interval between artwork progress callbacks (~4 Hz).
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Throttles progress callbacks so a large library reports a few times a
+/// second rather than once per downloaded image. The final tick always fires,
+/// and callbacks are globally monotonic: several workers can finish out of
+/// order, so the highest count is tracked under the same lock.
+struct ProgressReporter<'a> {
+    progress: &'a (dyn Fn(usize, usize) + Sync),
+    total: usize,
+    /// (last emit time, highest count already reported).
+    state: Mutex<(Instant, usize)>,
+}
+
+impl ProgressReporter<'_> {
+    fn tick(&self, completed: usize) {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (last, reported) = &mut *state;
+        let completed = completed.max(*reported);
+        if completed >= self.total || now.duration_since(*last) >= PROGRESS_INTERVAL {
+            *last = now;
+            *reported = completed;
+            (self.progress)(completed, self.total);
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct ArtworkBatch {
@@ -40,7 +70,14 @@ pub fn cache_artwork(
     roms: &[RomDto],
     cache: &Path,
 ) -> Result<ArtworkBatch> {
-    cache_artwork_cancellable(client, catalogue, roms, cache, &AtomicBool::new(true))
+    cache_artwork_cancellable(
+        client,
+        catalogue,
+        roms,
+        cache,
+        &AtomicBool::new(true),
+        &|_, _| {},
+    )
 }
 
 pub fn cache_artwork_cancellable(
@@ -49,6 +86,7 @@ pub fn cache_artwork_cancellable(
     roms: &[RomDto],
     cache: &Path,
     active: &AtomicBool,
+    progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<ArtworkBatch> {
     ensure_no_reparse_components(cache)?;
     fs::create_dir_all(cache)?;
@@ -97,7 +135,16 @@ pub fn cache_artwork_cancellable(
     }
     let tasks: Vec<_> = tasks.into_iter().collect();
     let next = AtomicUsize::new(0);
+    let completed = AtomicUsize::new(0);
     let results = Mutex::new(Vec::new());
+    let reporter = ProgressReporter {
+        progress,
+        total: tasks.len(),
+        state: Mutex::new((Instant::now(), 0)),
+    };
+    // Report the starting point so the UI shows "0 / N" while the first
+    // downloads are still in flight.
+    progress(0, tasks.len());
     std::thread::scope(|scope| {
         for _ in 0..CONCURRENCY.min(tasks.len()) {
             scope.spawn(|| loop {
@@ -108,11 +155,12 @@ pub fn cache_artwork_cancellable(
                 let Some((key, (resource, _))) = tasks.get(index) else {
                     break;
                 };
-                let result = cache_one(client, resource, &cache.join(format!("{key}.img")), active);
+                let result = cache_one(client, resource, &cache.join(key), active);
                 results
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push((index, result));
+                reporter.tick(completed.fetch_add(1, Ordering::AcqRel) + 1);
             });
         }
     });
@@ -185,39 +233,60 @@ pub fn cache_artwork_cancellable(
 fn cache_one(
     client: &RommClient,
     resource: &str,
-    path: &Path,
+    base: &Path,
     active: &AtomicBool,
 ) -> Result<(PathBuf, &'static str)> {
-    ensure_no_reparse_components(path)?;
-    if !path.try_exists()? {
-        let mut staged = tempfile::NamedTempFile::new_in(
-            path.parent()
-                .ok_or_else(|| Error::Unsupported("artwork cache has no parent".into()))?,
-        )?;
-        client.download_artwork(
-            resource,
-            &mut LimitedWriter {
-                file: staged.as_file_mut(),
-                remaining: MAX_ARTWORK_BYTES,
-                active,
-            },
-        )?;
-        staged.as_file().sync_all()?;
-        // Validate before any cache publication. A 200 HTML login page is not art.
-        raster_extension(&fs::read(staged.path())?)?;
-        if let Err(error) = staged.persist_noclobber(path) {
-            if error.error.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(error.error.into());
-            }
+    ensure_no_reparse_components(base)?;
+    if let Some(cached) = cached_artwork(base)? {
+        return Ok(cached);
+    }
+    let mut staged = tempfile::NamedTempFile::new_in(
+        base.parent()
+            .ok_or_else(|| Error::Unsupported("artwork cache has no parent".into()))?,
+    )?;
+    client.download_artwork(
+        resource,
+        &mut LimitedWriter {
+            file: staged.as_file_mut(),
+            remaining: MAX_ARTWORK_BYTES,
+            active,
+        },
+    )?;
+    staged.as_file().sync_all()?;
+    // Validate before any cache publication. A 200 HTML login page is not art.
+    let extension = raster_extension(&fs::read(staged.path())?)?;
+    // The detected extension is part of the cache filename, so a later hit
+    // never re-reads (or re-validates) the image bytes.
+    let path = base.with_extension(extension);
+    ensure_no_reparse_components(&path)?;
+    if let Err(error) = staged.persist_noclobber(&path) {
+        if error.error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error.error.into());
         }
     }
-    let metadata = fs::metadata(path)?;
-    if !metadata.is_file() || metadata.len() > MAX_ARTWORK_BYTES {
-        return Err(Error::Unsupported(
-            "invalid or oversized cached artwork".into(),
-        ));
+    Ok(cached_artwork(base)?.unwrap_or((path, extension)))
+}
+
+/// A previously cached artwork file, found by its stored extension. A cache
+/// hit is validated by size only — the extension proves the bytes were already
+/// raster-checked when written. The actual file path is reparse-checked, not
+/// just its parent.
+fn cached_artwork(base: &Path) -> Result<Option<(PathBuf, &'static str)>> {
+    for extension in ["png", "jpg", "gif", "webp"] {
+        let path = base.with_extension(extension);
+        ensure_no_reparse_components(&path)?;
+        if !path.try_exists()? {
+            continue;
+        }
+        let metadata = fs::metadata(&path)?;
+        if !metadata.is_file() || metadata.len() > MAX_ARTWORK_BYTES {
+            return Err(Error::Unsupported(
+                "invalid or oversized cached artwork".into(),
+            ));
+        }
+        return Ok(Some((path, extension)));
     }
-    Ok((path.into(), raster_extension(&fs::read(path)?)?))
+    Ok(None)
 }
 
 fn raster_extension(bytes: &[u8]) -> Result<&'static str> {
@@ -257,5 +326,34 @@ impl Write for LimitedWriter<'_> {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.file.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_reporter_emits_monotonic_counts_under_out_of_order_completion() {
+        let seen = Mutex::new(Vec::new());
+        let record = |completed: usize, _total: usize| seen.lock().unwrap().push(completed);
+        let past = Instant::now()
+            .checked_sub(PROGRESS_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        let reporter = ProgressReporter {
+            progress: &record,
+            total: 10,
+            state: Mutex::new((past, 0)),
+        };
+        // Two workers can finish out of order; the reporter must still report a
+        // non-decreasing count and end at the total.
+        reporter.tick(2);
+        reporter.tick(1);
+        reporter.tick(5);
+        reporter.tick(3);
+        reporter.tick(10);
+        let seen = seen.into_inner().unwrap();
+        assert!(seen.windows(2).all(|pair| pair[0] <= pair[1]), "{seen:?}");
+        assert_eq!(seen.last(), Some(&10));
     }
 }

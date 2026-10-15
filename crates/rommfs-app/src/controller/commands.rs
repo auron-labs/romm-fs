@@ -65,6 +65,9 @@ pub enum Command {
     },
     RefreshCatalogue,
     RefreshSaveSync,
+    /// Re-run the frontend metadata pass (artwork + gamelists) for a mounted
+    /// library, e.g. after a failed pass (Overview Retry).
+    RefreshMetadata,
     SelectSaveSyncInstallation {
         path: PathBuf,
     },
@@ -79,10 +82,22 @@ pub enum Command {
     SetPlayDataSync {
         enabled: bool,
     },
+    /// Turn "Hide RomM games you already have" on or off. On by default; the
+    /// metadata pass applies the change.
+    SetHideOwnedCopies {
+        enabled: bool,
+    },
     ExportSaveSyncIncoming {
         session_id: u64,
         incoming_id: String,
         destination: PathBuf,
+    },
+    /// Turn one discovered memory-card folder on or off. Explicit and off by
+    /// default; scoped to the server, account, installation, and save root.
+    SetMemoryCardFolderEnabled {
+        emulator: String,
+        relative_dir: PathBuf,
+        enabled: bool,
     },
     Shutdown,
 }

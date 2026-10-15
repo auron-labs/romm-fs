@@ -6,7 +6,7 @@ use rommfs_core::retrobat::{
 use rommfs_core::romm::{PlatformDto, RomDto};
 use rommfs_fixture::contract;
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 
 fn sources(name: &str) -> (Vec<PlatformDto>, Vec<RomDto>) {
@@ -50,6 +50,7 @@ fn generate(
         frontend,
         &BTreeMap::new(),
         &HashMap::new(),
+        &HashSet::new(),
         play_off!(),
     )
     .unwrap()
@@ -83,6 +84,7 @@ fn generated_entries_live_under_the_romm_folder_and_are_xml_safe() {
         &FrontendGamelists::default(),
         &BTreeMap::new(),
         &art,
+        &HashSet::new(),
         play_off!(),
     )
     .unwrap();
@@ -180,6 +182,7 @@ fn existing_artwork_is_kept_until_fresh_artwork_is_available() {
         &frontend("gb", &xml),
         &BTreeMap::new(),
         &art,
+        &HashSet::new(),
         play_off!(),
     )
     .unwrap();
@@ -275,6 +278,7 @@ fn an_index_for_another_account_starts_fresh_instead_of_refusing() {
         &FrontendGamelists::default(),
         &BTreeMap::new(),
         &HashMap::new(),
+        &HashSet::new(),
         play_off!(),
     )
     .unwrap();
@@ -299,6 +303,7 @@ fn legacy_managed_gamelists_contribute_frontend_state() {
         &FrontendGamelists::default(),
         &legacy,
         &HashMap::new(),
+        &HashSet::new(),
         play_off!(),
     )
     .unwrap();

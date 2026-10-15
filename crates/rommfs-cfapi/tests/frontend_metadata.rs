@@ -19,7 +19,7 @@ macro_rules! play_off {
 }
 use rommfs_core::romm::{PlatformDto, RomDto};
 use rommfs_fixture::contract;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 
 fn publication(legacy: &BTreeMap<String, String>, index: &MetadataIndex) -> MetadataPublication {
@@ -37,6 +37,7 @@ fn publication(legacy: &BTreeMap<String, String>, index: &MetadataIndex) -> Meta
         &FrontendGamelists::default(),
         legacy,
         &HashMap::new(),
+        &HashSet::new(),
         play_off!(),
     )
     .unwrap()
@@ -175,6 +176,7 @@ fn failed_gamelist_publication_retries_swapped_paths_without_reassigning_history
         &FrontendGamelists::default(),
         &BTreeMap::new(),
         &HashMap::new(),
+        &HashSet::new(),
         play_off!(),
     )
     .unwrap();
@@ -191,6 +193,7 @@ fn failed_gamelist_publication_retries_swapped_paths_without_reassigning_history
         &old,
         &BTreeMap::new(),
         &HashMap::new(),
+        &HashSet::new(),
         play_off!(),
     )
     .unwrap();
@@ -220,6 +223,7 @@ fn failed_gamelist_publication_retries_swapped_paths_without_reassigning_history
         &unreadable,
         &BTreeMap::new(),
         &HashMap::new(),
+        &HashSet::new(),
         play_off!(),
     )
     .unwrap();
@@ -241,6 +245,7 @@ fn failed_gamelist_publication_retries_swapped_paths_without_reassigning_history
         &old,
         &BTreeMap::new(),
         &HashMap::new(),
+        &HashSet::new(),
         play_off!(),
     )
     .unwrap();
@@ -274,6 +279,7 @@ fn failed_gamelist_publication_retries_swapped_paths_without_reassigning_history
         &frontend,
         &BTreeMap::new(),
         &HashMap::new(),
+        &HashSet::new(),
         play_off!(),
     )
     .unwrap();

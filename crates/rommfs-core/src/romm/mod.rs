@@ -5,10 +5,12 @@
 
 pub mod client;
 mod firmware;
+mod memory_cards;
 mod pairing;
 pub mod play_data;
 mod saves;
 pub use firmware::FirmwareDto;
+pub use memory_cards::{MemoryCard, MemoryCardVersion, MAX_MEMORY_CARD_BYTES};
 pub use pairing::{PairedSession, PairingPoll, PairingRequest};
 pub use play_data::{
     CollectionDto, PlayDataPermissions, PlaySessionDto, PlaySessionUpload, RemotePlayData,
@@ -16,6 +18,6 @@ pub use play_data::{
 };
 pub mod types;
 
-pub use client::{Credentials, DownloadConfig, MetadataConfig, RommClient};
+pub use client::{iso8601_utc, Credentials, DownloadConfig, MetadataConfig, RommClient};
 pub use saves::{RemoteSave, SaveApiFailure, SaveSyncIdentity};
 pub use types::*;

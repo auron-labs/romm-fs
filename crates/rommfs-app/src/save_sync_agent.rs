@@ -6,6 +6,7 @@ mod files;
 mod gate;
 mod incoming;
 mod incoming_transfer;
+mod memory_cards;
 mod transfer;
 
 #[cfg(test)]
@@ -16,6 +17,9 @@ pub(crate) use actor::export_pending_incoming;
 pub(crate) use actor::SaveSyncAgent;
 #[cfg(windows)]
 pub(crate) use files::check_save_root_writable;
-pub(crate) use gate::SaveSyncCommandGate;
+pub(crate) use gate::{SaveSyncCommandGate, SaveSyncEnablement};
+pub(crate) use memory_cards::MemoryCardConfig;
+#[cfg(test)]
+pub(crate) use memory_cards::{reconcile_once, MemoryCardReport};
 #[cfg(test)]
 use transfer::{remote_filename_matches_revision, validate_configuration};

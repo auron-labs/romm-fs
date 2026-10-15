@@ -68,16 +68,16 @@ fn catalogue_pages_are_fetched_once_and_warm_remounts_make_no_http_requests() {
             )
         })
         .collect();
-    for offset in (0..2448).step_by(200) {
+    for offset in (0..2448).step_by(500) {
         fx.on(
             "GET",
-            &format!("/api/roms?limit=200&offset={offset}&"),
+            &format!("/api/roms?limit=500&offset={offset}&"),
             ResponseSpec::Json {
                 status: 200,
                 body: contract::roms_page(
-                    &items[offset..(offset + 200).min(items.len())],
+                    &items[offset..(offset + 500).min(items.len())],
                     items.len(),
-                    200,
+                    500,
                     offset,
                 ),
             },
@@ -90,9 +90,9 @@ fn catalogue_pages_are_fetched_once_and_warm_remounts_make_no_http_requests() {
     worker.connect(fx.url(), "user", "password");
     assert_eq!(worker.catalogue.as_ref().unwrap().entries.len(), 2448);
     assert_eq!(fx.route_hit_count("GET", "/api/platforms"), 1);
-    for offset in (0..2448).step_by(200) {
+    for offset in (0..2448).step_by(500) {
         assert_eq!(
-            fx.route_hit_count("GET", &format!("/api/roms?limit=200&offset={offset}&")),
+            fx.route_hit_count("GET", &format!("/api/roms?limit=500&offset={offset}&")),
             1
         );
     }
@@ -118,7 +118,7 @@ fn catalogue_pages_are_fetched_once_and_warm_remounts_make_no_http_requests() {
     // disk and in memory, rather than publishing the first successful page.
     fx.on(
         "GET",
-        "/api/roms?limit=200&offset=200&",
+        "/api/roms?limit=500&offset=500&",
         ResponseSpec::Json {
             status: 500,
             body: "{}".into(),
@@ -164,6 +164,7 @@ fn invalid_layout_selection_keeps_the_previous_projection_and_preferences() {
         retrobat_root: None,
         start_at_login: false,
         save_root: None,
+        hide_owned_copies: true,
     });
     worker.set_integration(IntegrationMode::RetroBat, Some(directory.path().into()));
     assert_eq!(
@@ -196,4 +197,434 @@ fn cancelled_refresh_cannot_emit_late_events_or_replace_the_new_session() {
         elapsed_ms: 100,
     });
     assert!(events.try_recv().is_err());
+}
+
+fn authed_client(fx: &FixtureServer) -> RommClient {
+    let client = RommClient::new(fx.url()).unwrap();
+    client
+        .authenticate(Credentials {
+            username: "user",
+            password: "pass",
+        })
+        .unwrap();
+    client
+}
+
+fn fixture_rom(id: i64, file_name: &str) -> RomDto {
+    serde_json::from_value(rommfs_fixture::contract::rom(
+        id, "nes", file_name, 10, "hash",
+    ))
+    .unwrap()
+}
+
+/// 2448 ROMs at 500/page: five pages, so four are fetched concurrently.
+fn concurrent_catalogue_fixture() -> (FixtureServer, FixtureBodyBarrier, usize) {
+    use rommfs_fixture::contract;
+    let fx = FixtureServer::start();
+    fx.on(
+        "POST",
+        "/api/token",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::token_ok(),
+        },
+    );
+    fx.on(
+        "GET",
+        "/api/platforms",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::platforms(&[(1, "nes", "nes", "NES")]),
+        },
+    );
+    let total: usize = 2448;
+    let items: Vec<_> = (0..total)
+        .map(|n| contract::rom(n as i64 + 1, "nes", &format!("game{n}.bin"), 10, "hash"))
+        .collect();
+    fx.on(
+        "GET",
+        "/api/roms?limit=500&offset=0&",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::roms_page(&items[0..500], total, 500, 0),
+        },
+    );
+    let barrier = FixtureBodyBarrier::new();
+    for offset in [500usize, 1000, 1500, 2000] {
+        let end = (offset + 500).min(total);
+        fx.on(
+            "GET",
+            &format!("/api/roms?limit=500&offset={offset}&"),
+            ResponseSpec::HeldJson {
+                status: 200,
+                body: contract::roms_page(&items[offset..end], total, 500, offset),
+                barrier: barrier.clone(),
+            },
+        );
+    }
+    (fx, barrier, total)
+}
+
+#[test]
+fn concurrent_catalogue_pages_are_reassembled_in_offset_order() {
+    let (fx, barrier, total) = concurrent_catalogue_fixture();
+    let client = authed_client(&fx);
+    let (sink, _events) = rommfs_core::events::channel();
+    let snapshot = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| fetch_catalogue(&client, &sink, 1, None));
+        // All four remaining pages must be in flight at once.
+        for _ in 0..4 {
+            assert!(
+                barrier.wait_until_blocked(Duration::from_secs(5)),
+                "fewer than four catalogue pages were fetched concurrently"
+            );
+        }
+        for _ in 0..4 {
+            barrier.release();
+        }
+        handle.join().unwrap().unwrap()
+    });
+    let ids: Vec<i64> = snapshot.roms.iter().map(|rom| rom.id).collect();
+    assert_eq!(ids, (1..=total as i64).collect::<Vec<_>>());
+}
+
+#[test]
+fn cancelling_a_concurrent_catalogue_fetch_reports_cancelled() {
+    let (fx, barrier, _total) = concurrent_catalogue_fixture();
+    let client = authed_client(&fx);
+    let (sink, _events) = rommfs_core::events::channel();
+    let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let scoped = sink.clone().scoped(active.clone());
+    let result = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| fetch_catalogue(&client, &scoped, 1, None));
+        for _ in 0..4 {
+            assert!(barrier.wait_until_blocked(Duration::from_secs(5)));
+        }
+        active.store(false, std::sync::atomic::Ordering::Release);
+        for _ in 0..4 {
+            barrier.release();
+        }
+        handle.join().unwrap()
+    });
+    assert!(matches!(result, Err(Error::Cancelled)), "got {result:?}");
+}
+
+#[test]
+fn incremental_refresh_applies_changes_additions_and_deletions() {
+    use rommfs_fixture::contract;
+    let fx = FixtureServer::start();
+    fx.on(
+        "POST",
+        "/api/token",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::token_ok(),
+        },
+    );
+    fx.on(
+        "GET",
+        "/api/platforms",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::platforms(&[(1, "nes", "nes", "NES")]),
+        },
+    );
+    fx.on(
+        "GET",
+        "/api/roms/identifiers",
+        ResponseSpec::Json {
+            status: 200,
+            body: serde_json::json!([1, 2, 3]).to_string(),
+        },
+    );
+    // The delta reports the changed ROM 2 and the new ROM 3; ROM 4 was deleted.
+    let delta = vec![
+        contract::rom(2, "nes", "changed.bin", 10, "hash"),
+        contract::rom(3, "nes", "new.bin", 10, "hash"),
+    ];
+    fx.on(
+        "GET",
+        "/api/roms?limit=500&offset=0&with_files=true&with_char_index=false&with_filter_values=false&with_rom_id_index=false&with_total=true&updated_after=",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::roms_page(&delta, 2, 500, 0),
+        },
+    );
+    let client = authed_client(&fx);
+    let now = rommfs_core::cache::now_unix_secs();
+    let prior = CatalogueSnapshot {
+        platforms: vec![],
+        roms: vec![
+            fixture_rom(1, "unchanged.bin"),
+            fixture_rom(2, "old.bin"),
+            fixture_rom(4, "deleted.bin"),
+        ],
+        refreshed_at: now,
+        full_refreshed_at: now,
+    };
+    let (sink, _events) = rommfs_core::events::channel();
+    let snapshot = fetch_catalogue(&client, &sink, 1, Some(prior)).unwrap();
+    assert_eq!(
+        snapshot.roms.iter().map(|rom| rom.id).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    let file_name = |id: i64| {
+        snapshot.roms.iter().find(|rom| rom.id == id).unwrap().files[0]
+            .file_name
+            .clone()
+    };
+    assert_eq!(file_name(1), "unchanged.bin");
+    assert_eq!(file_name(2), "changed.bin");
+    assert_eq!(file_name(3), "new.bin");
+    // The delta covers the whole window since the previous refresh start, with
+    // the five-minute skew.
+    let expected = rommfs_core::romm::iso8601_utc(now.saturating_sub(300)).replace(':', "%3A");
+    let delta_target = fx
+        .requests()
+        .into_iter()
+        .find(|request| request.target.contains("updated_after="))
+        .expect("a delta request was made");
+    assert!(
+        delta_target.target.contains(&expected),
+        "{} !~ {expected}",
+        delta_target.target
+    );
+}
+
+#[test]
+fn incremental_refresh_falls_back_to_a_full_walk_when_the_server_rejects_the_delta() {
+    use rommfs_fixture::contract;
+    // `/identifiers` missing (404, older server) and the delta page rejecting
+    // `updated_after` (422) both fall back to the full walk.
+    for reject in ["identifiers", "updated_after"] {
+        let fx = FixtureServer::start();
+        fx.on(
+            "POST",
+            "/api/token",
+            ResponseSpec::Json {
+                status: 200,
+                body: contract::token_ok(),
+            },
+        );
+        fx.on(
+            "GET",
+            "/api/platforms",
+            ResponseSpec::Json {
+                status: 200,
+                body: contract::platforms(&[(1, "nes", "nes", "NES")]),
+            },
+        );
+        let (status, body) = match reject {
+            "identifiers" => (404, r#"{"detail":"not found"}"#.to_string()),
+            _ => (422, r#"{"detail":"invalid updated_after"}"#.to_string()),
+        };
+        fx.on(
+            "GET",
+            "/api/roms/identifiers",
+            if reject == "identifiers" {
+                ResponseSpec::Json {
+                    status,
+                    body: body.clone(),
+                }
+            } else {
+                ResponseSpec::Json {
+                    status: 200,
+                    body: "[1,2]".into(),
+                }
+            },
+        );
+        if reject == "updated_after" {
+            fx.on(
+                "GET",
+                "/api/roms?limit=500&offset=0&with_files=true&with_char_index=false&with_filter_values=false&with_rom_id_index=false&with_total=true&updated_after=",
+                ResponseSpec::Json { status, body },
+            );
+        }
+        let full = vec![
+            contract::rom(1, "nes", "a.bin", 10, "hash"),
+            contract::rom(2, "nes", "b.bin", 10, "hash"),
+        ];
+        fx.on(
+            "GET",
+            "/api/roms?limit=500&offset=0&",
+            ResponseSpec::Json {
+                status: 200,
+                body: contract::roms_page(&full, 2, 500, 0),
+            },
+        );
+        let client = authed_client(&fx);
+        let now = rommfs_core::cache::now_unix_secs();
+        let prior = CatalogueSnapshot {
+            platforms: vec![],
+            roms: vec![fixture_rom(9, "stale.bin")],
+            refreshed_at: now,
+            full_refreshed_at: now,
+        };
+        let (sink, events) = rommfs_core::events::channel();
+        let snapshot = fetch_catalogue(&client, &sink, 1, Some(prior)).unwrap();
+        assert_eq!(
+            snapshot.roms.iter().map(|rom| rom.id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "reject={reject}"
+        );
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            AppEvent::Log(line) if line.message.contains("incremental refresh unavailable")
+        )));
+    }
+}
+
+#[test]
+fn incremental_refresh_falls_back_when_visible_ids_cannot_be_reconciled() {
+    use rommfs_fixture::contract;
+    let fx = FixtureServer::start();
+    fx.on(
+        "POST",
+        "/api/token",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::token_ok(),
+        },
+    );
+    fx.on(
+        "GET",
+        "/api/platforms",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::platforms(&[(1, "nes", "nes", "NES")]),
+        },
+    );
+    // The server lists ROM 2 as visible, but neither the snapshot nor the delta
+    // carries it, so the delta cannot be trusted.
+    fx.on(
+        "GET",
+        "/api/roms/identifiers",
+        ResponseSpec::Json {
+            status: 200,
+            body: serde_json::json!([1, 2, 3]).to_string(),
+        },
+    );
+    let delta = vec![contract::rom(3, "nes", "c.bin", 10, "hash")];
+    fx.on(
+        "GET",
+        "/api/roms?limit=500&offset=0&with_files=true&with_char_index=false&with_filter_values=false&with_rom_id_index=false&with_total=true&updated_after=",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::roms_page(&delta, 1, 500, 0),
+        },
+    );
+    let full = vec![
+        contract::rom(1, "nes", "a.bin", 10, "hash"),
+        contract::rom(2, "nes", "b.bin", 10, "hash"),
+        contract::rom(3, "nes", "c.bin", 10, "hash"),
+    ];
+    fx.on(
+        "GET",
+        "/api/roms?limit=500&offset=0&",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::roms_page(&full, 3, 500, 0),
+        },
+    );
+    let client = authed_client(&fx);
+    let now = rommfs_core::cache::now_unix_secs();
+    let prior = CatalogueSnapshot {
+        platforms: vec![],
+        roms: vec![fixture_rom(1, "a.bin"), fixture_rom(4, "gone.bin")],
+        refreshed_at: now,
+        full_refreshed_at: now,
+    };
+    let (sink, _events) = rommfs_core::events::channel();
+    let snapshot = fetch_catalogue(&client, &sink, 1, Some(prior)).unwrap();
+    assert_eq!(
+        snapshot.roms.iter().map(|rom| rom.id).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn catalogue_first_page_integrity_is_enforced() {
+    use rommfs_fixture::contract;
+    let fx = FixtureServer::start();
+    fx.on(
+        "POST",
+        "/api/token",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::token_ok(),
+        },
+    );
+    fx.on(
+        "GET",
+        "/api/platforms",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::platforms(&[(1, "nes", "nes", "NES")]),
+        },
+    );
+    let client = authed_client(&fx);
+    let (sink, _events) = rommfs_core::events::channel();
+    // (label, declared total, returned limit, first-page item count). The first
+    // page must be exactly `min(limit, total)`, and a zero limit is invalid.
+    let cases = [
+        ("short before total", 1000usize, 500usize, 10usize),
+        ("more than the total", 10, 500, 20),
+        ("zero returned limit", 1000, 0, 0),
+    ];
+    for (label, total, limit, count) in cases {
+        let items: Vec<_> = (0..count)
+            .map(|n| contract::rom(n as i64 + 1, "nes", &format!("g{n}.bin"), 10, "hash"))
+            .collect();
+        fx.on(
+            "GET",
+            "/api/roms?limit=500&offset=0&",
+            ResponseSpec::Json {
+                status: 200,
+                body: contract::roms_page(&items, total, limit, 0),
+            },
+        );
+        let result = fetch_catalogue(&client, &sink, 1, None);
+        assert!(
+            matches!(result, Err(Error::InvalidCatalogue(_))),
+            "{label}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn connected_session_catalogue_poll_fires_only_when_due() {
+    let (sink, _events) = rommfs_core::events::channel();
+    let mut worker = Worker::new(sink);
+    worker.client = Some(Arc::new(RommClient::new("http://127.0.0.1:9").unwrap()));
+    worker.next_catalogue_poll = Some(Instant::now() + Duration::from_secs(60));
+    worker.poll_catalogue_refresh_timer();
+    assert!(worker.refresh_result.is_none(), "polled before it was due");
+
+    worker.next_catalogue_poll = Some(Instant::now() - Duration::from_secs(1));
+    worker.poll_catalogue_refresh_timer();
+    assert!(worker.refresh_result.is_some(), "due poll did not refresh");
+    assert!(worker.next_catalogue_poll.unwrap() > Instant::now());
+
+    // A due poll while a refresh is already in flight is skipped: the running
+    // refresh is neither replaced nor cancelled.
+    let (_tx, rx) = mpsc::channel();
+    worker.refresh_result = Some(rx);
+    let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    worker.refresh_active = Some(active.clone());
+    worker.next_catalogue_poll = Some(Instant::now() - Duration::from_secs(1));
+    worker.poll_catalogue_refresh_timer();
+    assert!(
+        worker.refresh_result.is_some(),
+        "an in-flight refresh was replaced"
+    );
+    assert!(
+        active.load(std::sync::atomic::Ordering::Acquire),
+        "an in-flight refresh was cancelled"
+    );
+    assert!(worker.next_catalogue_poll.unwrap() > Instant::now());
+
+    worker.cancel_catalogue_refresh();
+    worker.next_catalogue_poll = None;
+    worker.poll_catalogue_refresh_timer();
+    assert!(worker.refresh_result.is_none(), "polled while disconnected");
 }

@@ -21,6 +21,7 @@ fn terminal_actor_failure_emits_session_queue_with_durable_counts() {
         1,
         Arc::new(AtomicBool::new(true)),
         sink,
+        None,
     )
     .unwrap();
 

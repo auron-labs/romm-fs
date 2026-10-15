@@ -70,6 +70,7 @@ fn clean_agent_discovers_all_file_slots_once_and_keeps_per_file_status() {
         Arc::new(AtomicBool::new(true)),
         sink,
         Some(rules),
+        None,
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);

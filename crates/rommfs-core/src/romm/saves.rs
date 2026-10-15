@@ -333,13 +333,13 @@ impl RommClient {
         }
     }
 
-    fn save_request<T: Into<isahc::Body>>(
+    pub(super) fn save_request<T: Into<isahc::Body>>(
         &self,
         request: isahc::http::Request<T>,
     ) -> std::result::Result<isahc::Response<isahc::Body>, isahc::Error> {
         self.build_save_request(request, false)?.send()
     }
-    fn save_content_request<T: Into<isahc::AsyncBody>>(
+    pub(super) fn save_content_request<T: Into<isahc::AsyncBody>>(
         &self,
         request: isahc::http::Request<T>,
         active: &AtomicBool,
@@ -372,7 +372,7 @@ impl RommClient {
         builder.body(body).map_err(isahc::Error::from)
     }
 
-    fn content_response_failure(
+    pub(super) fn content_response_failure(
         &self,
         response: &mut isahc::Response<isahc::AsyncBody>,
         status: u16,
@@ -387,7 +387,7 @@ impl RommClient {
         Ok(failure_with_detail(response, status, detail))
     }
 
-    fn response_failure(
+    pub(super) fn response_failure(
         &self,
         response: &mut isahc::Response<isahc::Body>,
         status: u16,
@@ -412,7 +412,7 @@ impl Wake for SaveTransferWake {
 /// Poll the HTTP operation on its worker thread. Dropping either the response
 /// future or its body cancels isahc's transfer, including waits for headers and
 /// reads of success/error bodies after the upload has finished.
-fn wait_for_save<F: Future>(
+pub(super) fn wait_for_save<F: Future>(
     future: F,
     active: &AtomicBool,
 ) -> std::result::Result<F::Output, SaveApiFailure> {
@@ -430,9 +430,9 @@ fn wait_for_save<F: Future>(
     }
 }
 
-struct CancellableReader<R> {
-    inner: R,
-    active: std::sync::Arc<AtomicBool>,
+pub(super) struct CancellableReader<R> {
+    pub(super) inner: R,
+    pub(super) active: std::sync::Arc<AtomicBool>,
 }
 impl<R: Read> Read for CancellableReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
@@ -443,14 +443,14 @@ impl<R: Read> Read for CancellableReader<R> {
     }
 }
 
-fn local_failure(error: Error) -> SaveApiFailure {
+pub(super) fn local_failure(error: Error) -> SaveApiFailure {
     SaveApiFailure {
         error,
         retry_after: None,
     }
 }
 
-fn save_failure(error: isahc::Error) -> SaveApiFailure {
+pub(super) fn save_failure(error: isahc::Error) -> SaveApiFailure {
     SaveApiFailure {
         error: transport(error),
         retry_after: None,
@@ -496,7 +496,7 @@ fn response_detail(response: &mut isahc::Response<isahc::Body>) -> String {
         .collect()
 }
 
-fn query_encode(value: &str) -> String {
+pub(super) fn query_encode(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
         match byte {

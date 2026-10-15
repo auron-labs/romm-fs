@@ -7,7 +7,7 @@ use rommfs_core::retrobat::{
 use rommfs_core::romm::{PlatformDto, RomDto, RomUserDto, RommClient};
 use rommfs_fixture::{contract, FixtureServer, ResponseSpec};
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 fn rom() -> RomDto {
     let mut value = contract::rom(1, "gb", "Game.gb", 3, "hash");
@@ -139,6 +139,7 @@ fn play_data_reconciles_into_our_entries_and_pushes_new_launches() {
         &frontend,
         &BTreeMap::new(),
         &HashMap::new(),
+        &HashSet::new(),
         &mut PlaySync {
             enabled: true,
             remote: &remote,
@@ -172,6 +173,7 @@ fn play_data_reconciles_into_our_entries_and_pushes_new_launches() {
         &frontend,
         &BTreeMap::new(),
         &HashMap::new(),
+        &HashSet::new(),
         &mut PlaySync {
             enabled: true,
             remote: &remote,
@@ -204,6 +206,7 @@ fn play_data_reconciles_into_our_entries_and_pushes_new_launches() {
         &frontend,
         &BTreeMap::new(),
         &HashMap::new(),
+        &HashSet::new(),
         &mut PlaySync {
             enabled: true,
             remote: &remote,
@@ -238,6 +241,7 @@ fn a_failed_push_keeps_its_delta_and_foreign_entries_are_untouched() {
         &first_frontend,
         &BTreeMap::new(),
         &HashMap::new(),
+        &HashSet::new(),
         &mut PlaySync {
             enabled: true,
             remote: &remote,
@@ -262,6 +266,7 @@ fn a_failed_push_keeps_its_delta_and_foreign_entries_are_untouched() {
         &frontend,
         &BTreeMap::new(),
         &HashMap::new(),
+        &HashSet::new(),
         &mut PlaySync {
             enabled: true,
             remote: &remote,
@@ -309,6 +314,7 @@ fn an_unreadable_gamelist_keeps_its_play_data() {
         &frontend,
         &BTreeMap::new(),
         &HashMap::new(),
+        &HashSet::new(),
         &mut PlaySync {
             enabled: true,
             remote: &HashMap::new(),

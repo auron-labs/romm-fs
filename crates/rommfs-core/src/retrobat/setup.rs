@@ -230,6 +230,14 @@ pub fn verify_setup_link(installation: &Path, managed: &Path, server: &str) -> a
     Ok(())
 }
 
+/// Whether an earlier build's setup record needs migrating before this
+/// integration can mount: running setup converts old links and moves
+/// backed-up folders back. False when setup never ran (nothing to migrate) or
+/// the record already matches this build.
+pub fn setup_needs_migration(installation: &Path) -> bool {
+    matches!(load_record(installation), Ok(Some(record)) if record.schema != SCHEMA)
+}
+
 /// Read the last setup result without changing anything. Used by the
 /// unelevated app after the Windows setup helper exits.
 pub fn inspect_setup(

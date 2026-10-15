@@ -106,6 +106,9 @@ fn multi_file_roms_keep_individual_original_files() {
     );
     assert_eq!(cat.entries.iter().filter(|e| e.key.rom_id == 20).count(), 2);
     assert!(warned.is_empty());
+    // Two games, three files: the Overview counts must not conflate them (WS6.1).
+    assert_eq!(cat.games(), 2);
+    assert_eq!(cat.entries.len(), 3);
 }
 
 #[test]

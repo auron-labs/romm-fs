@@ -24,6 +24,14 @@ pub struct ConnectionPreferences {
     pub start_at_login: bool,
     #[serde(default)]
     pub save_root: Option<PathBuf>,
+    /// Hide RomM's copy of a game the user already has locally. On by default;
+    /// the user turns it off in the RetroBat tab.
+    #[serde(default = "hide_owned_by_default")]
+    pub hide_owned_copies: bool,
+}
+
+fn hide_owned_by_default() -> bool {
+    true
 }
 
 pub struct ConnectionSettings(Connection);

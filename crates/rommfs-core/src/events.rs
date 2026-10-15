@@ -50,6 +50,26 @@ pub struct SaveSyncIncomingStatus {
     pub state: String,
 }
 
+/// One discovered emulator memory-card folder with its per-folder consent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryCardFolderStatus {
+    pub emulator: String,
+    pub label: String,
+    pub relative_dir: String,
+    pub cards: usize,
+    pub enabled: bool,
+}
+
+/// A card whose local and remote copies both changed: the local card is kept
+/// and the remote copy is written beside it as a `.rommfs-conflict` sibling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryCardConflictStatus {
+    pub emulator: String,
+    pub card_name: String,
+    pub relative_path: String,
+    pub remote_version_id: i64,
+}
+
 /// An event-backed snapshot of the current save handoff queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SaveSyncQueueStatus {
@@ -166,9 +186,24 @@ pub enum AppEvent {
         error: Option<String>,
     },
     FrontendMetadata {
+        /// The metadata pass this status belongs to.
+        job_id: u64,
         pending: bool,
         detail: String,
         error: Option<String>,
+    },
+    /// Live progress of the frontend metadata pass. `job_id` identifies the
+    /// pass; progress from an earlier, cancelled pass is dropped by the UI.
+    FrontendMetadataProgress {
+        job_id: u64,
+        completed: usize,
+        total: usize,
+    },
+    /// The active metadata pass ended without publishing (cancelled, stopped,
+    /// signed out). The UI drops the pass and its progress; later events for
+    /// `job_id` are ignored.
+    FrontendMetadataInvalidated {
+        job_id: u64,
     },
     /// Play-data sync (favourites and play history) availability and consent.
     PlayDataUpdated {
@@ -178,9 +213,17 @@ pub enum AppEvent {
         enabled: bool,
         problem: Option<String>,
     },
+    /// "Hide RomM games you already have": the switch state and how many
+    /// entries RomMFS hid in the last metadata pass.
+    HideCopies {
+        enabled: bool,
+        hidden: usize,
+    },
     RetroBatSetup {
         running: bool,
         detail: String,
+        /// Systems the last run could not link, each with its reason (WS6.10).
+        skipped: Vec<crate::retrobat::SkippedSystem>,
         error: Option<String>,
     },
     PairingReady {
@@ -207,6 +250,9 @@ pub enum AppEvent {
         /// A verified RetroBat setup record exists for this installation and
         /// games folder.
         setup_complete: bool,
+        /// An earlier build's setup record is present: setup must run to
+        /// migrate its links before the integration can mount.
+        setup_migration: bool,
         error: Option<String>,
     },
     SignedOut,
@@ -244,7 +290,10 @@ pub enum AppEvent {
     CatalogueLoading,
     CatalogueLoaded {
         platforms: usize,
-        roms: usize,
+        /// Distinct ROM identities with at least one visible file.
+        games: usize,
+        /// Visible files (a game with several files counts each one).
+        files: usize,
         skipped_unsupported: usize,
     },
     CatalogueFailed {
@@ -311,6 +360,15 @@ pub enum AppEvent {
         incoming_id: String,
         destination: Option<String>,
         error: Option<String>,
+    },
+
+    /// Memory-card discovery, per-folder consent, and conflict review.
+    MemoryCardsUpdated {
+        session_id: u64,
+        available: bool,
+        folders: Vec<MemoryCardFolderStatus>,
+        conflicts: Vec<MemoryCardConflictStatus>,
+        problem: Option<String>,
     },
 
     DownloadStarted {
@@ -459,6 +517,7 @@ impl EventSink {
                 running,
                 detail,
                 error,
+                ..
             } => (
                 "RetroBatSetup",
                 ProgressSample {

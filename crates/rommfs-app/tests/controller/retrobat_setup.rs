@@ -15,6 +15,7 @@ fn retrobat_steps_unlock_in_order_with_one_primary() {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
+        setup_migration: false,
         error: None,
     });
     let steps = ui.retrobat_steps();
@@ -27,6 +28,7 @@ fn retrobat_steps_unlock_in_order_with_one_primary() {
     ui.apply_event(&AppEvent::RetroBatSetup {
         running: true,
         detail: "working".into(),
+        skipped: Vec::new(),
         error: None,
     });
     assert_eq!(ui.retrobat_steps().link, StepStatus::Running);
@@ -35,13 +37,14 @@ fn retrobat_steps_unlock_in_order_with_one_primary() {
     ui.apply_event(&AppEvent::RetroBatSetup {
         running: false,
         detail: "linked".into(),
+        skipped: Vec::new(),
         error: None,
     });
     let steps = ui.retrobat_steps();
     assert_eq!(steps.link, StepStatus::Done);
     // Support files also need the library to be loaded.
     assert!(matches!(steps.support, StepStatus::Blocked(_)));
-    ui.catalogue = Some((3, 10, 0));
+    ui.catalogue = Some((3, 10, 10, 0));
     let steps = ui.retrobat_steps();
     assert_eq!(steps.support, StepStatus::Ready);
     assert_eq!(steps.primary(), Some(RetroBatStep::Support));
@@ -52,6 +55,7 @@ fn retrobat_steps_unlock_in_order_with_one_primary() {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
+        setup_migration: false,
         error: None,
     });
     assert_eq!(ui.retrobat_steps().link, StepStatus::Done);
@@ -59,6 +63,7 @@ fn retrobat_steps_unlock_in_order_with_one_primary() {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("D:\\RetroBat".into()),
         setup_complete: false,
+        setup_migration: false,
         error: None,
     });
     assert_eq!(ui.retrobat_steps().link, StepStatus::Ready);
@@ -68,6 +73,7 @@ fn retrobat_steps_unlock_in_order_with_one_primary() {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("E:\\RetroBat".into()),
         setup_complete: true,
+        setup_migration: false,
         error: None,
     });
     assert_eq!(ui.retrobat_steps().link, StepStatus::Done);
@@ -86,16 +92,18 @@ fn retrobat_steps_unlock_in_order_with_one_primary() {
 fn support_files_do_not_wait_for_the_games_folder_link() {
     use rommfs_app::controller::{RetroBatStep, StepStatus};
     let mut ui = linked_ui();
-    ui.catalogue = Some((3, 10, 0));
+    ui.catalogue = Some((3, 10, 10, 0));
     ui.apply_event(&AppEvent::IntegrationUpdated {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
+        setup_migration: false,
         error: None,
     });
     ui.apply_event(&AppEvent::RetroBatSetup {
         running: false,
         detail: "failed".into(),
+        skipped: Vec::new(),
         error: Some("denied".into()),
     });
     let steps = ui.retrobat_steps();
@@ -113,20 +121,58 @@ fn retrobat_setup_failure_is_a_retry_not_done() {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
+        setup_migration: false,
         error: None,
     });
     ui.apply_event(&AppEvent::RetroBatSetup {
         running: false,
         detail: "failed".into(),
+        skipped: Vec::new(),
         error: Some("denied".into()),
     });
     assert_eq!(ui.retrobat_steps().link, StepStatus::Failed);
 }
 
 #[test]
+fn an_outdated_setup_record_is_a_migration_prompt_not_a_blocked_start() {
+    use rommfs_app::controller::StepStatus;
+    let mut ui = linked_ui();
+    // An earlier build's record: not complete, but step 2 is actionable, so the
+    // Overview offers the update instead of a guaranteed-to-fail start.
+    ui.apply_event(&AppEvent::IntegrationUpdated {
+        mode: IntegrationMode::RetroBat,
+        retrobat_root: Some("C:\\RetroBat".into()),
+        setup_complete: false,
+        setup_migration: true,
+        error: None,
+    });
+    assert!(ui.retrobat_setup_migration);
+    assert!(!ui.retrobat_setup_ok);
+    assert_eq!(ui.retrobat_steps().link, StepStatus::Ready);
+
+    // Running setup clears the prompt; the next verified event reports current.
+    ui.apply_event(&AppEvent::RetroBatSetup {
+        running: false,
+        detail: "linked".into(),
+        skipped: Vec::new(),
+        error: None,
+    });
+    assert!(ui.retrobat_setup_ok);
+    ui.apply_event(&AppEvent::IntegrationUpdated {
+        mode: IntegrationMode::RetroBat,
+        retrobat_root: Some("C:\\RetroBat".into()),
+        setup_complete: true,
+        setup_migration: false,
+        error: None,
+    });
+    assert!(!ui.retrobat_setup_migration);
+    assert!(ui.retrobat_setup_ok);
+}
+
+#[test]
 fn loaded_catalogue_means_the_folder_is_not_unconfigured() {
     let mut ui = UiState::new(64);
-    ui.catalogue = Some((3, 10, 0));
+    ui.catalogue = Some((3, 10, 10, 0));
     assert_eq!(ui.folder_summary(), FolderSummary::Stopped);
 }
 

@@ -1,6 +1,7 @@
 use super::files::export_incoming;
 use super::gate::SaveSyncEnablement;
 use super::incoming::reconcile_inventory;
+use super::memory_cards::{MemoryCardAgent, MemoryCardConfig};
 use super::transfer::{
     is_active, run_transfer_worker, validate_configuration, validate_export_configuration,
     IncomingJob, TransferJob, TransferUpdate, WorkerJob, ACTOR_POLL_INTERVAL,
@@ -31,6 +32,10 @@ pub(crate) struct SaveSyncAgent {
     commands: Sender<AgentCommand>,
     actor: Option<JoinHandle<()>>,
     active: Arc<AtomicBool>,
+    /// The memory-card reconciliation thread, owned here so its lifecycle is
+    /// the save agent's: it starts and stops with this agent, even when save
+    /// sync itself is disabled.
+    card_agent: Option<MemoryCardAgent>,
 }
 
 enum AgentCommand {
@@ -54,6 +59,7 @@ impl SaveSyncAgent {
         session_id: u64,
         enabled: impl Into<SaveSyncEnablement>,
         sink: EventSink,
+        memory_cards: Option<MemoryCardConfig>,
     ) -> Result<Self> {
         Self::start_with_rules(
             scope,
@@ -67,6 +73,7 @@ impl SaveSyncAgent {
             enabled,
             sink,
             None,
+            memory_cards,
         )
     }
 
@@ -83,8 +90,15 @@ impl SaveSyncAgent {
         enabled: impl Into<SaveSyncEnablement>,
         sink: EventSink,
         rules: Option<SaveFileRules>,
+        memory_cards: Option<MemoryCardConfig>,
     ) -> Result<Self> {
         let enabled = enabled.into();
+        // The card thread is owned here, so it lives and dies with the save
+        // agent even when save sync is off and the actor below returns early.
+        let card_agent = match memory_cards {
+            Some(config) => Some(MemoryCardAgent::start(config, sink.clone())?),
+            None => None,
+        };
         let (stop, stop_rx) = mpsc::channel();
         let (commands, command_rx) = mpsc::channel();
         let active = Arc::new(AtomicBool::new(true));
@@ -136,12 +150,16 @@ impl SaveSyncAgent {
             commands,
             actor: Some(thread),
             active,
+            card_agent,
         })
     }
 
     pub(crate) fn stop(&mut self) {
         self.active.store(false, Ordering::SeqCst);
         let _ = self.stop.send(());
+        if let Some(mut agent) = self.card_agent.take() {
+            agent.stop();
+        }
         if let Some(actor) = self.actor.take() {
             let _ = actor.join();
         }

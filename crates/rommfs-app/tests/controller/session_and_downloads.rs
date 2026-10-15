@@ -16,10 +16,11 @@ fn connect_success_shows_connected_and_catalogue_counts() {
     ui.apply_event(&AppEvent::CatalogueLoading);
     ui.apply_event(&AppEvent::CatalogueLoaded {
         platforms: 2,
-        roms: 5,
+        games: 4,
+        files: 5,
         skipped_unsupported: 1,
     });
-    assert_eq!(ui.catalogue, Some((2, 5, 1)));
+    assert_eq!(ui.catalogue, Some((2, 4, 5, 1)));
     assert!(ui.conn_error.is_none());
 }
 
@@ -71,7 +72,8 @@ fn reconnect_clears_previous_session_state() {
         AppEvent::Connected,
         AppEvent::CatalogueLoaded {
             platforms: 1,
-            roms: 1,
+            games: 1,
+            files: 1,
             skipped_unsupported: 0,
         },
         AppEvent::DownloadStarted {
@@ -383,4 +385,73 @@ fn file_id_separates_transfers_and_history_never_prunes_active_or_failed_rows() 
         ui.downloads.last().unwrap().finished,
         Some(Err(_))
     ));
+}
+
+/// WS4.1: metadata progress tracks only the active pass. A new pass restarts
+/// the counts, a stale pass cannot finish/revive a newer one, and cancellation
+/// stops a late callback from resurrecting the pass.
+#[test]
+fn metadata_progress_tracks_the_active_pass_only() {
+    let start = |job_id| AppEvent::FrontendMetadata {
+        job_id,
+        pending: true,
+        detail: "Downloading artwork".into(),
+        error: None,
+    };
+    let finish = |job_id| AppEvent::FrontendMetadata {
+        job_id,
+        pending: false,
+        detail: "Artwork & gamelists up to date".into(),
+        error: None,
+    };
+    let progress = |job_id, completed| AppEvent::FrontendMetadataProgress {
+        job_id,
+        completed,
+        total: 10,
+    };
+
+    let mut ui = UiState::new(64);
+    ui.apply_event(&start(1));
+    assert!(ui.frontend_metadata_pending);
+    ui.apply_event(&progress(1, 3));
+    assert_eq!(ui.frontend_metadata_progress, Some((3, 10)));
+    // Non-monotonic within the pass is ignored.
+    ui.apply_event(&progress(1, 2));
+    assert_eq!(ui.frontend_metadata_progress, Some((3, 10)));
+    ui.apply_event(&progress(1, 10));
+    assert_eq!(ui.frontend_metadata_progress, Some((10, 10)));
+
+    // A finish clears the counts and records the age.
+    ui.apply_event(&finish(1));
+    assert!(!ui.frontend_metadata_pending);
+    assert!(ui.frontend_metadata_progress.is_none());
+    assert!(ui.frontend_metadata_updated_at.is_some());
+
+    // Pass 2 starts; pass 1's late callbacks are ignored.
+    ui.apply_event(&start(2));
+    ui.apply_event(&progress(1, 9));
+    assert!(ui.frontend_metadata_progress.is_none());
+    ui.apply_event(&progress(2, 4));
+    assert_eq!(ui.frontend_metadata_progress, Some((4, 10)));
+    // A stale finish or start for pass 1 cannot end or revive pass 2.
+    ui.apply_event(&finish(1));
+    assert!(ui.frontend_metadata_pending);
+    assert_eq!(ui.frontend_metadata_progress, Some((4, 10)));
+    ui.apply_event(&start(1));
+    assert!(ui.frontend_metadata_pending);
+
+    // Cancellation invalidates pass 2; later events for it are ignored.
+    ui.apply_event(&AppEvent::FrontendMetadataInvalidated { job_id: 2 });
+    assert!(!ui.frontend_metadata_pending);
+    assert!(ui.frontend_metadata_progress.is_none());
+    ui.apply_event(&progress(2, 10));
+    assert!(ui.frontend_metadata_progress.is_none());
+    ui.apply_event(&start(2));
+    assert!(!ui.frontend_metadata_pending);
+
+    // A newer pass (3) still starts normally.
+    ui.apply_event(&start(3));
+    assert!(ui.frontend_metadata_pending);
+    ui.apply_event(&progress(3, 1));
+    assert_eq!(ui.frontend_metadata_progress, Some((1, 10)));
 }

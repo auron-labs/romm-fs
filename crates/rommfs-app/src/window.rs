@@ -34,7 +34,9 @@ use gpui_kit::{
     SharedString, Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use rommfs_core::connection_settings::IntegrationMode;
-use rommfs_core::events::{AppEvent, ForeignKind, Level, SaveSyncIncomingStatus};
+use rommfs_core::events::{
+    AppEvent, ForeignKind, Level, MemoryCardConflictStatus, SaveSyncIncomingStatus,
+};
 use rommfs_core::save_sync::{ExistingSavePreview, ExistingSaveScanStatus};
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -601,9 +603,10 @@ impl RommfsWindow {
             | SaveSyncSummary::Paused => StatusKind::Danger,
             SaveSyncSummary::NeedsSetup
             | SaveSyncSummary::Checking
-            | SaveSyncSummary::NoLinkedFiles
             | SaveSyncSummary::Reconciling
             | SaveSyncSummary::Syncing => StatusKind::Warning,
+            // Nothing to sync yet is not a warning — it is simply empty (WS6.6).
+            SaveSyncSummary::NoLinkedFiles => StatusKind::Muted,
             SaveSyncSummary::Off => StatusKind::Muted,
             SaveSyncSummary::UpToDate => StatusKind::Success,
         };

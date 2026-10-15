@@ -104,6 +104,15 @@ impl Catalogue {
     pub fn is_launchable(&self, key: &RomKey) -> bool {
         self.launchable.contains(key)
     }
+    /// Distinct ROM identities with at least one visible file — the "games"
+    /// count shown beside the file total (WS6.1).
+    pub fn games(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| entry.key.rom_id)
+            .collect::<HashSet<_>>()
+            .len()
+    }
 }
 
 /// Generic platform folders with original files, including safe nested paths.

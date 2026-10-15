@@ -15,6 +15,7 @@ pub fn auxiliary_paths(
     ))
 }
 mod metadata;
+mod owned;
 mod play_data;
 mod setup;
 mod xml;
@@ -29,13 +30,14 @@ pub use metadata::{
     generate_gamelists, publish_gamelists, read_gamelists, FrontendGamelists, MetadataIndex,
     MetadataPublication, PlaySync, PLAY_FAMILY_NAME,
 };
+pub use owned::{LocalFiles, HASH_CAP_BYTES};
 pub use play_data::{
     build_remote_play, is_play_field, merge_play, parse_play_fields, render_play_fields,
     PlayBaseline, PlayMerge, PlayPush, PlayValues, PLAY_FIELDS,
 };
 pub use setup::{
-    inspect_setup, linked_systems, setup_roms_link, verify_setup_link, SetupOutcome, SetupRecord,
-    SkippedSystem, ROMM_FOLDER,
+    inspect_setup, linked_systems, setup_needs_migration, setup_roms_link, verify_setup_link,
+    SetupOutcome, SetupRecord, SkippedSystem, ROMM_FOLDER,
 };
 
 /// Resolve effective frontend home/save directories through launcher settings.

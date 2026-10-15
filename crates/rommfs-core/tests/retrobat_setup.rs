@@ -162,6 +162,26 @@ fn rerun_adds_links_for_systems_that_become_available() {
     assert!(path_is_link(&install.join("roms/snes").join(ROMM_FOLDER)));
 }
 
+#[test]
+fn an_older_setup_record_needs_migration_and_a_current_one_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let (install, _managed) = installation(dir.path());
+    assert!(!rommfs_core::retrobat::setup_needs_migration(&install));
+    let record = install.join(".rommfs-setup.json");
+    fs::write(
+        &record,
+        r#"{"schema":2,"server_id":"s","managed_root":"/m","version":null}"#,
+    )
+    .unwrap();
+    assert!(rommfs_core::retrobat::setup_needs_migration(&install));
+    fs::write(
+        &record,
+        r#"{"schema":3,"server_id":"s","managed_root":"/m","version":null}"#,
+    )
+    .unwrap();
+    assert!(!rommfs_core::retrobat::setup_needs_migration(&install));
+}
+
 #[cfg(unix)]
 #[test]
 fn earlier_layouts_are_converted_and_moved_folders_come_back() {
@@ -347,7 +367,7 @@ fn publication_excludes_missing_replaced_and_redirected_links() {
         generate_gamelists, inspect_setup, linked_systems, publish_gamelists, read_gamelists,
         MetadataIndex, PlayPush, PlaySync,
     };
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     let dir = tempfile::tempdir().unwrap();
     let (install, managed) = installation(dir.path());
@@ -402,6 +422,7 @@ fn publication_excludes_missing_replaced_and_redirected_links() {
             &frontend,
             &BTreeMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
             &mut PlaySync {
                 enabled: false,
                 remote: &HashMap::new(),

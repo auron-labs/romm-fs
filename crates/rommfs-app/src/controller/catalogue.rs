@@ -35,7 +35,8 @@ impl Worker {
         let cat = self.project_snapshot(&snapshot)?;
         self.sink.emit(AppEvent::CatalogueLoaded {
             platforms: cat.platforms.len(),
-            roms: cat.entries.len(),
+            games: cat.games(),
+            files: cat.entries.len(),
             skipped_unsupported: cat.skipped_unsupported,
         });
         self.sink.emit(AppEvent::CatalogueSnapshot {
@@ -94,7 +95,12 @@ impl Worker {
     pub(super) fn load_catalogue(&mut self, client: &RommClient) -> Result<Catalogue> {
         self.sink.emit(AppEvent::CatalogueLoading);
         self.catalogue_operation_id += 1;
-        let snapshot = fetch_catalogue(client, &self.sink, self.catalogue_operation_id)?;
+        let snapshot = fetch_catalogue(
+            client,
+            &self.sink,
+            self.catalogue_operation_id,
+            self.source_snapshot.clone(),
+        )?;
         let cat = self.publish_snapshot(snapshot.clone(), false)?;
         self.persist_snapshot(&snapshot);
         Ok(cat)
@@ -116,8 +122,9 @@ impl Worker {
         self.refresh_active = Some(active);
         let (tx, rx) = mpsc::channel();
         self.refresh_result = Some(rx);
+        let prior = self.source_snapshot.clone();
         self.refresh_handle = Some(std::thread::spawn(move || {
-            let result = fetch_catalogue(&client, &sink, operation_id);
+            let result = fetch_catalogue(&client, &sink, operation_id, prior);
             let _ = tx.send((Instant::now(), result));
         }));
     }
@@ -168,7 +175,32 @@ impl Worker {
         }
     }
 
+    /// The real-time fallback: no socket.io credential exists for a bearer-only
+    /// session (the server resolves socket identity from the web session cookie
+    /// only), so poll an incremental refresh on the session's own timer. Owned
+    /// by the connection: cleared on sign-out and drained by
+    /// `cancel_catalogue_refresh`.
+    pub(super) fn poll_catalogue_refresh_timer(&mut self) {
+        let Some(deadline) = self.next_catalogue_poll else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.next_catalogue_poll = Some(Instant::now() + CATALOGUE_POLL_INTERVAL);
+        // A refresh already in flight is left alone; the next poll is measured
+        // from now, so the timer cannot stack requests behind a slow refresh.
+        if self.refresh_result.is_some() {
+            return;
+        }
+        self.refresh_catalogue();
+    }
+
     pub(super) fn finish_catalogue_refresh(&mut self, result: Result<CatalogueSnapshot>) {
+        // The next real-time poll is measured from this completed refresh.
+        self.next_catalogue_poll = self
+            .next_catalogue_poll
+            .map(|_| Instant::now() + CATALOGUE_POLL_INTERVAL);
         // Projection and persistence can be slow on a large library; show the
         // final stage instead of a frozen 100% page bar.
         self.sink.emit(AppEvent::CatalogueProgress {

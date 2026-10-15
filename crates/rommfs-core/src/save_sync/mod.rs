@@ -7,7 +7,17 @@ mod links;
 pub use links::{path_is_symbolic_link, remove_symbolic_link};
 mod legacy_gb_profile;
 mod mapping;
+mod memory_card_journal;
+mod memory_cards;
 mod ordinary_files;
+pub use memory_card_journal::{MemoryCardJournal, MemoryCardSlot};
+pub use memory_cards::{
+    conflict_sibling, discover_card_folder, discover_card_folders, extract_card_archive,
+    hash_local_card, latest_card_modified, plan_card_action, read_local_card_hash,
+    remote_card_restore_target, validate_emulator_name, write_card_archive, CardBaseline,
+    CardDecision, CardFolder, DiscoveredCard, MemoryCardEmulator, RemoteCardRestore,
+    RemoteCardVersion, MEMORY_CARD_MAX_BYTES,
+};
 pub use ordinary_files::{ensure_distinct, SaveFilePlan, SaveFileRules, UnmatchedFile};
 mod path;
 mod preview;

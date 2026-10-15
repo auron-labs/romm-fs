@@ -42,6 +42,11 @@ impl MetadataIndex {
             .get(&format!("{rom_id}:{file_id}"))
             .map(|game| &game.play)
     }
+
+    /// Entries RomMFS hid because the user already has a local copy.
+    pub fn auto_hidden_count(&self) -> usize {
+        self.games.values().filter(|game| game.auto_hidden).count()
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -54,6 +59,11 @@ struct IndexedGame {
     /// Last reconciled local and remote play data (favourites and history).
     #[serde(default)]
     play: PlayBaseline,
+    /// True when RomMFS added the `hidden` flag to this entry because the user
+    /// already has a local copy. Cleared, and the flag removed, when the copy
+    /// goes away; a `hidden` the user set is never touched.
+    #[serde(default)]
+    auto_hidden: bool,
 }
 
 fn initially_active() -> bool {
@@ -149,6 +159,14 @@ fn element_text(node: &str) -> anyhow::Result<String> {
     Ok(quick_xml::de::from_str::<Value>(node)?.text)
 }
 
+/// Whether a captured frontend field list carries a true `hidden` flag.
+fn hidden_true(fields: &[String]) -> bool {
+    fields.iter().any(|node| {
+        super::play_data::node_name(node).as_deref() == Some("hidden")
+            && element_text(node).is_ok_and(|text| text.trim().eq_ignore_ascii_case("true"))
+    })
+}
+
 /// The managed path (`<system>/<file>`) of a gamelist path, when it points
 /// into our folder (`./RomM/<file>` in RetroBat, `./<file>` in a legacy
 /// managed gamelist).
@@ -234,6 +252,9 @@ fn split_gamelist(
 /// `legacy` holds gamelists an earlier build kept in the managed folder; they
 /// are only read for frontend fields. A system whose gamelist can't be read is
 /// skipped and left untouched; it never stops the others.
+///
+/// `owned` holds the identities the user already has a local copy of: those
+/// entries are hidden, and only entries RomMFS itself hid are unhidden again.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_gamelists(
     catalogue: &Catalogue,
@@ -244,6 +265,7 @@ pub fn generate_gamelists(
     frontend: &FrontendGamelists,
     legacy: &BTreeMap<String, String>,
     artwork: &HashMap<(i64, &'static str), String>,
+    owned: &HashSet<(i64, i64)>,
     play: &mut PlaySync,
 ) -> anyhow::Result<MetadataPublication> {
     anyhow::ensure!(account_id > 0, "metadata requires a verified account");
@@ -360,9 +382,21 @@ pub fn generate_gamelists(
             },
             active: true,
             play: PlayBaseline::default(),
+            auto_hidden: false,
         });
         state.path = path;
         state.active = true;
+
+        // Auto-hide a copy the user already has. Ownership is recorded in the
+        // index, not the XML, so a `hidden` the user set by hand is left alone.
+        let owned_by_user = owned.contains(&(entry.key.rom_id, entry.key.file_id));
+        let was_auto_hidden = state.auto_hidden;
+        let already_hidden = hidden_true(&state.frontend_fields);
+        state.auto_hidden = owned_by_user && (was_auto_hidden || !already_hidden);
+        // Suppress the captured `hidden` node when RomMFS owns it (adding or
+        // removing); otherwise keep whatever the user wrote.
+        let suppress_hidden = state.auto_hidden || was_auto_hidden;
+        let emit_hidden = state.auto_hidden;
 
         // Reconcile play data before writing the entry. `emit_generated_play`
         // is false when the feature is off or a push failed, in which case the
@@ -489,7 +523,14 @@ pub fn generate_gamelists(
             if emit_generated_play && is_play_field(&nodes[0].0) {
                 continue;
             }
+            // RomMFS owns the hidden flag when it auto-hid this entry.
+            if suppress_hidden && nodes[0].0 == "hidden" {
+                continue;
+            }
             writer.get_mut().extend_from_slice(raw.as_bytes());
+        }
+        if emit_hidden {
+            field(&mut writer, "hidden", "true")?;
         }
         if emit_generated_play {
             for (name, text) in render_play_fields(&merged_play) {

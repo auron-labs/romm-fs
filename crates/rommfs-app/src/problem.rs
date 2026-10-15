@@ -1,5 +1,5 @@
 //! User-facing problem model: plain-language title and cause for the UI, with
-//! the raw diagnostic text kept only for the "Technical details" disclosure.
+//! the raw diagnostic text kept only for the "Details" disclosure.
 //! Everything here is pure so it can be unit-tested on any platform.
 
 use rommfs_core::error::Error;

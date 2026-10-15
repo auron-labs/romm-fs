@@ -60,6 +60,58 @@ the ROM's `fs_path`/`fs_name` determine its relative path. Nested paths are
 validated before projection; zero records and unsafe/out-of-platform paths are
 reported rather than converted into an empty successful download.
 
+### Catalogue speed and incremental refresh (source-backed)
+
+`GET /api/roms` computes four optional sidecars by default:
+`with_char_index`, `with_filter_values`, `with_rom_id_index` and `with_total`.
+RomMFS reads none of the three indexes/filter lists, so it sends all three as
+`false`; `with_total` is `true` on the first page only and `false` after it.
+The page limit is capped at `le=10_000` (`CustomLimitOffsetParams`); RomMFS
+requests 500 and honours the `limit` the server returns if it clamps lower.
+After the first page reports `total`, the remaining offsets are fetched four at
+a time and reassembled in offset order; the declared total, a matching `offset`,
+a first page of exactly `min(limit, total)`, a non-zero returned `limit`, and
+the absence of a short or over-long page before the total are the integrity
+checks.
+
+`updated_after` (ISO 8601 datetime with timezone) filters on `Rom.updated_at`.
+`GET /api/roms/identifiers` (`roms.read`) returns every visible ROM id,
+respecting hidden platforms and ROMs — the authoritative current id set for a
+delta merge. An incremental refresh fetches `/api/platforms`, the identifiers,
+and the ROMs changed after the previous refresh *start* minus a five-minute
+skew, then replaces changed ROMs, adds new ones and drops ids missing from the
+identifiers. A visible id that is neither in the snapshot nor in the delta, a
+missing `/identifiers` route, or a rejected `updated_after` (404/422) falls back
+to a full walk.
+
+**`updated_at` reliability.** `Rom.updated_at` is a `BaseModel` column with
+`onupdate`, and the server deliberately avoids no-op writes so it stays a usable
+incremental signal (`bulk_mark_present`, `sync_rom_files` only write changed
+rows). A rescan that changes only a ROM's *secondary* file rows
+(`sync_rom_files`) may not touch the `Rom` row itself, so a file-only change can
+be absent from the delta and from the identifiers. RomMFS therefore treats the
+delta as best-effort and runs a **full refresh at least every 24 h**
+(`CatalogueSnapshot.full_refreshed_at`), plus a full walk whenever the delta
+cannot be reconciled. This is a limitation of the pinned source, not a proven
+guarantee that every file change bumps `updated_at`.
+
+Sources: [ROM listing, `with_*` flags, `updated_after`, identifiers](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/endpoints/roms/__init__.py),
+[`Rom.updated_at` and no-op-write avoidance](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/handler/database/roms_handler.py).
+
+**Benchmark status (2026-10-15).** No live measurement was taken. The instance
+named in the plan (`romm.jcaks.net`) has no credentials configured in this
+environment, no RomM server is listening on `localhost:8080`, and the pinned
+harness image (`rommapp/romm:5.3.1`) is not present locally (only `latest`), so
+starting the harness would pull a different, unpinned server. The evidence for
+this change is therefore deterministic and fixture-based: the request-shape
+tests (`roms_page_disables_unused_sidecars_...`,
+`rom_identifiers_and_updated_after_are_sent_as_documented`) and the concurrency
+test (`concurrent_catalogue_pages_are_reassembled_in_offset_order`), which prove
+the four-page concurrency bound, offset-order reassembly and cancellation. A
+real page-size/flag timing comparison on a 2 471-ROM instance remains an open
+measurement.
+
+
 ## Download
 
 `GET /api/roms/{id}/content/{file_name}` (also supports HEAD)
@@ -167,6 +219,40 @@ Sources: [collections](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8
 [play-session ingestion](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/handler/play_session_handler.py),
 [ROM props and `RomUser`](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/endpoints/roms/__init__.py).
 
+## Memory cards (source-backed)
+
+Cards are per (user, emulator) and hold every game's saves, not one game's.
+`GET /api/memory-cards?emulator=<name>` (`assets.read`) lists the caller's own
+cards, newest-synced first; `MemoryCardSchema` carries `id`, `user_id`,
+`emulator`, `platform_id`, `name`, `slot` and `is_public`. `POST
+/api/memory-cards` (JSON `{name, emulator, platform_id?, is_public?}`,
+`assets.write`) creates an empty card; `platform_id` is a loose display hint
+only. `GET /api/memory-cards/{id}/versions` (`assets.read`) returns
+`MemoryCardVersionSchema` newest first with `id`, `memory_card_id`, `file_name`,
+`file_size_bytes`, `content_hash`, `download_path` and `missing_from_fs`.
+`GET /api/memory-cards/versions/{version_id}/content` and `GET
+/api/memory-cards/{id}/content` (the newest version) serve the stored zip;
+`POST /api/memory-cards/{id}/versions` (`assets.write`) uploads a new version as
+multipart field `cardFile`.
+
+The server refuses a bare card image (`.ps2`, `.raw`): a version must be a
+readable, safe zip, at most `MEMORY_CARD_MAX_BYTES` = 256 MB. `emulator` must
+match `^[A-Za-z0-9][A-Za-z0-9 ._-]*$`; RomMFS uses `duckstation` and `pcsx2`.
+RomMFS builds the archive itself and identifies a card by (server, account,
+emulator, name) with a baseline of the accepted version id plus the SHA-256 of
+the local card. Source:
+[memory cards](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/endpoints/memory_cards.py),
+[card storage](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/utils/memory_cards.py),
+[schemas](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/endpoints/responses/memory_cards.py),
+[zip hashing](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/handler/filesystem/assets_handler.py).
+
+Two points are **not** established by the pinned source and are treated as
+RomMFS assumptions, not contract: the internal layout the RetroBat broker
+unpacks onto a container, and whether other clients use the card `name` for the
+archive file name (the server itself names versions `"<name> [<ts>].card.zip"`).
+RomMFS writes entry names relative to the `memcards` folder and does not depend
+on the server's naming.
+
 ## File destinations and remaining limits
 
 | Content | API/source | Generic folders | RetroBat | Launchable metadata |
@@ -232,3 +318,21 @@ works unauthenticated while no users exist.
 Library layout inside container: `/romm/library/roms/<platform_fs_slug>/<file>`
 (and `/romm/library/bios/`). Platform `fs_slug` for nes/snes/gb is the
 directory name (e.g. `nes`, `snes`, `gb`).
+
+### Socket identity is cookie-only (spike result, 2026-10-15)
+
+The socket.io connect handler
+(`backend/endpoints/sockets/logs.py:connect`) resolves the caller with
+`utils.auth.get_session_from_environ`: the ASGI-scope session or, failing that,
+the `romm_session` cookie read from Redis. The socket.io `auth` payload is
+ignored, and the handler never rejects a connection — an unauthenticated socket
+still connects, but gets no identity and joins no room. Scan and sync events
+are emitted to all connected clients, so a non-admin socket receives them; the
+blocker is authentication, not authorization. RomMFS authenticates with an
+OAuth **bearer** token and does not hold the web session cookie, so it cannot
+subscribe to the socket. The real-time feature is therefore implemented as a
+bounded incremental poll (see `docs/architecture.md`), not a socket client; no
+socket library is added.
+
+Sources: [connect handler](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/endpoints/sockets/logs.py),
+[session resolution](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/utils/auth.py).

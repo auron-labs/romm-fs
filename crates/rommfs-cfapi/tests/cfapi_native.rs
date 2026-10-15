@@ -247,6 +247,7 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
         &FrontendGamelists::default(),
         &BTreeMap::new(),
         &HashMap::new(),
+        &std::collections::HashSet::new(),
         &mut PlaySync {
             enabled: false,
             remote: &HashMap::new(),

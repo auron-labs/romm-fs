@@ -299,7 +299,9 @@ impl Worker {
                     "Account needs assets.read and assets.write to synchronize saves".into(),
                 ));
             }
-            if self.save_sync_enabled {
+            let (_, card_config, _) = self.memory_card_plan(&scope);
+            let start_agent = self.save_sync_enabled || card_config.is_some();
+            if start_agent {
                 let directory = self.save_sync_storage_dir.as_ref().ok_or_else(|| {
                     Error::Unsupported("Save journal directory is unavailable".into())
                 })?;
@@ -308,23 +310,31 @@ impl Worker {
                     .as_ref()
                     .ok_or_else(|| Error::Auth("Connect before synchronizing saves".into()))?;
                 let epoch = self.current_save_sync_epoch;
-                if self.save_sync_gate.open(epoch) && self.save_sync_gate.enabled_for(epoch) {
+                let enablement = if self.save_sync_enabled {
+                    (self.save_sync_gate.open(epoch) && self.save_sync_gate.enabled_for(epoch))
+                        .then(|| self.save_sync_gate.enablement(epoch))
+                } else {
+                    Some(SaveSyncEnablement::Test(Arc::new(
+                        std::sync::atomic::AtomicBool::new(false),
+                    )))
+                };
+                if let Some(enablement) = enablement {
                     self.save_sync_agent = Some(SaveSyncAgent::start_with_rules(
                         scope,
                         self.save_sync_mapping_report
                             .as_ref()
-                            .expect("file plan exists")
-                            .mappings
-                            .clone(),
+                            .map(|report| report.mappings.clone())
+                            .unwrap_or_default(),
                         identity.clone(),
                         client.clone(),
                         directory.join("save-sync-journal.db"),
                         directory.join("save-sync-snapshots"),
                         self.save_sync_debounce_secs,
                         self.save_sync_session_id,
-                        self.save_sync_gate.enablement(epoch),
+                        enablement,
                         self.sink.clone(),
                         Some(rules),
+                        card_config,
                     )?);
                 }
             }
@@ -399,6 +409,7 @@ impl Worker {
             games,
             unmatched,
         });
+        self.refresh_memory_cards();
     }
 }
 
@@ -463,6 +474,7 @@ mod tests {
             retrobat_root: None,
             start_at_login: true,
             save_root: Some(root),
+            hide_owned_copies: true,
         });
         worker.server_id = Some(server_id_of(fixture.url()));
         worker.client = Some(Arc::new(RommClient::new(fixture.url()).unwrap()));
@@ -478,6 +490,7 @@ mod tests {
             platforms: vec![],
             roms: vec![],
             refreshed_at: 0,
+            full_refreshed_at: 0,
         });
         worker.save_sync_settings =
             Some(SaveSyncSettingsStore::open(directory.join("settings.db")).unwrap());
@@ -568,6 +581,7 @@ mod tests {
             platforms: vec![platform],
             roms,
             refreshed_at: 0,
+            full_refreshed_at: 0,
         });
     }
 

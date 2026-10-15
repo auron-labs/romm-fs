@@ -31,7 +31,7 @@ pub fn render(
             this.child(section)
         })
         .child(operations_section(view, cx))
-        .child(log_section(view, log_scroll, cx))
+        .child(log_section(view, window, log_scroll, cx))
 }
 
 /// One consistent treatment for anything needing action (phase 2a rule 5):
@@ -83,6 +83,24 @@ fn retry_button(
         .small()
         .on_click(cx.listener(move |view, _, _, cx| {
             action(view, cx);
+        }))
+}
+
+/// "Go fix this" for an attention row whose fix lives on a Settings tab.
+fn settings_action_button(
+    id: &'static str,
+    label: &'static str,
+    tab: usize,
+    cx: &mut Context<RommfsWindow>,
+) -> Button {
+    Button::new(id)
+        .label(label)
+        .outline()
+        .small()
+        .on_click(cx.listener(move |view, _, _, cx| {
+            view.active_view = 3;
+            view.settings_tab = tab;
+            cx.notify();
         }))
 }
 
@@ -224,11 +242,22 @@ fn attention_section(
     }
     if let Some(error) = &state.retrobat_setup_error {
         // SetupRetroBat needs the install + managed roots, which only the
-        // Settings page collects — no retry here.
+        // Settings page collects — the action opens the RetroBat tab.
         let problem = UserProblem::from_text("Couldn't finish RetroBat setup", error);
         rows.push(
-            problem_block("attention-retrobat-setup", &problem, None, window, cx)
-                .into_any_element(),
+            problem_block(
+                "attention-retrobat-setup",
+                &problem,
+                Some(settings_action_button(
+                    "attention-retrobat-settings",
+                    "RetroBat settings",
+                    2,
+                    cx,
+                )),
+                window,
+                cx,
+            )
+            .into_any_element(),
         );
     }
     if let Some(error) = &state.installer_error {
@@ -252,7 +281,9 @@ fn attention_section(
                 "attention-metadata",
                 "Frontend metadata refresh failed",
                 Some(error.clone()),
-                None,
+                Some(retry_button("retry-metadata", cx, |view, _| {
+                    view.controller.send(Command::RefreshMetadata);
+                })),
                 window,
                 cx,
             )
@@ -265,7 +296,12 @@ fn attention_section(
                 "attention-integration",
                 "Library layout change failed",
                 Some(error.clone()),
-                None,
+                Some(settings_action_button(
+                    "attention-integration-settings",
+                    "Open Settings",
+                    1,
+                    cx,
+                )),
                 window,
                 cx,
             )
@@ -329,10 +365,15 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
     match state.mount {
         MountState::Mounting => {
             let detail = match &state.mount_progress {
-                Some((stage, completed, total, elapsed)) => {
-                    operation_progress("mount-progress", stage, *completed, *total, *elapsed, cx)
-                        .into_any_element()
-                }
+                Some((stage, completed, total, elapsed)) => operation_progress(
+                    "mount-progress",
+                    stage_label(stage),
+                    *completed,
+                    *total,
+                    *elapsed,
+                    cx,
+                )
+                .into_any_element(),
                 None => Progress::new("mount-progress")
                     .loading(true)
                     .small()
@@ -368,7 +409,7 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
                 Some(
                     operation_progress(
                         "catalogue-progress",
-                        stage,
+                        stage_label(stage),
                         *completed,
                         *total,
                         *elapsed,
@@ -525,13 +566,38 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
 
     // Frontend metadata fetch
     if state.frontend_metadata_pending {
-        let detail = state
-            .frontend_metadata_detail
-            .as_ref()
-            .map(|detail| muted_xs(detail.clone(), cx).into_any_element());
-        running.push(
-            op_row(cx.theme().accent, "Fetching frontend metadata", detail).into_any_element(),
-        );
+        let detail = match state.frontend_metadata_progress {
+            Some((completed, total)) => v_flex()
+                .gap_1()
+                .when_some(state.frontend_metadata_detail.clone(), |this, stage| {
+                    this.child(muted_xs(stage, cx))
+                })
+                .child(muted_xs(
+                    format!("{} / {} artwork files", completed, total),
+                    cx,
+                ))
+                .child(
+                    Progress::new("metadata-progress")
+                        .value(if total > 0 {
+                            (100.0 * completed as f32 / total as f32).min(100.0)
+                        } else {
+                            0.0
+                        })
+                        .small(),
+                )
+                .into_any_element(),
+            None => {
+                let mut block = v_flex()
+                    .gap_1()
+                    .child(Progress::new("metadata-progress").loading(true).small());
+                if let Some(detail) = state.frontend_metadata_detail.clone() {
+                    block = block.child(muted_xs(detail, cx));
+                }
+                block.into_any_element()
+            }
+        };
+        running
+            .push(op_row(cx.theme().accent, "Frontend metadata", Some(detail)).into_any_element());
     }
 
     let idle = running.is_empty() && failed.is_empty() && recent.is_empty() && completed.is_empty();
@@ -601,6 +667,7 @@ fn level_visible(level: Level, min_level: usize) -> bool {
 
 fn log_section(
     view: &RommfsWindow,
+    window: &mut Window,
     log_scroll: ScrollHandle,
     cx: &mut Context<RommfsWindow>,
 ) -> impl IntoElement {
@@ -634,7 +701,7 @@ fn log_section(
     }
     let lines: Vec<AnyElement> = runs
         .into_iter()
-        .map(|(line, count)| render_log_line(line, count, cx).into_any_element())
+        .map(|(line, count)| render_log_line(line, count, window, cx).into_any_element())
         .collect();
     let empty_text = if log_empty {
         "No activity yet"
@@ -864,15 +931,9 @@ pub(in crate::window) fn format_log_line(line: &rommfs_core::events::LogLine) ->
 fn render_log_line(
     line: &rommfs_core::events::LogLine,
     count: usize,
-    cx: &App,
+    window: &mut Window,
+    cx: &mut Context<RommfsWindow>,
 ) -> impl IntoElement {
-    let time = div()
-        .text_color(cx.theme().muted_foreground)
-        .child(fmt_time(line.unix_secs));
-    let level = div()
-        .w_12()
-        .text_color(level_kind(line.level).color(cx))
-        .child(level_str(line.level));
     let body = if line.op.is_empty() {
         line.message.clone()
     } else {
@@ -883,11 +944,51 @@ fn render_log_line(
     } else {
         body
     };
+    // One line by default; the toggle reveals the whole entry. A short entry
+    // that still spans lines (embedded newlines) gets the toggle too (WS6.13).
+    let long = body.chars().count() > 72 || body.contains('\n') || body.contains('\r');
+    let key = SharedString::from(format!("log-line-{body}"));
+    let open = window.use_keyed_state(key.clone(), cx, |_, _| std::cell::Cell::new(false));
+    let is_open = open.read(cx).get();
+    let toggle = open.clone();
+    let time = div()
+        .flex_shrink_0()
+        .text_color(cx.theme().muted_foreground)
+        .child(fmt_time(line.unix_secs));
+    let level = div()
+        .w_12()
+        .flex_shrink_0()
+        .text_color(level_kind(line.level).color(cx))
+        .child(level_str(line.level));
     h_flex()
         .gap_2()
+        .items_start()
         .child(time)
         .child(level)
-        .child(div().text_color(cx.theme().foreground).child(body))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .text_color(cx.theme().foreground)
+                        .when(!is_open, |this| this.truncate().whitespace_nowrap())
+                        .child(body),
+                )
+                .when(long || is_open, |this| {
+                    this.child(
+                        Button::new(key)
+                            .ghost()
+                            .small()
+                            .label(if is_open { "Less" } else { "More" })
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                toggle.update(cx, |open, _| open.set(!open.get()));
+                                cx.notify();
+                            })),
+                    )
+                }),
+        )
 }
 fn fmt_bytes(n: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];

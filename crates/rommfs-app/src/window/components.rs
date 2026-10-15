@@ -83,9 +83,23 @@ pub(super) fn chip(text: impl Into<SharedString>) -> Tag {
     Tag::secondary().small().child(text.into())
 }
 
-/// "Technical details" disclosure for failure blocks: a quiet toggle plus
-/// the complete diagnostic text in mono. The full path and cause chain
-/// stay reachable even where the summary line is shortened (UI-PLAN §6).
+/// The one disclosure toggle (WS6.8): a left-aligned ghost button whose
+/// chevron turns as the section opens.
+fn disclosure_toggle(id: SharedString, open: bool, label: impl Into<SharedString>) -> Button {
+    Button::new(id)
+        .ghost()
+        .small()
+        .icon(Icon::new(if open {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        }))
+        .label(label)
+}
+
+/// The "Details" disclosure for failure blocks: a quiet toggle plus the
+/// complete diagnostic text in mono. The full path and cause chain stay
+/// reachable even where the summary line is shortened (UI-PLAN §6).
 pub(super) fn details_disclosure(
     id: impl Into<SharedString>,
     detail: String,
@@ -101,18 +115,15 @@ pub(super) fn details_disclosure(
     v_flex()
         .gap_1()
         .child(
-            Button::new(id)
-                .ghost()
-                .small()
-                .label(if is_open {
-                    "Hide technical details"
-                } else {
-                    "Technical details"
-                })
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    toggle.update(cx, |open, _| open.set(!open.get()));
-                    cx.notify();
-                })),
+            disclosure_toggle(
+                id,
+                is_open,
+                if is_open { "Hide details" } else { "Details" },
+            )
+            .on_click(cx.listener(move |_, _, _, cx| {
+                toggle.update(cx, |open, _| open.set(!open.get()));
+                cx.notify();
+            })),
         )
         .when(is_open, |this| {
             this.child(
@@ -168,7 +179,7 @@ pub(super) fn problem_block(
         })
 }
 
-/// A quiet toggle that expands to a plain list of lines.
+/// A quiet chevron toggle that expands to a plain list of lines.
 pub(super) fn notes_disclosure(
     id: &'static str,
     label: String,
@@ -184,14 +195,15 @@ pub(super) fn notes_disclosure(
     v_flex()
         .gap_1()
         .child(
-            Button::new(id)
-                .ghost()
-                .small()
-                .label(if is_open { "Hide".to_string() } else { label })
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    toggle.update(cx, |open, _| open.set(!open.get()));
-                    cx.notify();
-                })),
+            disclosure_toggle(
+                id.into(),
+                is_open,
+                if is_open { "Hide".to_string() } else { label },
+            )
+            .on_click(cx.listener(move |_, _, _, cx| {
+                toggle.update(cx, |open, _| open.set(!open.get()));
+                cx.notify();
+            })),
         )
         .when(is_open, |this| {
             this.children(lines.into_iter().map(|line| muted_xs(line, cx)))
@@ -247,6 +259,40 @@ pub(super) fn section_heading(text: &'static str) -> impl IntoElement {
         .child(text)
 }
 
+/// One row shape shared by Overview and Settings: a heading, a status dot and
+/// phrase, and an optional trailing action (phase 2d consistency pass).
+pub(super) fn status_row(
+    label: &'static str,
+    kind: StatusKind,
+    status: impl Into<SharedString>,
+    action: Option<Button>,
+    cx: &App,
+) -> impl IntoElement {
+    h_flex()
+        .justify_between()
+        .gap_3()
+        .child(section_heading(label))
+        .child(
+            h_flex()
+                .gap_3()
+                .items_center()
+                .child(status_marker(kind, status, cx))
+                .when_some(action, |this, button| this.child(button)),
+        )
+}
+
+/// Internal progress stage names → the words the user sees (WS6.2). The raw
+/// stage stays in the log; only the visible label is translated.
+pub(super) fn stage_label(stage: &str) -> &str {
+    match stage {
+        "Root preparation" => "Preparing games folder…",
+        "Placeholder creation" => "Preparing game files…",
+        "Catalogue pages" => "Fetching games…",
+        "Finalising library" => "Preparing your library…",
+        other => other,
+    }
+}
+
 /// ~24px page title (UI-PLAN §2 visual scale).
 pub(super) fn page_heading(text: &'static str) -> impl IntoElement {
     div()
@@ -279,23 +325,22 @@ pub(super) fn operation_progress(
     elapsed_ms: u64,
     cx: &App,
 ) -> impl IntoElement {
-    let count = total.map_or_else(
-        || completed.to_string(),
-        |total| format!("{completed} / {total}"),
-    );
+    // Indeterminate work has no honest count or time to show, so it shows only
+    // its stage (WS6.2).
+    let label = match total {
+        Some(total) => format!(
+            "{stage} · {completed} / {total} · {:.1}s",
+            elapsed_ms as f64 / 1000.0
+        ),
+        None => stage.to_string(),
+    };
     let percent = total
         .filter(|t| *t > 0)
         .map_or(0.0, |t| (100.0 * completed as f32 / t as f32).min(100.0));
-    v_flex()
-        .gap_1()
-        .child(muted(
-            format!("{stage} · {count} · {:.1}s", elapsed_ms as f64 / 1000.0),
-            cx,
-        ))
-        .child(
-            Progress::new(id)
-                .value(percent)
-                .loading(total.is_none())
-                .small(),
-        )
+    v_flex().gap_1().child(muted(label, cx)).child(
+        Progress::new(id)
+            .value(percent)
+            .loading(total.is_none())
+            .small(),
+    )
 }

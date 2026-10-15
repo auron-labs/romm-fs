@@ -80,7 +80,7 @@ pub(crate) fn run_elevated(
     installation: &Path,
     managed: &Path,
     server: &str,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<super::SetupReport> {
     let executable = wide(std::env::current_exe()?.as_os_str());
     let verb = wide(OsStr::new("runas"));
     let parameters = parameters(&[
@@ -128,7 +128,10 @@ pub(crate) fn run_elevated(
     anyhow::ensure!(code == 0, "Elevated RetroBat setup did not complete. Close RetroBat and its emulators, check folder access, then retry (helper exit code {code})");
     // Inspect only: the normal app never repeats privileged mutations.
     let outcome = rommfs_core::retrobat::inspect_setup(installation, managed, server)?;
-    Ok(vec![outcome.summary(), super::switch_status(installation)])
+    Ok(super::SetupReport {
+        messages: vec![outcome.summary(), super::switch_status(installation)],
+        skipped: outcome.skipped,
+    })
 }
 
 struct Process(windows_sys::Win32::Foundation::HANDLE);

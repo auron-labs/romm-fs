@@ -268,6 +268,7 @@ fn worker_loop_sweeps_again_after_the_mount_start_sweep() {
             installer: installer::InstallerJob::default(),
             metadata_job: None,
             metadata_handle: None,
+            metadata_job_id: 0,
             metadata_active: None,
             metadata_source: None,
             metadata_ready: None,
@@ -317,8 +318,10 @@ fn worker_loop_sweeps_again_after_the_mount_start_sweep() {
             play_data_enabled: false,
             play_data_available: false,
             play_data_problem: None,
+            hide_copies_count: 0,
             play_watch: None,
             play_watch_checked: Instant::now(),
+            next_catalogue_poll: None,
         };
         worker_loop_with_interval_from(cmd_rx, worker, Duration::from_millis(10));
     });
@@ -389,6 +392,7 @@ fn games_folder_apply_updates_the_session_config() {
         retrobat_root: None,
         start_at_login: false,
         save_root: None,
+        hide_owned_copies: true,
     });
 
     worker.set_mount_root("  /new/roms  ");

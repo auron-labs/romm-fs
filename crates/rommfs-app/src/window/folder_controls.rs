@@ -244,6 +244,19 @@ impl RommfsWindow {
             });
         let ready = summary == FolderSummary::Ready;
         let connected = self.state.conn == ConnectionState::Connected;
+        // With the RetroBat layout, a start that the setup check would refuse is
+        // not offered: run the update (migration) or finish setup first.
+        let start_blocked_reason =
+            if self.state.retrobat_setup_migration && !self.state.retrobat_setup_ok {
+                Some("Run the RetroBat update first.")
+            } else if self.state.integration == IntegrationMode::RetroBat
+                && !self.state.retrobat_setup_ok
+            {
+                Some("Finish setting up RetroBat first.")
+            } else {
+                None
+            };
+        let retro_setup_pending = start_blocked_reason.is_some();
 
         // The primary action this state offers (UI-PLAN §3 truth table).
         let primary: Option<Button> = match summary {
@@ -251,10 +264,17 @@ impl RommfsWindow {
                 Some(self.nav_button("overview-setup-folder", "Choose games folder", 4, true, cx))
             }
             FolderSummary::Stopped => configured.clone().map(|path| {
-                Button::new("start-mount")
+                let start = Button::new("start-mount")
                     .label("Start games folder")
                     .primary()
-                    .on_click(cx.listener(move |view, _, _, cx| view.start_mount(path.clone(), cx)))
+                    .disabled(retro_setup_pending)
+                    .on_click(
+                        cx.listener(move |view, _, _, cx| view.start_mount(path.clone(), cx)),
+                    );
+                match start_blocked_reason {
+                    Some(reason) => start.tooltip(reason),
+                    None => start,
+                }
             }),
             FolderSummary::Ready => configured.clone().map(|path| {
                 Button::new("open-mount")
@@ -271,12 +291,7 @@ impl RommfsWindow {
 
         v_flex()
             .gap_2()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .child(section_heading("Games folder"))
-                    .child(status_marker(mount_kind, mount_text, cx)),
-            )
+            .child(status_row("Games folder", mount_kind, mount_text, None, cx))
             .when_some(configured, |this, path| this.child(muted(path, cx)))
             .child(
                 h_flex()
@@ -334,17 +349,29 @@ impl RommfsWindow {
             .when_some(self.render_foreign_remediation(cx), |this, block| {
                 this.child(block)
             })
-            .when_some(self.state.catalogue, |this, (platforms, roms, skipped)| {
-                this.child(muted(
-                    format!(
-                        "{} platforms · {} ROMs · {} skipped",
-                        fmt_count(platforms),
-                        fmt_count(roms),
-                        fmt_count(skipped),
-                    ),
-                    cx,
-                ))
-            })
+            .when_some(
+                self.state.catalogue,
+                |this, (platforms, games, files, skipped)| {
+                    this.child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .flex_wrap()
+                            .child(muted(
+                                format!(
+                                    "{} · {} games · {} files",
+                                    plural(platforms, "platform"),
+                                    fmt_count(games),
+                                    fmt_count(files),
+                                ),
+                                cx,
+                            ))
+                            .when(skipped > 0, |this| {
+                                this.child(chip(format!("{} files not shown", fmt_count(skipped))))
+                            }),
+                    )
+                },
+            )
             .when_some(self.state.catalogue_refreshed_at, |this, timestamp| {
                 this.child(muted(
                     format!("Last complete catalogue: {}", relative_time(timestamp)),
@@ -396,7 +423,7 @@ impl RommfsWindow {
                 match self.state.mount_progress.clone() {
                     Some((stage, completed, total, elapsed)) => this.child(operation_progress(
                         "mount-progress",
-                        &stage,
+                        stage_label(&stage),
                         completed,
                         total,
                         elapsed,

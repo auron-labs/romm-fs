@@ -217,6 +217,7 @@ fn start_agent_with_mappings(
         1,
         enabled,
         sink,
+        None,
     )
     .unwrap()
 }

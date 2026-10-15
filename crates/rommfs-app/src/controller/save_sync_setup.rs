@@ -159,44 +159,60 @@ impl Worker {
                 }
             });
 
-        if self.save_sync_enabled && available {
-            if let (Some(scope), Some(report), Some(client), Some(identity)) = (
-                scope.as_ref(),
-                self.save_sync_mapping_report.as_ref(),
-                self.client.as_ref(),
-                self.save_sync_identity.as_ref(),
+        let (_, card_config, _) = match scope.as_ref() {
+            Some(scope) => self.memory_card_plan(scope),
+            None => (Vec::new(), None, None),
+        };
+        let save_start = self.save_sync_enabled
+            && available
+            && self
+                .save_sync_mapping_report
+                .as_ref()
+                .is_some_and(|report| !report.mappings.is_empty());
+        if (save_start || card_config.is_some()) && scope.is_some() {
+            if save_start && self.save_sync_storage_dir.is_none() {
+                self.save_sync_gate.close();
+                selected_problem = Some("No persistent save-sync directory is available.".into());
+            } else if let (Some(scope), Some(client), Some(identity), Some(settings_dir)) = (
+                scope.clone(),
+                self.client.clone(),
+                self.save_sync_identity.clone(),
+                self.save_sync_storage_dir.clone(),
             ) {
-                if !report.mappings.is_empty() {
-                    if let Some(settings_dir) = &self.save_sync_storage_dir {
-                        let journal_path = settings_dir.join("save-sync-journal.db");
-                        let spool_path = settings_dir.join("save-sync-snapshots");
-                        let epoch = self.current_save_sync_epoch;
-                        if self.save_sync_gate.open(epoch) && self.save_sync_gate.enabled_for(epoch)
-                        {
-                            match SaveSyncAgent::start(
-                                scope.clone(),
-                                report.mappings.clone(),
-                                identity.clone(),
-                                Arc::clone(client),
-                                journal_path,
-                                spool_path,
-                                self.save_sync_debounce_secs,
-                                self.save_sync_session_id,
-                                self.save_sync_gate.enablement(epoch),
-                                self.sink.clone(),
-                            ) {
-                                Ok(agent) => self.save_sync_agent = Some(agent),
-                                Err(error) => {
-                                    self.save_sync_gate.close();
-                                    selected_problem =
-                                        Some(format!("Save watcher could not start: {error}"));
-                                }
-                            }
+                let mappings = self
+                    .save_sync_mapping_report
+                    .as_ref()
+                    .map(|report| report.mappings.clone())
+                    .unwrap_or_default();
+                let epoch = self.current_save_sync_epoch;
+                let enablement = if save_start {
+                    (self.save_sync_gate.open(epoch) && self.save_sync_gate.enabled_for(epoch))
+                        .then(|| self.save_sync_gate.enablement(epoch))
+                } else {
+                    Some(SaveSyncEnablement::Test(Arc::new(
+                        std::sync::atomic::AtomicBool::new(false),
+                    )))
+                };
+                if let Some(enablement) = enablement {
+                    match SaveSyncAgent::start(
+                        scope,
+                        mappings,
+                        identity,
+                        Arc::clone(&client),
+                        settings_dir.join("save-sync-journal.db"),
+                        settings_dir.join("save-sync-snapshots"),
+                        self.save_sync_debounce_secs,
+                        self.save_sync_session_id,
+                        enablement,
+                        self.sink.clone(),
+                        card_config,
+                    ) {
+                        Ok(agent) => self.save_sync_agent = Some(agent),
+                        Err(error) => {
+                            self.save_sync_gate.close();
+                            selected_problem =
+                                Some(format!("Save watcher could not start: {error}"));
                         }
-                    } else {
-                        self.save_sync_gate.close();
-                        selected_problem =
-                            Some("No persistent save-sync directory is available.".into());
                     }
                 }
             }
@@ -250,6 +266,7 @@ impl Worker {
                     .enabled_for(self.current_save_sync_epoch),
             debounce_secs: self.save_sync_debounce_secs,
         });
+        self.refresh_memory_cards();
     }
 
     pub(super) fn select_save_sync_installation(&mut self, path: &Path) {

@@ -2,7 +2,9 @@
 //! Drives workers via commands, consumes `AppEvent`s into `UiState`.
 //! Tests exercise this path — no duplicate state machine in the UI (PRD §6).
 
-use crate::save_sync_agent::{SaveSyncAgent, SaveSyncCommandGate};
+use crate::save_sync_agent::{
+    MemoryCardConfig, SaveSyncAgent, SaveSyncCommandGate, SaveSyncEnablement,
+};
 use anyhow::Context as _;
 use rommfs_core::cache::clock::{Clock, SystemClock, DEFAULT_EVICTION_THRESHOLD_SECS};
 #[cfg(not(windows))]
@@ -18,19 +20,22 @@ use rommfs_core::connection_settings::{
 use rommfs_core::download::{ContentSource, DownloadManager};
 use rommfs_core::error::{Error, Result};
 use rommfs_core::events::{
-    AppEvent, EventSink, ForeignEntry, ForeignKind, Level, LogBuffer, SaveSyncGameStatus,
-    SaveSyncQueueStatus,
+    AppEvent, EventSink, ForeignEntry, ForeignKind, Level, LogBuffer, MemoryCardConflictStatus,
+    MemoryCardFolderStatus, SaveSyncGameStatus, SaveSyncQueueStatus,
 };
 use rommfs_core::filesystem::RommFs;
-use rommfs_core::romm::{Credentials, PairedSession, PairingPoll, PairingRequest, RommClient};
+use rommfs_core::romm::{
+    iso8601_utc, Credentials, PairedSession, PairingPoll, PairingRequest, RomDto, RommClient,
+    RomsPage,
+};
 use rommfs_core::save_sync::{
-    discover_installations, map_catalogue, resolve_retrobat_gb_profile, validate_installation,
-    ConsentSettings, DiscoveryInput, InstallationCandidate, InstallationProblem, MappingReport,
-    RetroBatGbProfile, SaveSyncJournal, SaveSyncScope, SaveSyncSettingsStore, SnapshotState,
-    UnmatchedFile,
+    discover_card_folders, discover_installations, map_catalogue, resolve_retrobat_gb_profile,
+    validate_installation, ConsentSettings, DiscoveryInput, InstallationCandidate,
+    InstallationProblem, MappingReport, RetroBatGbProfile, SaveSyncJournal, SaveSyncScope,
+    SaveSyncSettingsStore, SnapshotState, UnmatchedFile,
 };
 use rommfs_core::tree::RommTree;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -47,6 +52,7 @@ mod catalogue;
 mod commands;
 mod connection;
 mod installer;
+mod memory_cards;
 mod mount;
 mod play_data;
 mod retrobat_setup;
@@ -55,6 +61,23 @@ mod save_sync_setup;
 mod state;
 
 const EVICTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Page size for the catalogue walk. RomM caps the limit at 10 000; the
+/// returned `limit` is respected if the server clamps it lower.
+const CATALOGUE_PAGE_LIMIT: u64 = 500;
+/// How many catalogue pages are fetched at once after the first page.
+const CATALOGUE_PAGE_CONCURRENCY: usize = 4;
+/// A snapshot whose last full refresh is older than this gets a full refresh
+/// again, because the server's `updated_at` signal may not cover a rescan that
+/// only added, removed or renamed files.
+const FULL_REFRESH_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+/// Overlap subtracted from the last refresh start when asking for changed
+/// ROMs, so a ROM written while the previous fetch ran is not missed.
+const INCREMENTAL_SKEW_SECS: u64 = 5 * 60;
+/// How often the connected session polls for catalogue changes. This is the
+/// real-time fallback: the RomM socket.io connect handler resolves identity
+/// from the web session cookie only, so a bearer-only session cannot subscribe.
+const CATALOGUE_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Owns the worker session (client + catalogue + mount + evict timer).
 /// Created on Connect; events flow back over the `EventSink` channel.
@@ -188,6 +211,9 @@ struct Worker {
     installer: installer::InstallerJob,
     metadata_job: Option<mpsc::Receiver<Result<rommfs_core::retrobat::ArtworkBatch>>>,
     metadata_handle: Option<JoinHandle<()>>,
+    /// Monotonic identity of the current artwork pass; progress from an earlier
+    /// pass carries a smaller id and is dropped by the UI.
+    metadata_job_id: u64,
     metadata_active: Option<Arc<std::sync::atomic::AtomicBool>>,
     metadata_source: Option<(Catalogue, CatalogueSnapshot)>,
     metadata_ready: Option<rommfs_core::retrobat::ArtworkBatch>,
@@ -241,10 +267,15 @@ struct Worker {
     play_data_enabled: bool,
     play_data_available: bool,
     play_data_problem: Option<String>,
+    /// How many entries the last metadata pass hid ("hide RomM copies").
+    hide_copies_count: usize,
     /// Linked gamelist modification times seen at the last check. `None` means
     /// the watch is not running.
     play_watch: Option<HashMap<String, Option<std::time::SystemTime>>>,
     play_watch_checked: Instant,
+    /// Deadline for the next incremental catalogue poll — the real-time
+    /// fallback while no socket is used. `None` while disconnected.
+    next_catalogue_poll: Option<Instant>,
 }
 
 impl Worker {
@@ -263,6 +294,7 @@ impl Worker {
             installer: installer::InstallerJob::default(),
             metadata_job: None,
             metadata_handle: None,
+            metadata_job_id: 0,
             metadata_active: None,
             metadata_source: None,
             metadata_ready: None,
@@ -310,8 +342,10 @@ impl Worker {
             play_data_enabled: false,
             play_data_available: false,
             play_data_problem: None,
+            hide_copies_count: 0,
             play_watch: None,
             play_watch_checked: Instant::now(),
+            next_catalogue_poll: None,
         }
     }
 
@@ -396,6 +430,7 @@ fn worker_loop_with_interval_from(
         worker.reap_draining();
         worker.poll_pairing();
         worker.poll_catalogue_refresh();
+        worker.poll_catalogue_refresh_timer();
         worker.poll_play_watch();
         worker.poll_metadata();
         if worker.installer.poll(&worker.sink) {
@@ -425,6 +460,10 @@ fn worker_loop_with_interval_from(
                     .saturating_duration_since(Instant::now())
                     .min(play_data::PLAY_WATCH_INTERVAL),
             )
+        } else if let Some(deadline) = worker.next_catalogue_poll {
+            // Connected but idle: wake for the next incremental catalogue poll.
+            next_eviction = None;
+            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
         } else {
             next_eviction = None;
             rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
@@ -508,6 +547,7 @@ fn worker_loop_with_interval_from(
             Command::StopMount => worker.stop_mount(),
             Command::RestartMount { path } => worker.restart_mount(path),
             Command::RefreshCatalogue => worker.refresh_catalogue(),
+            Command::RefreshMetadata => worker.queue_metadata(),
             Command::RefreshSaveSync => worker.refresh_save_sync(),
             Command::SelectSaveSyncInstallation { path } => {
                 worker.select_save_sync_installation(path)
@@ -515,11 +555,17 @@ fn worker_loop_with_interval_from(
             Command::SetSaveSyncEnabled { enabled } => worker.set_save_sync_enabled(*enabled),
             Command::SetSaveSyncDebounce { seconds } => worker.set_save_sync_debounce(*seconds),
             Command::SetPlayDataSync { enabled } => worker.set_play_data_enabled(*enabled),
+            Command::SetHideOwnedCopies { enabled } => worker.set_hide_owned_copies(*enabled),
             Command::ExportSaveSyncIncoming {
                 session_id,
                 incoming_id,
                 destination,
             } => worker.export_save_sync_incoming(*session_id, incoming_id, destination),
+            Command::SetMemoryCardFolderEnabled {
+                emulator,
+                relative_dir,
+                enabled,
+            } => worker.set_memory_card_folder_enabled(emulator, relative_dir, *enabled),
             Command::Shutdown => {
                 worker.cancel_auxiliary();
                 worker.installer.cancel(&worker.sink);
@@ -554,17 +600,21 @@ fn worker_loop_with_interval_from(
                 Command::SetupRetroBat { .. } => worker.sink.emit(AppEvent::RetroBatSetup {
                     running: false,
                     detail: "RetroBat setup stopped".into(),
+                    skipped: Vec::new(),
                     error: Some(format!("internal error: {msg}")),
                 }),
                 Command::RemoveForeignLinks { .. } => {}
                 Command::SetIntegration { .. }
                 | Command::RefreshCatalogue
+                | Command::RefreshMetadata
                 | Command::RefreshSaveSync
                 | Command::SelectSaveSyncInstallation { .. }
                 | Command::SetSaveSyncEnabled { .. }
                 | Command::SetSaveSyncDebounce { .. }
                 | Command::SetPlayDataSync { .. }
-                | Command::ExportSaveSyncIncoming { .. } => {}
+                | Command::SetHideOwnedCopies { .. }
+                | Command::ExportSaveSyncIncoming { .. }
+                | Command::SetMemoryCardFolderEnabled { .. } => {}
                 Command::SelectSaveFolder { .. }
                 | Command::AssociateSaveFile { .. }
                 | Command::AssociateSaveFolder { .. } => {}
@@ -601,12 +651,52 @@ fn fetch_catalogue(
     client: &RommClient,
     sink: &EventSink,
     operation_id: u64,
+    prior: Option<CatalogueSnapshot>,
 ) -> Result<CatalogueSnapshot> {
     let started = Instant::now();
-    let request_started = Instant::now();
+    let started_unix = rommfs_core::cache::now_unix_secs();
     if !sink.is_active() {
         return Err(Error::Cancelled);
     }
+    // Incremental when a snapshot for this server/account exists and its last
+    // full refresh is recent. A server that rejects `updated_after` or
+    // `/identifiers`, or a delta that cannot be reconciled, falls back to the
+    // full walk below; an auth or permission failure is not hidden by one.
+    if let Some(prior) = prior.filter(|prior| {
+        started_unix.saturating_sub(prior.full_refreshed_at) < FULL_REFRESH_MAX_AGE_SECS
+    }) {
+        match fetch_catalogue_incremental(client, sink, operation_id, &prior, started, started_unix)
+        {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) if incremental_can_fall_back(&error) => {
+                sink.emit(AppEvent::log(
+                    Level::Info,
+                    "catalogue",
+                    format!(
+                        "operation={operation_id} incremental refresh unavailable, running a full refresh: {error}"
+                    ),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    fetch_catalogue_full(client, sink, operation_id, started, started_unix)
+}
+
+/// An incremental failure falls back to a full refresh unless it is a
+/// cancellation or a session/permission problem the full walk would hit too.
+fn incremental_can_fall_back(error: &Error) -> bool {
+    !error.needs_sign_in() && !matches!(error, Error::Cancelled | Error::Forbidden(_))
+}
+
+fn fetch_catalogue_full(
+    client: &RommClient,
+    sink: &EventSink,
+    operation_id: u64,
+    started: Instant,
+    started_unix: u64,
+) -> Result<CatalogueSnapshot> {
+    let request_started = Instant::now();
     let platforms = client.platforms();
     sink.emit(AppEvent::log(
         Level::Info,
@@ -614,55 +704,16 @@ fn fetch_catalogue(
         format!(
             "operation={operation_id} GET /api/platforms elapsed_ms={} result={}",
             request_started.elapsed().as_millis(),
-            if platforms.is_ok() {
-                "ok".into()
-            } else {
-                platforms.as_ref().expect_err("failed result").to_string()
-            }
+            http_result(&platforms)
         ),
     ));
     let platforms = platforms?;
-    let mut roms = Vec::new();
-    loop {
-        if !sink.is_active() {
-            return Err(Error::Cancelled);
-        }
-        let offset = roms.len() as u64;
-        let request_started = Instant::now();
-        let page = client.roms_page(200, offset);
-        sink.emit(AppEvent::log(Level::Info, "http", format!("operation={operation_id} GET /api/roms limit=200 offset={offset} elapsed_ms={} result={}", request_started.elapsed().as_millis(), if page.is_ok() { "ok".into() } else { page.as_ref().expect_err("failed result").to_string() })));
-        let page = page?;
-        let count = page.items.len();
-        let total = page.total;
-        if page.offset != offset {
-            return Err(Error::InvalidCatalogue(
-                "catalogue pagination offset did not advance correctly".into(),
-            ));
-        }
-        roms.extend(page.items);
-        sink.emit(AppEvent::CatalogueProgress {
-            operation_id,
-            stage: "Catalogue pages".into(),
-            completed: roms.len() as u64,
-            total,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-        });
-        match total {
-            Some(total) if roms.len() as u64 >= total => break,
-            Some(_) if count == 0 => {
-                return Err(Error::InvalidCatalogue(
-                    "catalogue ended before declared total".into(),
-                ))
-            }
-            None if count < 200 => break,
-            _ => {}
-        }
-    }
+    let roms = fetch_rom_pages(client, sink, operation_id, None, started)?;
     sink.emit(AppEvent::log(
         Level::Info,
         "catalogue",
         format!(
-            "operation={operation_id} fetched {} platforms and {} ROMs in {}ms",
+            "operation={operation_id} fetched {} platforms and {} ROMs in {}ms kind=full",
             platforms.len(),
             roms.len(),
             started.elapsed().as_millis()
@@ -671,8 +722,302 @@ fn fetch_catalogue(
     Ok(CatalogueSnapshot {
         platforms,
         roms,
-        refreshed_at: rommfs_core::cache::now_unix_secs(),
+        refreshed_at: started_unix,
+        full_refreshed_at: started_unix,
     })
+}
+
+/// Merge `updated_after=<last refresh start − skew>` against the snapshot and
+/// the authoritative identifier set: replace changed ROMs, add new ones and
+/// drop deleted ones. An id that is visible but neither in the snapshot nor in
+/// the delta cannot be reconciled here, so the caller runs a full refresh.
+fn fetch_catalogue_incremental(
+    client: &RommClient,
+    sink: &EventSink,
+    operation_id: u64,
+    prior: &CatalogueSnapshot,
+    started: Instant,
+    started_unix: u64,
+) -> Result<CatalogueSnapshot> {
+    let request_started = Instant::now();
+    let platforms = client.platforms();
+    sink.emit(AppEvent::log(
+        Level::Info,
+        "http",
+        format!(
+            "operation={operation_id} GET /api/platforms elapsed_ms={} result={}",
+            request_started.elapsed().as_millis(),
+            http_result(&platforms)
+        ),
+    ));
+    let platforms = platforms?;
+    if !sink.is_active() {
+        return Err(Error::Cancelled);
+    }
+    let request_started = Instant::now();
+    let identifiers = client.rom_identifiers();
+    sink.emit(AppEvent::log(
+        Level::Info,
+        "http",
+        format!(
+            "operation={operation_id} GET /api/roms/identifiers elapsed_ms={} result={}",
+            request_started.elapsed().as_millis(),
+            http_result(&identifiers)
+        ),
+    ));
+    let identifier_set: HashSet<i64> = identifiers?.into_iter().collect();
+    // Cover the whole window since the previous refresh *start*, with a skew
+    // so a ROM written while that refresh ran is not missed.
+    let updated_after = iso8601_utc(prior.refreshed_at.saturating_sub(INCREMENTAL_SKEW_SECS));
+    let delta = fetch_rom_pages(client, sink, operation_id, Some(&updated_after), started)?;
+
+    let prior_ids: HashSet<i64> = prior.roms.iter().map(|rom| rom.id).collect();
+    let delta_map: HashMap<i64, RomDto> = delta
+        .into_iter()
+        .filter(|rom| identifier_set.contains(&rom.id))
+        .map(|rom| (rom.id, rom))
+        .collect();
+    // Keep the snapshot's order, applying each changed ROM in place.
+    let mut roms: Vec<RomDto> = Vec::with_capacity(identifier_set.len());
+    for rom in &prior.roms {
+        if !identifier_set.contains(&rom.id) {
+            continue;
+        }
+        roms.push(
+            delta_map
+                .get(&rom.id)
+                .cloned()
+                .unwrap_or_else(|| rom.clone()),
+        );
+    }
+    let mut added: Vec<i64> = delta_map
+        .keys()
+        .filter(|id| !prior_ids.contains(id))
+        .copied()
+        .collect();
+    added.sort_unstable();
+    for id in added {
+        if let Some(rom) = delta_map.get(&id) {
+            roms.push(rom.clone());
+        }
+    }
+    if roms.len() != identifier_set.len() {
+        return Err(Error::InvalidCatalogue(
+            "incremental refresh could not reconcile every visible ROM id".into(),
+        ));
+    }
+    sink.emit(AppEvent::log(
+        Level::Info,
+        "catalogue",
+        format!(
+            "operation={operation_id} fetched {} platforms and {} ROMs in {}ms kind=incremental",
+            platforms.len(),
+            roms.len(),
+            started.elapsed().as_millis()
+        ),
+    ));
+    Ok(CatalogueSnapshot {
+        platforms,
+        roms,
+        refreshed_at: started_unix,
+        full_refreshed_at: prior.full_refreshed_at,
+    })
+}
+
+/// Fetch every page of `GET /api/roms` (optionally filtered by
+/// `updated_after`). The first page reports the total; the rest are fetched
+/// `CATALOGUE_PAGE_CONCURRENCY` at a time and reassembled in offset order. The
+/// declared total is authoritative: a mismatched offset, a first page that is
+/// not exactly `min(limit, total)`, a short page before the total, or a
+/// reassembly count that does not match fails the fetch.
+fn fetch_rom_pages(
+    client: &RommClient,
+    sink: &EventSink,
+    operation_id: u64,
+    updated_after: Option<&str>,
+    started: Instant,
+) -> Result<Vec<RomDto>> {
+    if !sink.is_active() {
+        return Err(Error::Cancelled);
+    }
+    let request_started = Instant::now();
+    let first = client.roms_page_flagged(CATALOGUE_PAGE_LIMIT, 0, true, updated_after);
+    sink.emit(AppEvent::log(
+        Level::Info,
+        "http",
+        format!(
+            "operation={operation_id} GET /api/roms limit={CATALOGUE_PAGE_LIMIT} offset=0 elapsed_ms={} result={}",
+            request_started.elapsed().as_millis(),
+            http_result(&first)
+        ),
+    ));
+    let first = first?;
+    if first.offset != 0 {
+        return Err(Error::InvalidCatalogue(
+            "catalogue pagination offset did not advance correctly".into(),
+        ));
+    }
+    // Respect the server's effective limit when it clamps the request, but a
+    // zero limit cannot page and must not be silently replaced.
+    let limit = first.limit;
+    if limit == 0 {
+        return Err(Error::InvalidCatalogue(
+            "catalogue reported a zero page limit".into(),
+        ));
+    }
+    let first_count = first.items.len() as u64;
+    if first_count > limit {
+        return Err(Error::InvalidCatalogue(
+            "catalogue page exceeded the requested limit".into(),
+        ));
+    }
+    let mut roms = first.items;
+    let total = first.total;
+    emit_catalogue_pages_progress(sink, operation_id, first_count, total, started);
+    if !sink.is_active() {
+        return Err(Error::Cancelled);
+    }
+    let Some(total) = total else {
+        // An older server that ignores `with_total`: walk sequentially until a
+        // short page. A first page that is already short is the whole
+        // catalogue, so no further request is made.
+        if first_count == limit {
+            let mut offset = first_count;
+            loop {
+                if !sink.is_active() {
+                    return Err(Error::Cancelled);
+                }
+                let page = client.roms_page_flagged(limit, offset, false, updated_after)?;
+                if page.offset != offset {
+                    return Err(Error::InvalidCatalogue(
+                        "catalogue pagination offset did not advance correctly".into(),
+                    ));
+                }
+                let count = page.items.len() as u64;
+                if count > limit {
+                    return Err(Error::InvalidCatalogue(
+                        "catalogue page exceeded the requested limit".into(),
+                    ));
+                }
+                roms.extend(page.items);
+                emit_catalogue_pages_progress(sink, operation_id, roms.len() as u64, None, started);
+                if count < limit {
+                    break;
+                }
+                offset += count;
+            }
+        }
+        return Ok(roms);
+    };
+    // With a declared total the first page must be exactly full, or exactly the
+    // total when the whole catalogue fits on one page.
+    let expected_first = limit.min(total);
+    if first_count != expected_first {
+        return Err(Error::InvalidCatalogue(format!(
+            "catalogue first page had {first_count} of {expected_first} expected items"
+        )));
+    }
+    if first_count >= total {
+        return Ok(roms);
+    }
+    let mut offsets = Vec::new();
+    let mut offset = first_count;
+    while offset < total {
+        offsets.push(offset);
+        offset += limit;
+    }
+    for chunk in offsets.chunks(CATALOGUE_PAGE_CONCURRENCY) {
+        if !sink.is_active() {
+            return Err(Error::Cancelled);
+        }
+        let pages: Vec<(u64, u128, Result<RomsPage>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|&offset| {
+                    scope.spawn(move || {
+                        let request_started = Instant::now();
+                        let page = client.roms_page_flagged(limit, offset, false, updated_after);
+                        (offset, request_started.elapsed().as_millis(), page)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| {
+                        (
+                            0,
+                            0,
+                            Err(Error::Transport("catalogue page worker panicked".into())),
+                        )
+                    })
+                })
+                .collect()
+        });
+        for (offset, elapsed, page) in pages {
+            sink.emit(AppEvent::log(
+                Level::Info,
+                "http",
+                format!(
+                    "operation={operation_id} GET /api/roms limit={limit} offset={offset} elapsed_ms={elapsed} result={}",
+                    http_result(&page)
+                ),
+            ));
+            let page = page?;
+            if page.offset != offset {
+                return Err(Error::InvalidCatalogue(
+                    "catalogue pagination offset did not advance correctly".into(),
+                ));
+            }
+            let count = page.items.len() as u64;
+            if count > limit {
+                return Err(Error::InvalidCatalogue(
+                    "catalogue page exceeded the requested limit".into(),
+                ));
+            }
+            if count != limit && offset + count < total {
+                return Err(Error::InvalidCatalogue(
+                    "catalogue page ended before the declared total".into(),
+                ));
+            }
+            roms.extend(page.items);
+        }
+        emit_catalogue_pages_progress(sink, operation_id, roms.len() as u64, Some(total), started);
+        if !sink.is_active() {
+            return Err(Error::Cancelled);
+        }
+    }
+    if roms.len() as u64 != total {
+        return Err(Error::InvalidCatalogue(format!(
+            "catalogue reassembly mismatch: {} of {}",
+            roms.len(),
+            total
+        )));
+    }
+    Ok(roms)
+}
+
+fn emit_catalogue_pages_progress(
+    sink: &EventSink,
+    operation_id: u64,
+    completed: u64,
+    total: Option<u64>,
+    started: Instant,
+) {
+    sink.emit(AppEvent::CatalogueProgress {
+        operation_id,
+        stage: "Catalogue pages".into(),
+        completed,
+        total,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    });
+}
+
+fn http_result<T>(result: &Result<T>) -> String {
+    match result {
+        Ok(_) => "ok".into(),
+        Err(error) => error.to_string(),
+    }
 }
 
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -743,6 +1088,111 @@ pub(crate) fn stopped_retrobat_guard(installation: &Path) -> anyhow::Result<Vec<
     {
         Ok(Vec::new())
     }
+}
+
+/// Whether a PS1/PS2 card emulator image is clear to touch a card.
+pub(crate) enum CardEmulatorState {
+    /// Exclusive handles are held for the pass.
+    Stopped(Vec<std::fs::File>),
+    /// An emulator image is open, so a shared card may be in use.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Running,
+    /// The guard could not be established; the caller must not sync.
+    Unavailable(String),
+}
+
+/// Deny card access while a DuckStation or PCSX2 image is open. Instead of
+/// guessing executable names, every executable inside each installed emulator
+/// folder is opened exclusively; an installed folder with no executable yields
+/// [`CardEmulatorState::Unavailable`], never a silent pass.
+pub(crate) fn card_emulator_state(installation: &Path) -> CardEmulatorState {
+    if let Err(error) = rommfs_core::save_sync::ensure_no_reparse_components(installation) {
+        return CardEmulatorState::Unavailable(error.to_string());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut guards = Vec::new();
+        for emulator in ["duckstation", "pcsx2"] {
+            let directory = installation.join("emulators").join(emulator);
+            match std::fs::symlink_metadata(&directory) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return CardEmulatorState::Unavailable(format!(
+                        "{} is not a directory",
+                        directory.display()
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return CardEmulatorState::Unavailable(error.to_string()),
+            }
+            let mut executables = Vec::new();
+            if let Err(error) = collect_executables(&directory, 0, &mut executables) {
+                return CardEmulatorState::Unavailable(error.to_string());
+            }
+            if executables.is_empty() {
+                return CardEmulatorState::Unavailable(format!(
+                    "no executable found under {}",
+                    directory.display()
+                ));
+            }
+            for path in executables {
+                if let Err(error) = rommfs_core::save_sync::ensure_no_reparse_components(&path) {
+                    return CardEmulatorState::Unavailable(error.to_string());
+                }
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .share_mode(0)
+                    .open(&path)
+                {
+                    Ok(file) => guards.push(file),
+                    Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33)) => {
+                        return CardEmulatorState::Running
+                    }
+                    Err(error) => {
+                        return CardEmulatorState::Unavailable(format!(
+                            "{}: {error}",
+                            path.display()
+                        ))
+                    }
+                }
+            }
+        }
+        CardEmulatorState::Stopped(guards)
+    }
+    #[cfg(not(windows))]
+    {
+        CardEmulatorState::Stopped(Vec::new())
+    }
+}
+
+#[cfg(windows)]
+fn collect_executables(
+    directory: &Path,
+    depth: u32,
+    out: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    if depth > 3 {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_executables(&path, depth + 1, out)?;
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn check_mount_root(root: &Path, server_id: &str) -> Result<()> {

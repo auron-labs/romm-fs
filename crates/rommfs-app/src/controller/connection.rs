@@ -31,6 +31,7 @@ impl Worker {
         self.save_sync_enabled = false;
         self.names.clear();
         self.fs = None;
+        self.next_catalogue_poll = None;
 
         let client = match RommClient::new(url) {
             Ok(c) => Arc::new(c),
@@ -94,17 +95,21 @@ impl Worker {
                     retrobat_root: None,
                     start_at_login: false,
                     save_root: None,
+                    hide_owned_copies: true,
                 });
             }
         }
         self.emit_integration(None);
         self.client = Some(Arc::clone(&client));
         self.server_id = Some(server_id_of(url));
+        // Arm the real-time fallback poll for this session.
+        self.next_catalogue_poll = Some(Instant::now() + CATALOGUE_POLL_INTERVAL);
         self.catalogue_account = identity
             .as_ref()
             .map(|identity| identity.account_id.to_string());
         self.save_sync_identity = identity;
         self.refresh_play_data();
+        self.refresh_hide_copies();
         self.sink.emit(AppEvent::Connected);
         // Connecting cleared the remembered host/folder facts when this
         // sign-in began; now that the session is authenticated, republish
@@ -273,6 +278,7 @@ impl Worker {
                 retrobat_root: None,
                 start_at_login: false,
                 save_root: None,
+                hide_owned_copies: true,
             });
         preferences.device_identifier = pairing.identifier.clone();
         // A credential-store failure leaves the authenticated in-memory session
@@ -382,6 +388,7 @@ impl Worker {
         self.source_snapshot = None;
         self.catalogue_account = None;
         self.names.clear();
+        self.next_catalogue_poll = None;
         self.save_sync_catalogue = None;
         self.save_sync_identity = None;
         self.save_sync_scope = None;
@@ -428,5 +435,6 @@ impl Worker {
         self.sink.emit(AppEvent::SignedOut);
         self.refresh_save_sync();
         self.refresh_play_data();
+        self.refresh_hide_copies();
     }
 }

@@ -1,5 +1,6 @@
 use super::super::*;
 use crate::controller::{parse_progress_counts, RetroBatStep, StepStatus};
+use rommfs_core::retrobat::SkippedSystem;
 
 /// The Settings tabs (phase 2c). The selected index lives in view state.
 const SETTINGS_TABS: [&str; 5] = ["Account", "Games folder", "RetroBat", "Saves", "App"];
@@ -154,14 +155,25 @@ impl RommfsWindow {
     ) -> impl IntoElement {
         let locked = self.settings_locked();
         let connected = self.state.conn == ConnectionState::Connected;
-        let empty = self.mount_input.read(cx).value().trim().is_empty();
-        let can_apply = !locked && connected && !empty;
+        let typed = self.mount_input.read(cx).value().trim().to_string();
+        let empty = typed.is_empty();
+        // Apply is only meaningful when the field differs from the folder in
+        // use (WS6.7).
+        let changed = self
+            .state
+            .mount_path
+            .clone()
+            .or_else(|| self.state.configured_mount_root.clone())
+            .is_none_or(|current| !current.eq_ignore_ascii_case(&typed));
+        let can_apply = !locked && connected && !empty && changed;
         let apply_reason = if locked {
             "Stop the games folder first."
         } else if !connected {
             "Connect to RomM first."
-        } else {
+        } else if empty {
             "Enter or browse to a folder."
+        } else {
+            "This is already the games folder."
         };
         let browse = Button::new("settings-browse-folder")
             .label("Browse…")
@@ -257,6 +269,17 @@ impl RommfsWindow {
         let locked = self.settings_locked();
         let steps = self.state.retrobat_steps();
         let primary = steps.primary();
+        // A finished support step with issues shows "Done · N need attention"
+        // in its header instead of a green "Done" beside the count (WS6.9).
+        let support_note = (steps.support == StepStatus::Done)
+            .then(|| {
+                self.state.auxiliary_summary.as_ref().and_then(|summary| {
+                    auxiliary_headline(summary.published, summary.unchanged, &summary.warnings)
+                        .1
+                        .map(|note| SharedString::from(format!("Done · {note}")))
+                })
+            })
+            .flatten();
         let install_body = self
             .retrobat_install_step(primary == Some(RetroBatStep::Install), window, cx)
             .into_any_element();
@@ -279,7 +302,7 @@ impl RommfsWindow {
         tab.child(self.retrobat_step(
             0,
             "Install RetroBat",
-            steps.install,
+            (steps.install, None),
             install_body,
             window,
             cx,
@@ -287,7 +310,7 @@ impl RommfsWindow {
         .child(self.retrobat_step(
             1,
             "Connect RetroBat to your games folder",
-            steps.link,
+            (steps.link, None),
             link_body,
             window,
             cx,
@@ -295,11 +318,44 @@ impl RommfsWindow {
         .child(self.retrobat_step(
             2,
             "BIOS & firmware",
-            steps.support,
+            (steps.support, support_note),
             support_body,
             window,
             cx,
         ))
+        .child(self.render_hide_copies(cx))
+    }
+
+    /// Hide RomM's copy of a game the user already has, with the current count.
+    fn render_hide_copies(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let enabled = self.state.hide_copies_enabled;
+        let hidden = self.state.hide_copies_count;
+        v_flex()
+            .gap_2()
+            .child(section_heading("Your games"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Switch::new("hide-owned-copies")
+                            .checked(enabled)
+                            .label("Hide RomM games you already have")
+                            .on_change(cx.listener(|view, checked, _, cx| {
+                                view.controller.send(Command::SetHideOwnedCopies {
+                                    enabled: *checked,
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .child(info_button(
+                        "hide-owned-copies-help",
+                        "When a game in RomM is also in your own roms folder, RomMFS hides the RomM copy in RetroBat. Your own files are never touched.",
+                    ))
+                    .when(enabled && hidden > 0, |this| {
+                        this.child(muted_xs(format!("{hidden} hidden"), cx))
+                    }),
+            )
     }
 
     /// One step card. Done steps collapse to a row with a Redo action until
@@ -308,11 +364,12 @@ impl RommfsWindow {
         &mut self,
         index: usize,
         title: &'static str,
-        status: StepStatus,
+        status: (StepStatus, Option<SharedString>),
         body: AnyElement,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let (status, note) = status;
         let number = index + 1;
         let done = status == StepStatus::Done;
         let open = window.use_keyed_state(
@@ -323,6 +380,10 @@ impl RommfsWindow {
         let is_open = open.read(cx).get();
         if done && !is_open {
             let toggle = open.clone();
+            let (kind, text) = match note {
+                Some(note) => (StatusKind::Warning, note),
+                None => (StatusKind::Success, "Done".into()),
+            };
             return h_flex()
                 .justify_between()
                 .gap_3()
@@ -339,7 +400,7 @@ impl RommfsWindow {
                     h_flex()
                         .gap_3()
                         .items_center()
-                        .child(status_marker(StatusKind::Success, "Done", cx))
+                        .child(status_marker(kind, text, cx))
                         .child(
                             Button::new(format!("retrobat-redo-{index}"))
                                 .label("Redo")
@@ -359,7 +420,7 @@ impl RommfsWindow {
             .border_1()
             .border_color(cx.theme().border)
             .rounded(cx.theme().radius)
-            .child(step_header(number, title, status, cx))
+            .child(step_header(number, title, status, note, cx))
             .child(body)
             .into_any_element()
     }
@@ -424,7 +485,7 @@ impl RommfsWindow {
                             )
                             .child(info_button(
                                 "save-folder-help",
-                                "Select saves only, not an emulator's entire portable folder. All file formats and companions are supported. Shared saves and memory cards remain excluded.",
+                                "Select saves only, not an emulator's entire portable folder. All file formats and companions are supported. Shared saves stay out of ordinary save mapping; memory cards sync separately below.",
                             )),
                     ),
             )
@@ -449,7 +510,48 @@ impl RommfsWindow {
                     )
                     .child(self.render_save_delay(cx)),
             )
+            .child(self.render_memory_cards(cx))
             .child(self.render_play_history(cx))
+    }
+
+    /// One switch per discovered PS1/PS2 memory-card folder. Off by default and
+    /// scoped like a save root; a shared card only syncs once its emulator exits.
+    fn render_memory_cards(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let folders = self.state.memory_card_folders.clone();
+        let available = self.state.memory_cards_available;
+        let problem = self.state.memory_cards_problem.clone();
+        v_flex()
+            .gap_2()
+            .child(section_heading("Memory cards"))
+            .when(folders.is_empty(), |this| {
+                this.child(muted_xs("No PS1/PS2 memory-card folders found.", cx))
+            })
+            .children(folders.into_iter().map(|folder| {
+                let switch = Switch::new(format!("memory-card-{}", folder.relative_dir))
+                    .checked(folder.enabled)
+                    .label(format!(
+                        "{} · {}",
+                        folder.label,
+                        plural(folder.cards, "card")
+                    ))
+                    .disabled(!available && !folder.enabled);
+                let switch = if available || folder.enabled {
+                    switch
+                } else {
+                    switch.tooltip("Reconnect to grant the save permissions.")
+                };
+                let emulator = folder.emulator.clone();
+                let relative_dir = PathBuf::from(folder.relative_dir.clone());
+                switch.on_change(cx.listener(move |view, checked, _, cx| {
+                    view.controller.send(Command::SetMemoryCardFolderEnabled {
+                        emulator: emulator.clone(),
+                        relative_dir: relative_dir.clone(),
+                        enabled: *checked,
+                    });
+                    cx.notify();
+                }))
+            }))
+            .when_some(problem, |this, problem| this.child(error_line(problem, cx)))
     }
 
     /// Favourites and play history: off until the user turns it on, and only
@@ -553,18 +655,23 @@ impl RommfsWindow {
 }
 
 /// Header line of one step: number and title with its status on the right.
+/// `note` overrides the status phrase when a done step still has issues.
 fn step_header(
     number: usize,
     title: &'static str,
     status: StepStatus,
+    note: Option<SharedString>,
     cx: &App,
 ) -> impl IntoElement {
-    let (kind, text) = match status {
-        StepStatus::Done => (StatusKind::Success, "Done"),
-        StepStatus::Ready => (StatusKind::Warning, "Next"),
-        StepStatus::Running => (StatusKind::Warning, "In progress"),
-        StepStatus::Failed => (StatusKind::Danger, "Needs attention"),
-        StepStatus::Blocked(_) => (StatusKind::Muted, "Waiting"),
+    let (kind, text) = match note {
+        Some(note) => (StatusKind::Warning, note),
+        None => match status {
+            StepStatus::Done => (StatusKind::Success, "Done".into()),
+            StepStatus::Ready => (StatusKind::Warning, "Next".into()),
+            StepStatus::Running => (StatusKind::Warning, "In progress".into()),
+            StepStatus::Failed => (StatusKind::Danger, "Needs attention".into()),
+            StepStatus::Blocked(_) => (StatusKind::Muted, "Waiting".into()),
+        },
     };
     h_flex()
         .justify_between()
@@ -586,25 +693,37 @@ fn step_progress(id: &'static str, counts: Option<(u64, u64)>) -> impl IntoEleme
     }
 }
 
-/// Splits the setup result into a headline and per-system notes when some
-/// systems were skipped or restored.
-fn setup_result_notes(detail: &str) -> (Option<&'static str>, Vec<String>) {
+/// The "folders restored" note from a finished setup result, when any were.
+/// Skipped systems are reported separately as chips (WS6.10).
+fn restored_note(detail: &str) -> Option<(String, Vec<String>)> {
     let body = detail.split_once(": ").map_or(detail, |(_, rest)| rest);
-    if !body.contains("skipped") && !body.contains("restored") {
-        return (None, Vec::new());
+    if !body.contains("restored") {
+        return None;
     }
     let lines = body
         .split("; ")
-        .flat_map(|part| part.split(". "))
         .map(|part| part.trim().to_string())
         .filter(|part| !part.is_empty())
         .collect();
-    let headline = if body.contains("skipped") {
-        "Some systems couldn't be linked."
-    } else {
-        "Folders an earlier version moved aside are back in RetroBat's roms folder."
-    };
-    (Some(headline), lines)
+    Some((
+        "Folders an earlier version moved aside are back in RetroBat's roms folder.".into(),
+        lines,
+    ))
+}
+
+/// One chip per skipped system, its reason on hover (WS6.10). The list wraps
+/// instead of running on as one line.
+fn skipped_systems_chips(skipped: Vec<SkippedSystem>) -> impl IntoElement {
+    h_flex()
+        .flex_wrap()
+        .gap_1()
+        .children(skipped.into_iter().enumerate().map(|(index, system)| {
+            Button::new(SharedString::from(format!("skipped-system-{index}")))
+                .ghost()
+                .small()
+                .label(system.system)
+                .tooltip(system.reason)
+        }))
 }
 
 impl RommfsWindow {
@@ -777,14 +896,20 @@ impl RommfsWindow {
             StepStatus::Done => "Set up again",
             _ => "Set up RetroBat",
         };
-        let done_notes = (status == StepStatus::Done)
-            .then(|| {
-                self.state
-                    .retrobat_setup_detail
-                    .as_deref()
-                    .map(setup_result_notes)
-            })
-            .flatten();
+        let done = status == StepStatus::Done;
+        let skipped = if done {
+            self.state.retrobat_setup_skipped.clone()
+        } else {
+            Vec::new()
+        };
+        let restored = if done {
+            self.state
+                .retrobat_setup_detail
+                .as_deref()
+                .and_then(restored_note)
+        } else {
+            None
+        };
         let mut action = Button::new("setup-retrobat")
             .label(label)
             .disabled(!enabled)
@@ -801,15 +926,7 @@ impl RommfsWindow {
                     .gap_2()
                     .items_center()
                     .child(action.on_click(cx.listener(|view, _, _, cx| {
-                        if let Some(installation) = view.settings_install_root(cx) {
-                            view.controller.send(Command::SetupRetroBat {
-                                installation,
-                                managed_root: PathBuf::from(
-                                    view.mount_input.read(cx).value().trim(),
-                                ),
-                            });
-                        }
-                        cx.notify();
+                        view.run_retrobat_setup(cx);
                     })))
                     .when_some(blocked, |this, reason| this.child(muted_xs(reason, cx))),
             )
@@ -823,9 +940,16 @@ impl RommfsWindow {
                         cx,
                     ))
             })
-            .when_some(done_notes, |this, (note, lines)| {
+            .when(done, |this| {
                 this.child(status_marker(StatusKind::Success, "Connected", cx))
-                    .when_some(note, |this, note| {
+                    .when(!skipped.is_empty(), |this| {
+                        this.child(muted(
+                            format!("{} couldn't be linked", plural(skipped.len(), "system")),
+                            cx,
+                        ))
+                        .child(skipped_systems_chips(skipped.clone()))
+                    })
+                    .when_some(restored, |this, (note, lines)| {
                         this.child(muted(note, cx)).child(notes_disclosure(
                             "setup-notes",
                             "Show details".into(),
@@ -930,17 +1054,11 @@ impl RommfsWindow {
                     this.child(
                         v_flex()
                             .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(cx.theme().success)
-                                    .child(headline),
-                            )
-                            .when_some(note, |this, note| {
-                                this.child(muted(note, cx)).child(notes_disclosure(
+                            .child(muted(headline, cx))
+                            .when_some(note, |this, _| {
+                                this.child(notes_disclosure(
                                     "auxiliary-notes",
-                                    "Show what needs attention".into(),
+                                    "What needs attention".into(),
                                     lines,
                                     window,
                                     cx,

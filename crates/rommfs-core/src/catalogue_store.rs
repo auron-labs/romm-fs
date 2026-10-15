@@ -13,7 +13,15 @@ const SCHEMA_VERSION: u32 = 1;
 pub struct CatalogueSnapshot {
     pub platforms: Vec<PlatformDto>,
     pub roms: Vec<RomDto>,
+    /// Start time of the refresh that produced this snapshot.
     pub refreshed_at: u64,
+    /// Start time of the last *full* refresh. A snapshot older than the full
+    /// refresh interval gets a full refresh again, because the server's
+    /// `updated_at` delta may not cover a rescan that only changed files.
+    /// Absent (0) on a snapshot written before this field existed, which forces
+    /// one full refresh.
+    #[serde(default)]
+    pub full_refreshed_at: u64,
 }
 
 pub struct CatalogueStore(Connection);
@@ -80,6 +88,7 @@ mod tests {
             platforms: vec![],
             roms: vec![],
             refreshed_at: 42,
+            full_refreshed_at: 42,
         };
         CatalogueStore::open(&path)
             .unwrap()
@@ -110,5 +119,24 @@ mod tests {
                 .refreshed_at,
             42
         );
+    }
+
+    #[test]
+    fn a_snapshot_written_before_full_refreshed_at_loads_with_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("catalogue.db");
+        let store = CatalogueStore::open(&path).unwrap();
+        // A v1 payload has no `full_refreshed_at`; it must still load, with a
+        // zero that forces one full refresh.
+        store
+            .0
+            .execute(
+                "INSERT INTO catalogue_snapshots VALUES ('s', 'a', 1, ?1)",
+                params![r#"{"platforms":[],"roms":[],"refreshed_at":7}"#],
+            )
+            .unwrap();
+        let loaded = store.load("s", "a").unwrap().unwrap();
+        assert_eq!(loaded.refreshed_at, 7);
+        assert_eq!(loaded.full_refreshed_at, 0);
     }
 }

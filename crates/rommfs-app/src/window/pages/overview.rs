@@ -28,12 +28,13 @@ impl RommfsWindow {
                 this.child(
                     v_flex()
                         .gap_2()
-                        .child(
-                            h_flex()
-                                .justify_between()
-                                .child(section_heading("RomM connection"))
-                                .child(status_marker(conn_kind, conn_text, cx)),
-                        )
+                        .child(status_row(
+                            "RomM connection",
+                            conn_kind,
+                            conn_text,
+                            None,
+                            cx,
+                        ))
                         .when_some(self.state.conn_error.clone(), |this, error| {
                             this.child(error_line(error, cx))
                         })
@@ -56,12 +57,7 @@ impl RommfsWindow {
             .child(
                 v_flex()
                     .gap_2()
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .child(section_heading("Save sync"))
-                            .child(status_marker(sync_kind, sync_text, cx)),
-                    )
+                    .child(status_row("Save sync", sync_kind, sync_text, None, cx))
                     .when_some(
                         self.state
                             .save_sync_attention()
@@ -88,14 +84,20 @@ impl RommfsWindow {
     }
 
     /// §3 RetroBat summary: installed directory, running/error state, and
-    /// the manage action (the install buttons live in Settings).
+    /// the manage action (the install buttons live in Settings). An earlier
+    /// build's setup record gets an inline Update action that runs step 2.
     fn render_overview_retrobat(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let migration = self.state.retrobat_setup_migration
+            && !self.state.retrobat_setup_ok
+            && !self.state.retrobat_setup_running;
         let (text, kind) = if self.state.retrobat_setup_running {
             ("Setting up\u{2026}", StatusKind::Warning)
         } else if self.state.retrobat_setup_error.is_some() {
             ("Setup failed", StatusKind::Danger)
         } else if self.state.retrobat_setup_ok {
             ("Ready", StatusKind::Success)
+        } else if migration {
+            ("Needs a quick update", StatusKind::Warning)
         } else if self.state.retrobat_root.is_some() {
             ("Finish setup in Settings", StatusKind::Warning)
         } else {
@@ -103,12 +105,7 @@ impl RommfsWindow {
         };
         v_flex()
             .gap_2()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .child(section_heading("RetroBat"))
-                    .child(status_marker(kind, text, cx)),
-            )
+            .child(status_row("RetroBat", kind, text, None, cx))
             .when_some(self.state.retrobat_root.clone(), |this, root| {
                 this.child(muted(root, cx))
             })
@@ -119,6 +116,97 @@ impl RommfsWindow {
                     this
                 }
             })
-            .child(self.settings_nav_button("overview-retrobat", "RetroBat settings", 2, false, cx))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .when(migration, |this| {
+                        this.child(
+                            Button::new("overview-retrobat-update")
+                                .label("Update")
+                                .primary()
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.run_retrobat_setup(cx);
+                                })),
+                        )
+                    })
+                    .child(self.settings_nav_button(
+                        "overview-retrobat",
+                        "RetroBat settings",
+                        2,
+                        false,
+                        cx,
+                    )),
+            )
+            .when(self.state.retrobat_setup_ok, |this| {
+                this.child(Separator::horizontal())
+                    .child(self.render_overview_metadata(cx))
+            })
+    }
+
+    /// WS4.2: the frontend metadata stage with live counts while it runs, or
+    /// "up to date · N ago", with a Retry after a failure.
+    fn render_overview_metadata(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let error = self.state.frontend_metadata_error.clone();
+        let pending = self.state.frontend_metadata_pending;
+        let (kind, text) = if error.is_some() {
+            (StatusKind::Danger, "Needs attention".to_string())
+        } else if pending {
+            (
+                StatusKind::Warning,
+                self.state
+                    .frontend_metadata_detail
+                    .clone()
+                    .unwrap_or_else(|| "Updating…".into()),
+            )
+        } else if let Some(at) = self.state.frontend_metadata_updated_at {
+            (
+                StatusKind::Success,
+                format!("Up to date · {}", relative_time(at)),
+            )
+        } else {
+            (StatusKind::Muted, "Not synced yet".to_string())
+        };
+        let retry = error.as_ref().map(|_| {
+            Button::new("overview-metadata-retry")
+                .label("Retry")
+                .primary()
+                .small()
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.controller.send(Command::RefreshMetadata);
+                    cx.notify();
+                }))
+        });
+        v_flex()
+            .gap_2()
+            .child(status_row("Artwork & gamelists", kind, text, retry, cx))
+            .when(pending, |this| {
+                this.child(match self.state.frontend_metadata_progress {
+                    Some((completed, total)) => v_flex()
+                        .gap_1()
+                        .child(muted(
+                            format!(
+                                "{} / {} artwork files",
+                                fmt_count(completed),
+                                fmt_count(total)
+                            ),
+                            cx,
+                        ))
+                        .child(
+                            Progress::new("overview-metadata-progress")
+                                .value(if total > 0 {
+                                    (100.0 * completed as f32 / total as f32).min(100.0)
+                                } else {
+                                    0.0
+                                })
+                                .small(),
+                        )
+                        .into_any_element(),
+                    None => Progress::new("overview-metadata-progress")
+                        .loading(true)
+                        .small()
+                        .into_any_element(),
+                })
+            })
+            .when_some(error, |this, error| this.child(error_line(error, cx)))
     }
 }

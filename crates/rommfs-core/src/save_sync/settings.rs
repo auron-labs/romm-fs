@@ -86,6 +86,16 @@ impl SaveSyncSettingsStore {
                     account_id TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
                     PRIMARY KEY (server_id, account_id)
+                );
+                CREATE TABLE IF NOT EXISTS memory_card_consent (
+                    server_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    installation_root TEXT NOT NULL,
+                    effective_saves_root TEXT NOT NULL,
+                    emulator TEXT NOT NULL,
+                    relative_dir TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+                    PRIMARY KEY (server_id, account_id, installation_root, effective_saves_root, emulator, relative_dir)
                 );",
             )
             .map_err(sqlite)?;
@@ -221,6 +231,72 @@ impl SaveSyncSettingsStore {
                 "INSERT INTO play_data_consent (server_id, account_id, enabled) VALUES (?1, ?2, ?3)
                  ON CONFLICT (server_id, account_id) DO UPDATE SET enabled = excluded.enabled",
                 rusqlite::params![server_id, account_id, enabled],
+            )
+            .map_err(sqlite)?;
+        Ok(())
+    }
+
+    /// Memory-card consent is scoped to one discovered emulator card folder,
+    /// the same way file consent is scoped to a save root. Missing rows mean
+    /// off: consent is never inferred from a discovered folder.
+    pub fn load_card_folder(
+        &self,
+        scope: &SaveSyncScope,
+        emulator: &str,
+        relative_dir: &Path,
+    ) -> Result<bool> {
+        validate_scope(scope)?;
+        self.connection
+            .query_row(
+                "SELECT enabled FROM memory_card_consent
+                 WHERE server_id = ?1 AND account_id = ?2 AND installation_root = ?3
+                   AND effective_saves_root = ?4 AND emulator = ?5 AND relative_dir = ?6",
+                rusqlite::params![
+                    scope.server_id,
+                    scope.account_id,
+                    windows_path_key(&scope.installation_root),
+                    windows_path_key(&scope.effective_saves_root),
+                    emulator,
+                    windows_path_key(relative_dir),
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|enabled| enabled.unwrap_or(false))
+            .map_err(sqlite)
+    }
+
+    pub fn save_card_folder(
+        &self,
+        scope: &SaveSyncScope,
+        emulator: &str,
+        relative_dir: &Path,
+        enabled: bool,
+    ) -> Result<()> {
+        validate_scope(scope)?;
+        if emulator.trim().is_empty() || relative_dir.as_os_str().is_empty() {
+            return Err(Error::Unsupported(
+                "memory-card consent requires an emulator and card folder".into(),
+            ));
+        }
+        self.connection
+            .execute(
+                "INSERT INTO memory_card_consent
+                    (server_id, account_id, installation_root, effective_saves_root,
+                     emulator, relative_dir, enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (server_id, account_id, installation_root,
+                              effective_saves_root, emulator, relative_dir)
+                 DO UPDATE SET enabled = excluded.enabled",
+                rusqlite::params![
+                    scope.server_id,
+                    scope.account_id,
+                    windows_path_key(&scope.installation_root),
+                    windows_path_key(&scope.effective_saves_root),
+                    emulator,
+                    windows_path_key(relative_dir),
+                    enabled,
+                ],
             )
             .map_err(sqlite)?;
         Ok(())

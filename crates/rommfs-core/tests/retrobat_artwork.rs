@@ -106,6 +106,77 @@ fn artwork_is_deduplicated_cached_and_never_requests_rom_bodies() {
 }
 
 #[test]
+fn artwork_progress_is_monotonic_and_ends_at_the_total() {
+    use std::sync::Mutex;
+    let fixture = FixtureServer::start();
+    let mut roms = Vec::new();
+    for id in 1..=3 {
+        let resource = format!("/assets/romm/resources/cover{id}.png");
+        fixture.on(
+            "GET",
+            &resource,
+            ResponseSpec::Bytes {
+                status: 200,
+                bytes: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+                truncate_at: None,
+                stall_after_bytes: None,
+            },
+        );
+        let mut rom = contract::rom(id, "gb", &format!("Game{id}.gb"), 3, "hash");
+        rom["path_cover_large"] = json!(resource);
+        roms.push(serde_json::from_value(rom).unwrap());
+    }
+    let client = client(&fixture);
+    let catalogue = build_catalogue(fixture.url(), &sources("unused").0, &roms, |_| {}).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let ticks = Mutex::new(Vec::new());
+    cache_artwork_cancellable(
+        &client,
+        &catalogue,
+        &roms,
+        cache.path(),
+        &AtomicBool::new(true),
+        &|completed, total| ticks.lock().unwrap().push((completed, total)),
+    )
+    .unwrap();
+    let ticks = ticks.into_inner().unwrap();
+    assert_eq!(ticks.first(), Some(&(0, 3)));
+    assert_eq!(ticks.last(), Some(&(3, 3)));
+    assert!(
+        ticks.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+        "{ticks:?}"
+    );
+}
+
+#[test]
+fn cached_artwork_is_stored_by_its_detected_extension() {
+    let fixture = FixtureServer::start();
+    let resource = "/assets/romm/resources/cover.png";
+    fixture.on(
+        "GET",
+        resource,
+        ResponseSpec::Bytes {
+            status: 200,
+            bytes: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+            truncate_at: None,
+            stall_after_bytes: None,
+        },
+    );
+    let client = client(&fixture);
+    let (platforms, roms) = sources(resource);
+    let catalogue = build_catalogue(fixture.url(), &platforms, &roms, |_| {}).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    cache_artwork(&client, &catalogue, &roms, cache.path()).unwrap();
+    let names: Vec<String> = std::fs::read_dir(cache.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    // The extension is part of the cache filename, so a later hit never has to
+    // re-read the image bytes to find it (WS4.5).
+    assert!(names.iter().all(|name| name.ends_with(".png")), "{names:?}");
+}
+
+#[test]
 fn external_traversal_and_rom_urls_are_rejected_before_network_access() {
     let fixture = FixtureServer::start();
     let client = client(&fixture);
@@ -160,7 +231,8 @@ fn missing_invalid_images_are_nonfatal_and_cancellation_does_not_publish_cache()
         &catalogue,
         &roms,
         cache.path(),
-        &AtomicBool::new(false)
+        &AtomicBool::new(false),
+        &|_, _| {},
     )
     .is_err());
     assert_eq!(fixture.request_count("GET", resource), 1);

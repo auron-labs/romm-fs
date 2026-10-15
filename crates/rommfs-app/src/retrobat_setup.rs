@@ -10,7 +10,7 @@ pub(crate) fn setup(
     installation: &Path,
     managed_root: &Path,
     server: &str,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<SetupReport> {
     anyhow::ensure!(
         installation.is_absolute() && managed_root.is_absolute(),
         "choose absolute RetroBat and managed ROM folder paths"
@@ -21,7 +21,17 @@ pub(crate) fn setup(
     let outcome = rommfs_core::retrobat::setup_roms_link(installation, managed_root, server)?;
     let mut messages = vec![outcome.summary()];
     messages.push(configure_switch(installation));
-    Ok(messages)
+    Ok(SetupReport {
+        messages,
+        skipped: outcome.skipped,
+    })
+}
+
+/// What a local setup run did: the messages to show, and the systems it could
+/// not link, each with its reason (WS6.10).
+pub(crate) struct SetupReport {
+    pub messages: Vec<String>,
+    pub skipped: Vec<rommfs_core::retrobat::SkippedSystem>,
 }
 
 /// Switch save settings are optional: a problem is reported, never a reason

@@ -150,7 +150,7 @@ impl SaveSyncSummary {
             Self::Off => "Save sync off",
             Self::NeedsSetup => "Save sync needs setup",
             Self::Checking => "Checking saves…",
-            Self::NoLinkedFiles => "No files ready to sync",
+            Self::NoLinkedFiles => "Nothing to sync yet",
             Self::Reconciling => "Checking saves…",
             Self::Syncing => "Syncing saves…",
             Self::NeedsAttention => "Save sync needs attention",
@@ -208,16 +208,30 @@ pub struct UiState {
     /// True once setup for the selected installation has actually succeeded
     /// (this session, or a verified setup record found on disk).
     pub retrobat_setup_ok: bool,
+    /// An earlier build's setup record must be migrated by running setup.
+    pub retrobat_setup_migration: bool,
     pub retrobat_setup_detail: Option<String>,
     pub retrobat_setup_error: Option<String>,
+    /// Systems the last setup run could not link, each with its reason.
+    pub retrobat_setup_skipped: Vec<rommfs_core::retrobat::SkippedSystem>,
     pub frontend_metadata_pending: bool,
     pub frontend_metadata_detail: Option<String>,
     pub frontend_metadata_error: Option<String>,
+    /// Live counts of the current metadata pass, and the pass identity that
+    /// produced them (a stale pass is ignored).
+    pub frontend_metadata_progress: Option<(usize, usize)>,
+    frontend_metadata_job_id: u64,
+    /// When the last metadata pass finished cleanly, for "up to date · N ago".
+    pub frontend_metadata_updated_at: Option<u64>,
     /// The session holds the scopes play-data sync needs.
     pub play_data_available: bool,
     /// Consent is on for the connected server and account.
     pub play_data_enabled: bool,
     pub play_data_problem: Option<String>,
+    /// "Hide RomM games you already have" is on (default), and how many entries
+    /// the last metadata pass hid.
+    pub hide_copies_enabled: bool,
+    pub hide_copies_count: usize,
     pub pairing_code: Option<String>,
     pub conn: ConnectionState,
     pub conn_error: Option<String>,
@@ -235,7 +249,7 @@ pub struct UiState {
     pub catalogue_refreshed_at: Option<u64>,
     pub catalogue_pending_remount: bool,
     catalogue_operation_id: u64,
-    pub catalogue: Option<(usize, usize, usize)>, // platforms, roms, skipped
+    pub catalogue: Option<(usize, usize, usize, usize)>, // platforms, games, files, skipped
     pub save_sync_candidates: Vec<InstallationCandidate>,
     pub save_sync_skipped: usize,
     pub save_sync_selected_root: Option<String>,
@@ -268,6 +282,12 @@ pub struct UiState {
     pub save_sync_authentication_required: bool,
     pub save_sync_export_errors: HashMap<String, String>,
     pub save_sync_export_feedback: HashMap<String, String>,
+    /// Discovered memory-card folders, their per-folder consent, and any card
+    /// whose local and remote copies both changed.
+    pub memory_card_folders: Vec<MemoryCardFolderStatus>,
+    pub memory_card_conflicts: Vec<MemoryCardConflictStatus>,
+    pub memory_cards_available: bool,
+    pub memory_cards_problem: Option<String>,
     pub log: LogBuffer,
 }
 
@@ -293,14 +313,21 @@ impl UiState {
             integration_notice: None,
             retrobat_setup_running: false,
             retrobat_setup_ok: false,
+            retrobat_setup_migration: false,
             retrobat_setup_detail: None,
             retrobat_setup_error: None,
+            retrobat_setup_skipped: Vec::new(),
             frontend_metadata_pending: false,
             frontend_metadata_detail: None,
             frontend_metadata_error: None,
+            frontend_metadata_progress: None,
+            frontend_metadata_job_id: 0,
+            frontend_metadata_updated_at: None,
             play_data_available: false,
             play_data_enabled: false,
             play_data_problem: None,
+            hide_copies_enabled: true,
+            hide_copies_count: 0,
             pairing_code: None,
             conn: ConnectionState::Idle,
             conn_error: None,
@@ -346,6 +373,10 @@ impl UiState {
             save_sync_authentication_required: false,
             save_sync_export_errors: HashMap::new(),
             save_sync_export_feedback: HashMap::new(),
+            memory_card_folders: Vec::new(),
+            memory_card_conflicts: Vec::new(),
+            memory_cards_available: false,
+            memory_cards_problem: None,
             log: LogBuffer::new(log_cap),
         }
     }
@@ -407,13 +438,60 @@ impl UiState {
                 self.installer_error = error.clone();
             }
             AppEvent::FrontendMetadata {
+                job_id,
                 pending,
                 detail,
                 error,
             } => {
-                self.frontend_metadata_pending = *pending;
-                self.frontend_metadata_detail = Some(detail.clone());
-                self.frontend_metadata_error = error.clone();
+                let accepted = if *pending {
+                    // Same active pass, or a strictly newer pass after the last
+                    // one finished. An older pass is stale.
+                    (self.frontend_metadata_pending && *job_id == self.frontend_metadata_job_id)
+                        || (!self.frontend_metadata_pending
+                            && *job_id > self.frontend_metadata_job_id)
+                } else {
+                    // A finish/stop belongs to the newest pass only. It is
+                    // accepted even right after an invalidation, so the closing
+                    // detail line still lands.
+                    *job_id == self.frontend_metadata_job_id
+                };
+                if accepted {
+                    self.frontend_metadata_job_id = (*job_id).max(self.frontend_metadata_job_id);
+                    self.frontend_metadata_pending = *pending;
+                    self.frontend_metadata_detail = Some(detail.clone());
+                    self.frontend_metadata_error = error.clone();
+                    if !pending {
+                        self.frontend_metadata_progress = None;
+                        if error.is_none() {
+                            self.frontend_metadata_updated_at =
+                                Some(rommfs_core::cache::now_unix_secs());
+                        }
+                    }
+                }
+            }
+            AppEvent::FrontendMetadataProgress {
+                job_id,
+                completed,
+                total,
+            } => {
+                // Progress is only trusted for the active pass, and the count
+                // only moves forward within it.
+                if self.frontend_metadata_pending
+                    && *job_id == self.frontend_metadata_job_id
+                    && self
+                        .frontend_metadata_progress
+                        .is_none_or(|(previous, _)| *completed >= previous)
+                {
+                    self.frontend_metadata_progress = Some((*completed, *total));
+                }
+            }
+            AppEvent::FrontendMetadataInvalidated { job_id } => {
+                // The pass was cancelled/stopped: drop it so a late callback or
+                // publication status for the same id cannot revive it.
+                if *job_id == self.frontend_metadata_job_id {
+                    self.frontend_metadata_pending = false;
+                    self.frontend_metadata_progress = None;
+                }
             }
             AppEvent::PlayDataUpdated {
                 available,
@@ -424,14 +502,20 @@ impl UiState {
                 self.play_data_enabled = *enabled;
                 self.play_data_problem = problem.clone();
             }
+            AppEvent::HideCopies { enabled, hidden } => {
+                self.hide_copies_enabled = *enabled;
+                self.hide_copies_count = *hidden;
+            }
             AppEvent::RetroBatSetup {
                 running,
                 detail,
+                skipped,
                 error,
             } => {
                 self.retrobat_setup_running = *running;
                 self.retrobat_setup_detail = Some(detail.clone());
                 self.retrobat_setup_error = error.clone();
+                self.retrobat_setup_skipped = skipped.clone();
                 if *running || error.is_some() {
                     self.retrobat_setup_ok = false;
                 }
@@ -450,18 +534,21 @@ impl UiState {
                 mode,
                 retrobat_root,
                 setup_complete,
+                setup_migration,
                 error,
             } => {
                 let changed = self.integration != *mode;
                 let root_changed = self.retrobat_root != *retrobat_root;
                 self.integration = *mode;
                 self.retrobat_root = retrobat_root.clone();
+                self.retrobat_setup_migration = *setup_migration;
                 if error.is_none() && retrobat_root.is_some() {
                     // A usable installation is selected: the installer's
                     // download/launch problems no longer apply.
                     self.installer_error = None;
                 }
-                self.retrobat_setup_ok = *mode == IntegrationMode::RetroBat
+                self.retrobat_setup_ok = !*setup_migration
+                    && *mode == IntegrationMode::RetroBat
                     && retrobat_root.is_some()
                     && (*setup_complete || (!root_changed && self.retrobat_setup_ok));
                 if root_changed {
@@ -522,6 +609,11 @@ impl UiState {
                 self.play_data_available = false;
                 self.play_data_enabled = false;
                 self.play_data_problem = None;
+                // Metadata belongs to the session that just ended. The job
+                // high-water mark is kept so a stale pass cannot revive.
+                self.frontend_metadata_pending = false;
+                self.frontend_metadata_progress = None;
+                self.frontend_metadata_updated_at = None;
             }
             AppEvent::PairingReady { user_code, .. } => {
                 self.pairing_code = Some(user_code.clone());
@@ -568,6 +660,15 @@ impl UiState {
                 self.save_sync_mapped_targets = 0;
                 self.save_sync_catalogue_unmapped = 0;
                 self.save_sync_existing_saves = None;
+                self.memory_card_folders.clear();
+                self.memory_card_conflicts.clear();
+                self.memory_cards_available = false;
+                self.memory_cards_problem = None;
+                // A new connection attempt is a new scope: drop the previous
+                // metadata stage/age (the job high-water mark stays).
+                self.frontend_metadata_pending = false;
+                self.frontend_metadata_progress = None;
+                self.frontend_metadata_updated_at = None;
             }
             AppEvent::Connected => {
                 self.conn = ConnectionState::Connected;
@@ -624,10 +725,11 @@ impl UiState {
             }
             AppEvent::CatalogueLoaded {
                 platforms,
-                roms,
+                games,
+                files,
                 skipped_unsupported,
             } => {
-                self.catalogue = Some((*platforms, *roms, *skipped_unsupported));
+                self.catalogue = Some((*platforms, *games, *files, *skipped_unsupported));
                 self.catalogue_progress = None;
                 self.conn_error = None;
             }
@@ -779,6 +881,10 @@ impl UiState {
                     self.save_sync_authentication_required = false;
                     self.save_sync_export_errors.clear();
                     self.save_sync_export_feedback.clear();
+                    self.memory_card_folders.clear();
+                    self.memory_card_conflicts.clear();
+                    self.memory_cards_available = false;
+                    self.memory_cards_problem = None;
                 }
             }
             AppEvent::SaveSyncAuthenticationRequired { session_id } => {
@@ -814,6 +920,20 @@ impl UiState {
                         self.save_sync_export_feedback
                             .insert(incoming_id.clone(), destination.clone());
                     }
+                }
+            }
+            AppEvent::MemoryCardsUpdated {
+                session_id,
+                available,
+                folders,
+                conflicts,
+                problem,
+            } => {
+                if *session_id == self.save_sync_session_id {
+                    self.memory_cards_available = *available;
+                    self.memory_card_folders = folders.clone();
+                    self.memory_card_conflicts = conflicts.clone();
+                    self.memory_cards_problem = problem.clone();
                 }
             }
 
