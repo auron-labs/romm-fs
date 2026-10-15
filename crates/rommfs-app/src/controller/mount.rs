@@ -403,6 +403,15 @@ impl Worker {
         }
     }
 
+    /// Stop and immediately re-start, so a pending catalogue refresh is
+    /// published in one worker step (phase 2b "Update ready").
+    pub(super) fn restart_mount(&mut self, path: &str) {
+        if self.mount.is_some() {
+            self.stop_mount();
+        }
+        self.start_mount(path);
+    }
+
     pub(super) fn stop_mount(&mut self) {
         let had_metadata = self.metadata_active.is_some()
             || self

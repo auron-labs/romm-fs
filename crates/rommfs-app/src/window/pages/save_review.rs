@@ -222,56 +222,43 @@ impl RommfsWindow {
     /// Compact live status: the shared derived marker, problem/failure
     /// detail, and the page's only setup actions (enable + refresh).
     /// Folder/install selection lives in Settings (UI-PLAN task 3).
-    fn save_review_status_strip(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn save_review_status_strip(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let enabled = self.state.save_sync_enabled;
         let (status, status_kind) = self.save_sync_status();
-        let saves_folder = self
-            .state
-            .save_sync_effective_saves_root
-            .clone()
-            .unwrap_or_else(|| "Not verified".into());
-        let scope = match (
+        // One compact identity line replaces the old server/account/folder/
+        // last-action block (phase 2b). Last action now lives in Activity.
+        let identity = match (
             &self.state.save_sync_server_id,
             self.state.save_sync_account_id,
         ) {
-            // The account displays as the signed-in username when it is
-            // known — a remembered session types nothing, and a bare
-            // database id is not an identity (UI-PLAN §4).
             (Some(server), Some(_)) => {
                 let user = self.user_input.read(cx).value().to_string();
                 if user.is_empty() {
-                    format!("Server: {server} · signed-in account")
+                    server.clone()
                 } else {
-                    format!("Server: {server} · Account: {user}")
+                    format!("{server} · {user}")
                 }
             }
             _ => "Server and account not verified".into(),
         };
-        let profile = self
+        let checked = self
             .state
             .save_sync_profile_version
             .as_deref()
-            .map(|version| format!("Save folder checked · {version}"))
-            .unwrap_or_else(|| "Save folder not checked yet — configured in Settings".into());
-        let last_action = self.state.save_sync_transfers.last().map(|transfer| {
-            format!(
-                "Last action: ROM {} · {} · {}{}",
-                transfer.rom_id,
-                transfer.revision,
-                transfer.phase,
-                transfer
-                    .detail
-                    .as_ref()
-                    .map(|detail| format!(" — {detail}"))
-                    .unwrap_or_default()
-            )
-        });
+            .map(|version| format!("checked {version}"))
+            .unwrap_or_else(|| "save folder not checked".into());
         let failure = self
             .state
             .save_sync_queue
             .as_ref()
             .and_then(|queue| queue.failure.clone())
             .or_else(|| self.state.save_sync_failure.clone());
+        let (inventory_chips, inventory_details) =
+            existing_save_inventory(self.state.save_sync_existing_saves.as_ref());
 
         let mut card = v_flex()
             .gap_2()
@@ -318,38 +305,47 @@ impl RommfsWindow {
                             }),
                     ),
             )
-            .child(muted_xs(format!("Folder: {saves_folder}"), cx))
-            .child(muted_xs(scope, cx))
-            .child(muted_xs(
-                format!(
-                    "{} mapped files · {} unmatched files{}",
-                    fmt_count(self.state.save_sync_mapped_targets),
-                    fmt_count(self.state.save_sync_catalogue_unmapped),
-                    match self.state.save_files_ignored() {
-                        0 => String::new(),
-                        ignored => format!(" · {} ignored", fmt_count(ignored)),
-                    },
-                ),
-                cx,
-            ))
-            .child(muted_xs(profile, cx))
-            .child(muted_xs(
-                existing_save_inventory_summary(self.state.save_sync_existing_saves.as_ref()),
+            .child(muted_xs(format!("{identity} · {checked}"), cx))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(chip(format!(
+                        "{} mapped",
+                        fmt_count(self.state.save_sync_mapped_targets)
+                    )))
+                    .child(chip(format!(
+                        "{} unmatched",
+                        fmt_count(self.state.save_sync_catalogue_unmapped)
+                    )))
+                    .when(self.state.save_files_ignored() > 0, |this| {
+                        this.child(chip(format!(
+                            "{} ignored",
+                            fmt_count(self.state.save_files_ignored())
+                        )))
+                    })
+                    .children(inventory_chips.into_iter().map(chip)),
+            );
+        if let Some(details) = inventory_details {
+            card = card.child(details_disclosure(
+                "save-inventory-details",
+                details,
+                window,
                 cx,
             ));
+        }
         if let Some(hint) = self.state.save_sync_off_hint() {
-            card = card.child(muted_xs(hint, cx)).child(self.nav_button(
-                "save-sync-open-settings",
-                "Open Settings",
-                3,
-                false,
-                cx,
-            ));
+            card = card
+                .child(muted_xs(hint, cx))
+                .child(self.settings_nav_button(
+                    "save-sync-open-settings",
+                    "Open Settings",
+                    3,
+                    false,
+                    cx,
+                ));
         } else if !enabled && !self.state.save_sync_available {
-            card = card.child(muted_xs(
-                "Save sync needs a configured save folder — set one up in Settings.",
-                cx,
-            ));
+            card = card.child(muted_xs("Save sync needs a save folder.", cx));
         }
         if enabled {
             if let Some(problem) = self.state.save_sync_problem.clone() {
@@ -364,9 +360,6 @@ impl RommfsWindow {
         let failure = failure.filter(|_| enabled);
         if let Some(failure) = failure {
             card = card.child(error_line(format!("Last failure: {failure}"), cx));
-        }
-        if let Some(action) = last_action {
-            card = card.child(muted_xs(action, cx));
         }
         for path in &self.state.save_sync_preview {
             card = card.child(
@@ -412,17 +405,12 @@ impl RommfsWindow {
                     )
                     .child(muted_xs(reason.clone(), cx));
                 if *mappable && has_games {
-                    detail = detail
-                        .child(muted_xs(
-                            "Pick a game, then link this file — or every mappable file in its folder.",
-                            cx,
-                        ))
-                        .child(
-                            Select::new(&self.save_game_select)
-                                .w_full()
-                                .accessibility_label("Save file game")
-                                .placeholder("Select the owning game…"),
-                        );
+                    detail = detail.child(
+                        Select::new(&self.save_game_select)
+                            .w_full()
+                            .accessibility_label("Save file game")
+                            .placeholder("Select the owning game…"),
+                    );
                     let file_path = path.clone();
                     let mut actions = h_flex().gap_2().child(
                         Button::new(format!("save-review-map-file-{}", row.key))
@@ -500,7 +488,7 @@ impl RommfsWindow {
                     detail = detail.child(actions);
                 } else if *mappable {
                     detail = detail.child(muted_xs(
-                        "Waiting for the game list — mapping unlocks once RomM returns it.",
+                        "Mapping unlocks once RomM returns the game list.",
                         cx,
                     ));
                 } else {
@@ -747,10 +735,6 @@ impl RommfsWindow {
                     .px_3()
                     .py_2()
                     .bg(cx.theme().muted)
-                    .child(muted_xs(
-                        "Type a path relative to the save folder, pick its game, then Map file.",
-                        cx,
-                    ))
                     .child(Input::new(&self.save_file_input).w_full())
                     .child(
                         Select::new(&self.save_game_select)
@@ -885,9 +869,9 @@ pub fn render(
             "Nothing matches the current search or filter.".to_string()
         } else {
             match view.state.save_sync_summary() {
-                SaveSyncSummary::Off => "Save sync is off — enable it to review files.".into(),
+                SaveSyncSummary::Off => "Save sync is off. Enable it to review files.".into(),
                 SaveSyncSummary::NeedsSetup => {
-                    "Save sync needs a save folder — configure one in Settings.".into()
+                    "Save sync needs a save folder. Configure one in Settings.".into()
                 }
                 SaveSyncSummary::Checking | SaveSyncSummary::Reconciling => {
                     "Checking saves…".into()
@@ -922,10 +906,8 @@ pub fn render(
             .items_center()
             .child(muted_xs(
                 format!(
-                    "{} file{} don't belong to games in your library \u{2014} {}.",
-                    fmt_count(ignored),
-                    if ignored == 1 { "" } else { "s" },
-                    if shown { "shown below" } else { "ignored" }
+                    "{} don't belong to a game in your library",
+                    plural(ignored, "file")
                 ),
                 cx,
             ))
@@ -1007,7 +989,7 @@ pub fn render(
     v_flex()
         .gap_4()
         .child(page_heading("Save sync"))
-        .child(view.save_review_status_strip(cx))
+        .child(view.save_review_status_strip(window, cx))
         .child(section)
 }
 
@@ -1065,40 +1047,37 @@ impl RommfsWindow {
     }
 }
 
-fn existing_save_inventory_summary(preview: Option<&ExistingSavePreview>) -> String {
+/// Existing-file scan as chips plus diagnostics behind "Details" (phase 2b:
+/// counts read as numbers, the prose moves behind a disclosure).
+fn existing_save_inventory(preview: Option<&ExistingSavePreview>) -> (Vec<String>, Option<String>) {
     let Some(preview) = preview else {
-        return "Refresh to discover new or unmatched save files.".into();
-    };
-    let diagnostics = if preview.diagnostics.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", preview.diagnostics.join(" "))
+        return (vec!["No save scan yet".into()], None);
     };
     match preview.status {
-        ExistingSaveScanStatus::Unavailable => {
-            format!("Existing-file scan unavailable; counts are not reported.{diagnostics}")
-        }
+        ExistingSaveScanStatus::Unavailable => (
+            vec!["Save scan unavailable".into()],
+            Some("Existing-file scan unavailable; counts are not reported.".into()),
+        ),
         ExistingSaveScanStatus::Complete | ExistingSaveScanStatus::Partial => {
-            let completeness = if preview.status == ExistingSaveScanStatus::Partial {
-                "partial; counts may be incomplete"
-            } else {
-                "complete"
-            };
+            let mut chips = vec![format!("{} recognised", preview.supported_files)];
+            if preview.skipped_files > 0 {
+                chips.push(format!("{} skipped", preview.skipped_files));
+            }
+            let mut details = Vec::new();
+            if preview.status == ExistingSaveScanStatus::Partial {
+                details.push("Scan was partial; counts may be incomplete.".to_string());
+            }
             let reasons = preview
                 .skipped_reasons
                 .iter()
                 .map(|count| format!("{} {}", count.files, count.reason.label()))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let skipped = if reasons.is_empty() {
-                String::new()
-            } else {
-                format!(" ({reasons})")
-            };
-            format!(
-                "Existing files ({completeness}): {} recognized files; {} skipped{skipped}.{diagnostics}",
-                preview.supported_files, preview.skipped_files
-            )
+            if !reasons.is_empty() {
+                details.push(reasons);
+            }
+            details.extend(preview.diagnostics.iter().cloned());
+            (chips, (!details.is_empty()).then(|| details.join("\n")))
         }
     }
 }

@@ -247,10 +247,31 @@ impl RommfsWindow {
             cx.notify();
         }))
     }
-    /// Jump to the Settings RetroBat section (first-run optional step).
+    /// A "go fix this" button that opens Settings on a specific tab.
+    pub(super) fn settings_nav_button(
+        &mut self,
+        id: &'static str,
+        label: &'static str,
+        tab: usize,
+        primary: bool,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let button = Button::new(id).label(label);
+        let button = if primary {
+            button.primary()
+        } else {
+            button.outline()
+        };
+        button.on_click(cx.listener(move |this, _, _, cx| {
+            this.active_view = 3;
+            this.settings_tab = tab;
+            cx.notify();
+        }))
+    }
+    /// Jump to the Settings RetroBat tab (first-run optional step).
     pub(super) fn open_retrobat_settings(&mut self, cx: &mut Context<Self>) {
         self.active_view = 3;
-        self.scroll_to_retrobat = true;
+        self.settings_tab = 2;
         cx.notify();
     }
 }

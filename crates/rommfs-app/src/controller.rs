@@ -482,6 +482,7 @@ fn worker_loop_with_interval_from(
             Command::SetMountRoot { path } => worker.set_mount_root(path),
             Command::StartMount { path } => worker.start_mount(path),
             Command::StopMount => worker.stop_mount(),
+            Command::RestartMount { path } => worker.restart_mount(path),
             Command::RefreshCatalogue => worker.refresh_catalogue(),
             Command::RefreshSaveSync => worker.refresh_save_sync(),
             Command::SelectSaveSyncInstallation { path } => {
@@ -518,9 +519,11 @@ fn worker_loop_with_interval_from(
                 | Command::Connect { .. } => worker.sink.emit(AppEvent::ConnectFailed {
                     reason: format!("internal error: {msg}"),
                 }),
-                Command::StartMount { .. } => worker.sink.emit(AppEvent::MountFailed {
-                    reason: format!("internal error: {msg}"),
-                }),
+                Command::StartMount { .. } | Command::RestartMount { .. } => {
+                    worker.sink.emit(AppEvent::MountFailed {
+                        reason: format!("internal error: {msg}"),
+                    })
+                }
                 Command::StopMount => {}
                 Command::SetMountRoot { .. } => {}
                 Command::SetupRetroBat { .. } => worker.sink.emit(AppEvent::RetroBatSetup {

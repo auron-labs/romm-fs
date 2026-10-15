@@ -56,14 +56,14 @@ impl RommfsWindow {
                     })))
                 .child(Collapsible::new().open(self.password_sign_in)
                     .child(Button::new("password-sign-in-options").ghost().label(if self.password_sign_in { "Hide password sign-in" } else { "Use password instead" })
+                        .tooltip("Password sign-in is not remembered. Browser sign-in uses Windows Credential Manager.")
                         .on_click(cx.listener(|view,_,_,cx| { view.password_sign_in = !view.password_sign_in; cx.notify(); })))
                     .content(v_flex().gap_3()
                         .child(h_flex().gap_3().items_stretch()
                             .child(div().flex_1().min_w_0().child(field_column("Username", Input::new(&self.user_input).w_full(), cx)))
                             .child(div().flex_1().min_w_0().child(field_column("Password", Input::new(&self.password_input).w_full().content_type(InputContentType::Password).mask_toggle(), cx))))
                         .child(Button::new("connect").label("Connect with password")
-                            .on_click(cx.listener(|view,_,_,cx| view.on_connect(cx))))
-                        .child(muted("Password sign-in is not remembered. Browser sign-in uses Windows Credential Manager.", cx)))))
+                            .on_click(cx.listener(|view,_,_,cx| view.on_connect(cx)))))))
             .when_some(self.state.pairing_code.clone(), |this, code| this.child(muted(format!("Approve RomMFS in your browser · code {code}"), cx)))
             .when_some(self.state.conn_error.clone(), |this,error| this.child(error_line(error,cx)))
     }
@@ -77,13 +77,16 @@ impl RommfsWindow {
         v_flex()
             .gap_2()
             .child(section_heading("Library layout"))
-            .child(muted_xs(
-                "Generic folders arranges games by platform. RetroBat uses RetroBat's system names so its roms folder can point at your games.",
-                cx,
-            ))
             .child(
                 RadioGroup::horizontal("library-layout")
-                    .children(["Generic folders", "RetroBat"])
+                    .child(
+                        Radio::new("generic")
+                            .label("Generic folders")
+                            .tooltip("Arranges games by platform."),
+                    )
+                    .child(Radio::new("retrobat").label("RetroBat").tooltip(
+                        "Uses RetroBat's system names so its roms folder can point at your games.",
+                    ))
                     .selected_index(Some(self.integration_choice))
                     .disabled(locked)
                     .on_change(cx.listener(|view, index, _, cx| {
@@ -109,41 +112,35 @@ impl RommfsWindow {
                     })),
             )
             .when(self.integration_choice == 1, |this| {
-                this.child(muted_xs(
-                    if self.state.retrobat_setup_ok {
-                        "The RetroBat layout is active and RetroBat is connected to your games folder."
-                    } else {
-                        "RetroBat's layout is used once RetroBat is connected to your games folder (see RetroBat below)."
-                    },
-                    cx,
-                ))
-            })
-    }
-    /// Why a Settings action is unavailable, with the stop action beside it
-    /// when the games folder is the cause.
-    pub(super) fn locked_reason(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let running = matches!(self.state.mount, MountState::Mounted | MountState::Mounting);
-        let busy = self.state.retrobat_setup_running || self.state.auxiliary_running;
-        h_flex()
-            .gap_2()
-            .items_center()
-            .child(muted_xs(
-                if running {
-                    "Stop the games folder first (it is running)."
-                } else if busy {
-                    "Wait for the current setup or install to finish, or cancel it."
-                } else {
-                    ""
-                },
-                cx,
-            ))
-            .when(running, |this| {
+                let active = self.state.retrobat_setup_ok;
                 this.child(
-                    Button::new("locked-stop-games-folder")
-                        .label("Stop games folder")
-                        .outline()
-                        .small()
-                        .on_click(cx.listener(|view, _, _, cx| view.on_stop_mount(cx))),
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(status_marker(
+                            if active {
+                                StatusKind::Success
+                            } else {
+                                StatusKind::Muted
+                            },
+                            if active {
+                                "Layout · RetroBat · Active"
+                            } else {
+                                "Layout · RetroBat · setup needed"
+                            },
+                            cx,
+                        ))
+                        .when(!active, |this| {
+                            this.child(
+                                Button::new("layout-open-retrobat")
+                                    .label("Set up RetroBat")
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.open_retrobat_settings(cx)
+                                    })),
+                            )
+                        }),
                 )
             })
     }
@@ -210,14 +207,14 @@ impl RommfsWindow {
                         })),
                 ),
         );
-        list = list.child(muted_xs(
-            "Only leftover links are removed — real files and folders are never deleted. Remove or move them yourself, then retry.",
-            cx,
-        ));
         if let Some(removal) = &self.state.foreign_removal {
             list = list.child(match removal {
-                Ok(n) => muted_xs(format!("Removed {n} links. You can retry now."), cx)
-                    .into_any_element(),
+                Ok(n) => status_marker(
+                    StatusKind::Success,
+                    format!("Removed {} links", fmt_count(*n)),
+                    cx,
+                )
+                .into_any_element(),
                 Err(e) => error_line(format!("Link cleanup failed: {e}"), cx).into_any_element(),
             });
         }
@@ -280,9 +277,7 @@ impl RommfsWindow {
                     .child(section_heading("Games folder"))
                     .child(status_marker(mount_kind, mount_text, cx)),
             )
-            .when_some(configured, |this, path| {
-                this.child(muted(path, cx))
-            })
+            .when_some(configured, |this, path| this.child(muted(path, cx)))
             .child(
                 h_flex()
                     .gap_2()
@@ -293,9 +288,10 @@ impl RommfsWindow {
                             Button::new("stop-mount")
                                 .label("Stop games folder")
                                 .outline()
-                                .on_click(
-                                    cx.listener(|view, _, _, cx| view.on_stop_mount(cx)),
-                                ),
+                                .tooltip(
+                                    "Games stay on the server; files already downloaded are kept.",
+                                )
+                                .on_click(cx.listener(|view, _, _, cx| view.on_stop_mount(cx))),
                         )
                     })
                     .when(connected, |this| {
@@ -310,27 +306,21 @@ impl RommfsWindow {
                         )
                     }),
             )
-            .when(ready, |this| {
-                this.child(muted_xs(
-                    "Stopping detaches the folder — games stay on the server and files already downloaded are kept, but the folder can't be opened until it starts again.",
-                    cx,
-                ))
-            })
             .when_some(self.state.mount_error.clone(), |this, error| {
-                let retry = self
-                    .state
-                    .mount_path
-                    .clone()
-                    .or_else(|| self.state.configured_mount_root.clone())
-                    .map(|path| {
-                        Button::new("retry-mount")
-                            .label("Retry")
-                            .primary()
-                            .small()
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.start_mount(path.clone(), cx)
-                            }))
-                    });
+                let retry =
+                    self.state
+                        .mount_path
+                        .clone()
+                        .or_else(|| self.state.configured_mount_root.clone())
+                        .map(|path| {
+                            Button::new("retry-mount")
+                                .label("Retry")
+                                .primary()
+                                .small()
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.start_mount(path.clone(), cx)
+                                }))
+                        });
                 this.child(failure_block(
                     "mount-failure",
                     "Couldn't start the games folder",
@@ -362,10 +352,30 @@ impl RommfsWindow {
                 ))
             })
             .when(self.state.catalogue_pending_remount, |this| {
-                this.child(muted(
-                    "A complete refresh is ready; stop and start the games folder to publish it.",
-                    cx,
-                ))
+                let restart = self
+                    .state
+                    .mount_path
+                    .clone()
+                    .or_else(|| self.state.configured_mount_root.clone());
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(status_marker(StatusKind::Warning, "Update ready", cx))
+                        .when_some(restart, |this, path| {
+                            this.child(
+                                Button::new("restart-mount")
+                                    .label("Restart folder")
+                                    .outline()
+                                    .small()
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.controller
+                                            .send(Command::RestartMount { path: path.clone() });
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
+                )
             })
             .when_some(
                 self.state.catalogue_progress.clone(),
@@ -382,9 +392,8 @@ impl RommfsWindow {
                     ))
                 },
             )
-            .when(
-                summary == FolderSummary::Starting,
-                |this| match self.state.mount_progress.clone() {
+            .when(summary == FolderSummary::Starting, |this| {
+                match self.state.mount_progress.clone() {
                     Some((stage, completed, total, elapsed)) => this.child(operation_progress(
                         "mount-progress",
                         &stage,
@@ -394,14 +403,7 @@ impl RommfsWindow {
                         cx,
                     )),
                     None => this.child(Progress::new("mount-progress").loading(true).small()),
-                },
-            )
-            .child(muted(
-                format!(
-                    "Game files download when an application opens them. {}",
-                    close_behavior_copy(self.tray_hides)
-                ),
-                cx,
-            ))
+                }
+            })
     }
 }

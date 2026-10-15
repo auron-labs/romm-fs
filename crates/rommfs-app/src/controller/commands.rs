@@ -58,6 +58,11 @@ pub enum Command {
         path: String,
     },
     StopMount,
+    /// Stop and re-start the games folder in one worker step, publishing a
+    /// pending catalogue refresh (phase 2b "Update ready").
+    RestartMount {
+        path: String,
+    },
     RefreshCatalogue,
     RefreshSaveSync,
     SelectSaveSyncInstallation {
@@ -97,9 +102,30 @@ pub(super) fn invalidates_save_sync_scope(command: &Command) -> bool {
             | Command::RestoreConnection
             | Command::Connect { .. }
             | Command::StartMount { .. }
+            | Command::RestartMount { .. }
             | Command::RefreshSaveSync
             | Command::SelectSaveSyncInstallation { .. }
             | Command::SetSaveSyncEnabled { enabled: false }
             | Command::Shutdown
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mounting_commands_invalidate_the_save_sync_scope() {
+        // A restart is a stop and a start, so it must invalidate like StartMount.
+        for command in [
+            Command::StartMount {
+                path: "/srv/games".into(),
+            },
+            Command::RestartMount {
+                path: "/srv/games".into(),
+            },
+        ] {
+            assert!(invalidates_save_sync_scope(&command));
+        }
+    }
 }

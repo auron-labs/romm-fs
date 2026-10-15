@@ -34,14 +34,42 @@ pub fn render(
         .child(log_section(view, log_scroll, cx))
 }
 
-/// One consistent treatment for anything needing action: a danger line plus
-/// an optional retry where a real command exists.
-fn attention_row(message: impl Into<String>, retry: Option<Button>, cx: &App) -> impl IntoElement {
-    h_flex()
-        .gap_3()
-        .items_center()
-        .child(div().flex_1().min_w_0().child(error_line(message, cx)))
-        .when_some(retry, |this, button| this.child(button))
+/// One consistent treatment for anything needing action (phase 2a rule 5):
+/// a headline naming what failed, a primary action, and the raw text behind
+/// "Details".
+fn attention_row(
+    id: &'static str,
+    headline: impl Into<SharedString>,
+    detail: Option<String>,
+    action: Option<Button>,
+    window: &mut Window,
+    cx: &mut Context<RommfsWindow>,
+) -> impl IntoElement {
+    v_flex()
+        .gap_1()
+        .child(
+            h_flex()
+                .gap_3()
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(cx.theme().danger)
+                        .child(headline.into()),
+                )
+                .when_some(action, |this, button| this.child(button)),
+        )
+        .when_some(detail, |this, detail| {
+            this.child(details_disclosure(
+                SharedString::from(format!("{id}-details")),
+                detail,
+                window,
+                cx,
+            ))
+        })
 }
 
 fn retry_button(
@@ -69,10 +97,13 @@ fn attention_section(
     if let Some(error) = &state.conn_error {
         rows.push(
             attention_row(
-                format!("Connection problem: {error}"),
+                "attention-connection",
+                "Couldn't connect to RomM",
+                Some(error.clone()),
                 Some(retry_button("retry-connection", cx, |view, _| {
                     view.controller.send(Command::RestoreConnection);
                 })),
+                window,
                 cx,
             )
             .into_any_element(),
@@ -81,20 +112,19 @@ fn attention_section(
     if let Some(error) = &state.startup_error {
         rows.push(
             attention_row(
-                format!("Startup problem: {error}"),
+                "attention-startup",
+                "Couldn't restore your last session",
+                Some(error.clone()),
                 Some(retry_button("retry-startup", cx, |view, _| {
                     view.controller.send(Command::RestoreConnection);
                 })),
+                window,
                 cx,
             )
             .into_any_element(),
         );
     }
     if state.mount == MountState::Failed {
-        let message = match &state.mount_error {
-            Some(error) => format!("Games folder failed to start: {error}"),
-            None => "Games folder failed to start".to_string(),
-        };
         let target = state
             .mount_path
             .clone()
@@ -105,21 +135,21 @@ fn attention_section(
                     .send(Command::StartMount { path: path.clone() });
             })
         });
-        // §6: the failure keeps expandable details — the target path the
-        // one-line summary doesn't carry.
+        let detail = match (&state.mount_error, target) {
+            (Some(error), _) => Some(error.clone()),
+            (None, Some(path)) => Some(path),
+            (None, None) => None,
+        };
         rows.push(
-            v_flex()
-                .gap_1()
-                .child(attention_row(message, retry, cx))
-                .when_some(target, |this, path| {
-                    this.child(details_disclosure(
-                        "attention-mount-details",
-                        format!("Games folder: {path}"),
-                        window,
-                        cx,
-                    ))
-                })
-                .into_any_element(),
+            attention_row(
+                "attention-mount",
+                "Couldn't start the games folder",
+                detail,
+                retry,
+                window,
+                cx,
+            )
+            .into_any_element(),
         );
     }
     let failed_downloads = state
@@ -128,26 +158,31 @@ fn attention_section(
         .filter(|d| matches!(d.finished, Some(Err(_))))
         .count();
     if failed_downloads > 0 {
-        // No retry command exists for downloads — the attention row only
-        // surfaces the failure; rows below keep the per-file error.
-        let message = if failed_downloads == 1 {
-            "1 download failed — see the file rows below".to_string()
-        } else {
-            format!(
-                "{} downloads failed — see the file rows below",
-                fmt_count(failed_downloads)
+        // No retry command exists for downloads — the raw per-file error
+        // stays on the file rows below.
+        rows.push(
+            attention_row(
+                "attention-downloads",
+                format!("{} failed", plural(failed_downloads, "download")),
+                None,
+                None,
+                window,
+                cx,
             )
-        };
-        rows.push(attention_row(message, None, cx).into_any_element());
+            .into_any_element(),
+        );
     }
     let save_sync_error = state.save_sync_attention();
     if let Some(error) = save_sync_error {
         rows.push(
             attention_row(
-                format!("Save sync needs attention: {error}"),
+                "attention-save-sync",
+                "Save sync needs attention",
+                Some(error),
                 Some(retry_button("retry-save-sync", cx, |view, _| {
                     view.controller.send(Command::RefreshSaveSync);
                 })),
+                window,
                 cx,
             )
             .into_any_element(),
@@ -160,22 +195,28 @@ fn attention_section(
     {
         rows.push(
             attention_row(
-                "Save sync stopped working — the background task exited".to_string(),
+                "attention-save-sync-actor",
+                "Save sync stopped working",
+                Some("The background task exited.".into()),
                 Some(retry_button("retry-save-sync", cx, |view, _| {
                     view.controller.send(Command::RefreshSaveSync);
                 })),
+                window,
                 cx,
             )
             .into_any_element(),
         );
     }
     if let Some(error) = &state.auxiliary_error {
+        let problem = UserProblem::from_text("Couldn't install support files", error);
         rows.push(
-            attention_row(
-                UserProblem::from_text("Couldn't install support files", error).line(),
+            problem_block(
+                "attention-auxiliary",
+                &problem,
                 Some(retry_button("retry-auxiliary", cx, |view, _| {
                     view.controller.send(Command::MaterializeAuxiliary);
                 })),
+                window,
                 cx,
             )
             .into_any_element(),
@@ -183,23 +224,23 @@ fn attention_section(
     }
     if let Some(error) = &state.retrobat_setup_error {
         // SetupRetroBat needs the install + managed roots, which only the
-        // settings page collects — no retry here.
+        // Settings page collects — no retry here.
+        let problem = UserProblem::from_text("Couldn't finish RetroBat setup", error);
         rows.push(
-            attention_row(
-                UserProblem::from_text("Couldn't finish RetroBat setup", error).line(),
-                None,
-                cx,
-            )
-            .into_any_element(),
+            problem_block("attention-retrobat-setup", &problem, None, window, cx)
+                .into_any_element(),
         );
     }
     if let Some(error) = &state.installer_error {
+        let problem = UserProblem::from_text("Couldn't get the RetroBat installer", error);
         rows.push(
-            attention_row(
-                UserProblem::from_text("Couldn't get the RetroBat installer", error).line(),
+            problem_block(
+                "attention-installer",
+                &problem,
                 Some(retry_button("retry-installer", cx, |view, _| {
                     view.controller.send(Command::DownloadRetroBatInstaller);
                 })),
+                window,
                 cx,
             )
             .into_any_element(),
@@ -208,8 +249,11 @@ fn attention_section(
     if let Some(error) = &state.frontend_metadata_error {
         rows.push(
             attention_row(
-                format!("Frontend metadata refresh failed: {error}"),
+                "attention-metadata",
+                "Frontend metadata refresh failed",
+                Some(error.clone()),
                 None,
+                window,
                 cx,
             )
             .into_any_element(),
@@ -217,14 +261,28 @@ fn attention_section(
     }
     if let Some(error) = &state.integration_error {
         rows.push(
-            attention_row(format!("Library layout change failed: {error}"), None, cx)
-                .into_any_element(),
+            attention_row(
+                "attention-integration",
+                "Library layout change failed",
+                Some(error.clone()),
+                None,
+                window,
+                cx,
+            )
+            .into_any_element(),
         );
     }
     if let Some(Err(error)) = &state.foreign_removal {
         rows.push(
-            attention_row(format!("Leftover-link cleanup failed: {error}"), None, cx)
-                .into_any_element(),
+            attention_row(
+                "attention-foreign",
+                "Couldn't remove leftover links",
+                Some(error.clone()),
+                None,
+                window,
+                cx,
+            )
+            .into_any_element(),
         );
     }
 
@@ -383,7 +441,7 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
             }
         });
         recent.push(
-            op_row(kind.color(cx), format!("Save sync — {label}"), detail).into_any_element(),
+            op_row(kind.color(cx), format!("Save sync · {label}"), detail).into_any_element(),
         );
         for transfer in &state.save_sync_transfers {
             let detail = transfer

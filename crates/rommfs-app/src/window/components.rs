@@ -61,6 +61,28 @@ pub(super) fn error_line(text: impl Into<String>, cx: &App) -> impl IntoElement 
         .child(text.into())
 }
 
+/// "3 systems" — counts read as numbers, never "system(s)" (phase 2a rule 6).
+pub(super) fn plural(count: usize, singular: &str) -> String {
+    let suffix = if count == 1 { "" } else { "s" };
+    format!("{} {singular}{suffix}", fmt_count(count))
+}
+
+/// A quiet ⓘ affordance: hover or keyboard focus reveals the explanation that
+/// would otherwise be a sentence in the page body (phase 2a rule 2).
+pub(super) fn info_button(id: &'static str, tooltip: &'static str) -> Button {
+    Button::new(id)
+        .ghost()
+        .small()
+        .icon(Icon::new(IconName::Info))
+        .tooltip(tooltip)
+        .accessibility_label("More information")
+}
+
+/// A short count or state chip (phase 2a rule 6: numbers, not prose).
+pub(super) fn chip(text: impl Into<SharedString>) -> Tag {
+    Tag::secondary().small().child(text.into())
+}
+
 /// "Technical details" disclosure for failure blocks: a quiet toggle plus
 /// the complete diagnostic text in mono. The full path and cause chain
 /// stay reachable even where the summary line is shortened (UI-PLAN §6).

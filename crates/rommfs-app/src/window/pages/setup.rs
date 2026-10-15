@@ -96,10 +96,10 @@ impl RommfsWindow {
                     .when_some(self.render_foreign_remediation(cx), |this, block| {
                         this.child(block)
                     })
-                    .child(self.nav_button(
+                    .child(self.settings_nav_button(
                         "setup-advanced",
                         "More options in Settings",
-                        3,
+                        1,
                         false,
                         cx,
                     )),
@@ -109,25 +109,27 @@ impl RommfsWindow {
                 v_flex()
                     .gap_3()
                     .child(section_heading("3. RetroBat (optional)"))
-                    .child(muted(
-                        "If you play through RetroBat, RomMFS can install it and connect it to your games folder. This is separate from the games folder above and never required.",
-                        cx,
-                    ))
+                    .child(div().child("Use RetroBat?"))
                     .child(
                         h_flex()
                             .gap_2()
                             .child(
                                 Button::new("setup-use-retrobat")
-                                    .label("I use RetroBat")
+                                    .label("Set up RetroBat")
                                     .outline()
                                     .on_click(cx.listener(|view, _, _, cx| {
                                         view.open_retrobat_settings(cx)
                                     })),
                             )
-                            .child(muted_xs(
-                                "Opens the RetroBat steps in Settings. Otherwise, skip this; you can set RetroBat up later from Settings.",
-                                cx,
-                            )),
+                            .child(
+                                Button::new("setup-skip-retrobat")
+                                    .label("Skip")
+                                    .ghost()
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.active_view = 0;
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
     }

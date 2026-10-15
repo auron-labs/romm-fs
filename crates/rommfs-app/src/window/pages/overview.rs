@@ -37,14 +37,14 @@ impl RommfsWindow {
                         .when_some(self.state.conn_error.clone(), |this, error| {
                             this.child(error_line(error, cx))
                         })
-                        .child(self.nav_button(
+                        .child(self.settings_nav_button(
                             "overview-connection",
                             if needs_sign_in {
                                 "Sign in"
                             } else {
                                 "Connection settings"
                             },
-                            3,
+                            0,
                             needs_sign_in,
                             cx,
                         )),
@@ -74,9 +74,8 @@ impl RommfsWindow {
                         |this| {
                             this.child(muted(
                                 format!(
-                                    "{} file{} found that aren't linked to a game yet",
-                                    fmt_count(unlinked),
-                                    if unlinked == 1 { "" } else { "s" }
+                                    "{} found that aren't linked to a game yet",
+                                    plural(unlinked, "file")
                                 ),
                                 cx,
                             ))
@@ -94,7 +93,7 @@ impl RommfsWindow {
         let (text, kind) = if self.state.retrobat_setup_running {
             ("Setting up\u{2026}", StatusKind::Warning)
         } else if self.state.retrobat_setup_error.is_some() {
-            ("Setup failed \u{2014} see Settings", StatusKind::Danger)
+            ("Setup failed", StatusKind::Danger)
         } else if self.state.retrobat_setup_ok {
             ("Ready", StatusKind::Success)
         } else if self.state.retrobat_root.is_some() {
@@ -120,6 +119,6 @@ impl RommfsWindow {
                     this
                 }
             })
-            .child(self.nav_button("overview-retrobat", "RetroBat settings", 3, false, cx))
+            .child(self.settings_nav_button("overview-retrobat", "RetroBat settings", 2, false, cx))
     }
 }

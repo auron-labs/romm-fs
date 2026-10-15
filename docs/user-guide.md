@@ -57,7 +57,7 @@ that copy before removing the private cache. Allow disk space for both copies.
 On Windows, closing the window hides it while mounting and save sync continue.
 The tray offers status, Open and Quit; **Quit** drains workers and stops the mount.
 If the tray cannot be created, closing the visible window quits instead.
-**Settings → Start at login** requires remembered browser sign-in and
+**Settings → Games folder → Start at login** requires remembered browser sign-in and
 launches in the tray, reconnects, mounts, then resumes the same enabled save scope.
 Passwords and tokens are never logged. Logout removes remembered sign-in and
 the login-startup entry, and cancels its active work.
@@ -148,7 +148,7 @@ instant (metadata only); the first launch of a game downloads its file once.
 > deletes anything already in RetroBat's `roms` folder, including the games
 > and gamelists a fresh RetroBat install ships.
 
-In **Settings → RetroBat**, use **Download official installer** and then
+In the **Settings → RetroBat** tab, use **Download official installer** and then
 **Launch installer…**, or select an installation you installed separately. Start RetroBat once and
 close it before setup so it creates its system configuration.
 RomMFS discovers the latest stable official Windows package, streams its bytes,
@@ -159,8 +159,9 @@ remove partial installation files. Stop RetroBat and its emulators before setup.
 Compatible versions are accepted by required layout,
 not version equality; 8.2.1 is the source/package research reference.
 
-In **Settings**, select RetroBat, choose its installation and a separate managed
-ROM folder, then choose **Set up RetroBat**. For each system RetroBat defines,
+In **Settings → Games folder**, select RetroBat, choose its installation and a
+separate managed ROM folder, then choose **Set up RetroBat** in the **RetroBat**
+tab. For each system RetroBat defines,
 setup adds one folder link, `roms/<system>/RomM` → `<managed folder>/<system>`.
 `roms/<system>` stays a real folder holding your own files; setup creates it
 only when RetroBat has none. A system that can't be linked (its folder is a link

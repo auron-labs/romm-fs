@@ -18,18 +18,20 @@ use gpui_kit::component::{
     input::{Input, InputContentType, InputEvent, InputState},
     label::Label,
     progress::Progress,
-    radio::RadioGroup,
+    radio::{Radio, RadioGroup},
     select::{SearchableVec, Select, SelectEvent, SelectState},
     separator::Separator,
     sidebar::{Sidebar, SidebarCollapsible, SidebarMenu, SidebarMenuItem},
     switch::Switch,
+    tab::{Tab, TabBar},
+    tag::Tag,
     try_parse_color, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
     StyledExt as _, Theme, ThemeMode,
 };
 use gpui_kit::{
     actions, div, point, prelude::*, px, size, AnyElement, App, Bounds, ClipboardItem, Context,
-    Entity, Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollAnchor,
-    ScrollHandle, SharedString, Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
+    Entity, Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollHandle,
+    SharedString, Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use rommfs_core::connection_settings::IntegrationMode;
 use rommfs_core::events::{AppEvent, ForeignKind, Level, SaveSyncIncomingStatus};
@@ -104,22 +106,18 @@ struct RommfsWindow {
     debounce_input_applied: String,
     debounce_error: Option<String>,
     active_view: usize,
+    /// Selected Settings tab (Account, Games folder, RetroBat, Saves, App).
+    settings_tab: usize,
     password_sign_in: bool,
     integration_choice: usize,
     /// Settings-tab installation picker; fed by the same discovery candidates
     /// as `install_select` but bound to the integration's RetroBat root.
     settings_install_select: Entity<SelectState<SearchableVec<SharedString>>>,
     completed_open: bool,
-    /// Settings > Advanced disclosure (save-change delay).
-    advanced_open: bool,
     /// One scroll handle per destination so each page keeps its own offset.
     page_scrolls: Vec<ScrollHandle>,
-    /// Anchor at the Settings RetroBat section (first-run "I use RetroBat").
-    retrobat_anchor: ScrollAnchor,
-    /// Scroll to the RetroBat section on the next Settings render.
-    scroll_to_retrobat: bool,
-    /// Settings > "Use a different save folder" disclosure.
-    custom_saves_open: bool,
+    /// One scroll handle per Settings tab so switching tabs keeps their offsets.
+    settings_tab_scrolls: Vec<ScrollHandle>,
     // --- Save review page state (window/pages/save_review.rs) ---
     /// Search box filtering the review table by name, file, or target path.
     #[allow(dead_code)] // read by pages/save_review.rs (UI-PLAN task 4)
@@ -364,15 +362,13 @@ impl RommfsWindow {
             // Fresh installs start on the guided setup view (UI-PLAN §3);
             // the first connection event re-routes to Overview.
             active_view: 4,
+            settings_tab: 0,
             password_sign_in: false,
             integration_choice: 0,
             settings_install_select,
             completed_open: false,
-            advanced_open: false,
             page_scrolls: page_scrolls.clone(),
-            retrobat_anchor: ScrollAnchor::for_handle(page_scrolls[3].clone()),
-            scroll_to_retrobat: false,
-            custom_saves_open: false,
+            settings_tab_scrolls: (0..5).map(|_| ScrollHandle::new()).collect(),
             save_review_search,
             save_review_page: 0,
             save_review_expanded: None,
@@ -727,12 +723,14 @@ impl Render for RommfsWindow {
                 960.,
                 pages::setup::render(self, window, cx).into_any_element(),
             ),
-            _ => page(
-                3,
-                "settings-view",
-                960.,
-                pages::settings::render(self, window, cx).into_any_element(),
-            ),
+            // Settings owns its tab bar and per-tab scrolling, so it is not
+            // wrapped in the shared page scroll region (phase 2c).
+            _ => div()
+                .id("settings-view")
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .child(pages::settings::render(self, window, cx)),
         };
         h_flex()
             .items_stretch()
