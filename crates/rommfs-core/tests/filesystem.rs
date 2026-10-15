@@ -58,6 +58,7 @@ fn rom(rom_id: i64, file_id: i64, name: &str, size: u64, sha1: &str) -> RomDto {
         is_physical: true,
         updated_at: "2026-10-01T00:00:00".into(),
         metadata: Default::default(),
+        rom_user: None,
         fs_path: String::new(),
         files: vec![RomFileDto {
             id: file_id,

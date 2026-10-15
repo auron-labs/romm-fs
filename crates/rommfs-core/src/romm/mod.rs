@@ -6,9 +6,14 @@
 pub mod client;
 mod firmware;
 mod pairing;
+pub mod play_data;
 mod saves;
 pub use firmware::FirmwareDto;
 pub use pairing::{PairedSession, PairingPoll, PairingRequest};
+pub use play_data::{
+    CollectionDto, PlayDataPermissions, PlaySessionDto, PlaySessionUpload, RemotePlayData,
+    RomUserDto, PLAY_DATA_SCOPES,
+};
 pub mod types;
 
 pub use client::{Credentials, DownloadConfig, MetadataConfig, RommClient};

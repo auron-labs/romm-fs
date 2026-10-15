@@ -213,6 +213,11 @@ pub struct UiState {
     pub frontend_metadata_pending: bool,
     pub frontend_metadata_detail: Option<String>,
     pub frontend_metadata_error: Option<String>,
+    /// The session holds the scopes play-data sync needs.
+    pub play_data_available: bool,
+    /// Consent is on for the connected server and account.
+    pub play_data_enabled: bool,
+    pub play_data_problem: Option<String>,
     pub pairing_code: Option<String>,
     pub conn: ConnectionState,
     pub conn_error: Option<String>,
@@ -293,6 +298,9 @@ impl UiState {
             frontend_metadata_pending: false,
             frontend_metadata_detail: None,
             frontend_metadata_error: None,
+            play_data_available: false,
+            play_data_enabled: false,
+            play_data_problem: None,
             pairing_code: None,
             conn: ConnectionState::Idle,
             conn_error: None,
@@ -407,6 +415,15 @@ impl UiState {
                 self.frontend_metadata_detail = Some(detail.clone());
                 self.frontend_metadata_error = error.clone();
             }
+            AppEvent::PlayDataUpdated {
+                available,
+                enabled,
+                problem,
+            } => {
+                self.play_data_available = *available;
+                self.play_data_enabled = *enabled;
+                self.play_data_problem = problem.clone();
+            }
             AppEvent::RetroBatSetup {
                 running,
                 detail,
@@ -502,6 +519,9 @@ impl UiState {
                 self.mount_path = None;
                 self.mount_error = None;
                 self.mount_progress = None;
+                self.play_data_available = false;
+                self.play_data_enabled = false;
+                self.play_data_problem = None;
             }
             AppEvent::PairingReady { user_code, .. } => {
                 self.pairing_code = Some(user_code.clone());

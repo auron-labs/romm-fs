@@ -95,6 +95,7 @@ fn case(directory: &Path, fixture: &FixtureServer, capture: bool) -> AgentCase {
         is_physical: false,
         updated_at: String::new(),
         metadata: Default::default(),
+        rom_user: None,
         fs_path: String::new(),
         files: vec![RomFileDto {
             id: FILE_ID,
@@ -289,6 +290,7 @@ fn second_game_mapping(case: &AgentCase) -> SaveMapping {
         is_physical: false,
         updated_at: String::new(),
         metadata: Default::default(),
+        rom_user: None,
         fs_path: String::new(),
         files: vec![RomFileDto {
             id: 80,

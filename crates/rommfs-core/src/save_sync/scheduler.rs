@@ -420,6 +420,7 @@ mod tests {
             is_physical: false,
             updated_at: String::new(),
             metadata: Default::default(),
+            rom_user: None,
             fs_path: String::new(),
             files: vec![RomFileDto {
                 id: file_id,

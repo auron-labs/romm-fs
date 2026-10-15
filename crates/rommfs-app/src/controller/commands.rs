@@ -74,6 +74,11 @@ pub enum Command {
     SetSaveSyncDebounce {
         seconds: u32,
     },
+    /// Turn favourites and play-history sync on or off for this server and
+    /// account. Consent is never inferred.
+    SetPlayDataSync {
+        enabled: bool,
+    },
     ExportSaveSyncIncoming {
         session_id: u64,
         incoming_id: String,

@@ -133,7 +133,11 @@ impl RommClient {
         &self,
         creds: Credentials<'_>,
     ) -> Result<Option<super::saves::SaveSyncIdentity>> {
-        let save_scopes = "platforms.read roms.read me.read assets.read assets.write";
+        // Save sync and play data share one session. The wider scope set is
+        // tried first; a limited account falls back to the ROM-only session and
+        // the missing features simply stay unavailable.
+        let save_scopes = "platforms.read roms.read me.read assets.read assets.write \
+             roms.user.read roms.user.write collections.read collections.write";
         match self.authenticate_scopes(
             Credentials {
                 username: creds.username,
@@ -391,14 +395,32 @@ impl RommClient {
         &self,
         path_and_query: &str,
     ) -> Result<T> {
-        let mut builder = isahc::Request::get(format!("{}{path_and_query}", self.base_url));
+        self.send_json("GET", path_and_query, None, None)
+    }
+
+    /// Authenticated request whose JSON body is parsed as the documented shape.
+    /// The body (when present) is already serialized; `content_type` defaults to
+    /// JSON. A mid-session 401 clears the token (sign-in is required again).
+    pub(super) fn send_json<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        body: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<T> {
+        let mut builder = isahc::Request::builder()
+            .method(method)
+            .uri(format!("{}{path_and_query}", self.base_url));
         if let Some(t) = self.token.read().unwrap().clone() {
             builder = builder.header("Authorization", format!("Bearer {t}"));
+        }
+        if let Some(content_type) = content_type {
+            builder = builder.header("Content-Type", content_type);
         }
         let request = builder
             .connect_timeout(self.metadata.connect_timeout)
             .timeout(self.metadata.response_timeout)
-            .body(())
+            .body(body.map(str::to_owned).unwrap_or_default())
             .map_err(|e| Error::Transport(format!("request build failed: {e}")))?;
         let mut resp = request.send().map_err(transport)?;
         match resp.status().as_u16() {
@@ -444,7 +466,7 @@ fn detail_of(resp: &mut isahc::Response<isahc::Body>) -> String {
 
 /// `application/x-www-form-urlencoded` value encoding: unreserved characters
 /// are kept, everything else is percent-encoded at the UTF-8 byte level.
-fn form_encode(s: &str) -> String {
+pub(super) fn form_encode(s: &str) -> String {
     pct_encode(s)
 }
 

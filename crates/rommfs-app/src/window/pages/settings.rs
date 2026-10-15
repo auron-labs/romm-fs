@@ -117,7 +117,33 @@ impl RommfsWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        v_flex().gap_3().child(self.render_connection(window, cx))
+        let missing_permission =
+            !self.state.play_data_available && self.state.conn == ConnectionState::Connected;
+        v_flex()
+            .gap_3()
+            .child(self.render_connection(window, cx))
+            .when(missing_permission, |this| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(status_marker(
+                            StatusKind::Warning,
+                            "Favourites & play history · Needs permission",
+                            cx,
+                        ))
+                        .child(
+                            Button::new("reconnect-play-data")
+                                .label("Reconnect")
+                                .outline()
+                                .small()
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.on_connect(cx);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
     }
 
     /// Games folder: location, library layout, and start at login.
@@ -423,6 +449,44 @@ impl RommfsWindow {
                     )
                     .child(self.render_save_delay(cx)),
             )
+            .child(self.render_play_history(cx))
+    }
+
+    /// Favourites and play history: off until the user turns it on, and only
+    /// available once the session holds the play-data scopes (phase 3).
+    fn render_play_history(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let available = self.state.play_data_available;
+        let enabled = self.state.play_data_enabled;
+        let switch = Switch::new("play-data-sync")
+            .checked(enabled)
+            .label("Favourites & play history")
+            .disabled(!available);
+        let switch = if available {
+            switch
+        } else {
+            switch.tooltip("Reconnect to grant the favourites and play-history permissions.")
+        };
+        v_flex()
+            .gap_2()
+            .child(section_heading("Play history"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(switch.on_change(cx.listener(|view, checked, _, cx| {
+                        view.controller.send(Command::SetPlayDataSync {
+                            enabled: *checked,
+                        });
+                        cx.notify();
+                    })))
+                    .child(info_button(
+                        "play-data-help",
+                        "Favourites, last played, play count and play time sync both ways with RomM. The later value wins for last played; a favourite changed on both sides keeps the RetroBat value.",
+                    )),
+            )
+            .when_some(self.state.play_data_problem.clone(), |this, problem| {
+                this.child(error_line(problem, cx))
+            })
     }
 
     /// The quiet period before a changed save uploads.

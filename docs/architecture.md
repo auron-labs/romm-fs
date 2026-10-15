@@ -76,6 +76,16 @@ live RomM instance. `route_hit_count` counts scripted route matches;
   excluded. Unreadable systems retain their identity state. Gamelist writes
   are attempted independently; any write failure leaves the identity index
   staged so a retry cannot recapture old XML against new filename mappings.
+- Favourites and play-history sync (`romm/play_data.rs`, `retrobat/play_data.rs`)
+  is opt-in and scoped to the verified server and account (`play_data_consent`).
+  The metadata pass pulls the favourites collection and the account's play
+  sessions once, reconciles each `./RomM/…` game against a per-identity baseline
+  stored in the metadata index, and publishes the merged values; a new local
+  launch is pushed as a play session. The first reconciliation adopts the union
+  of both sides instead of adding two histories. A failed push keeps the local
+  delta for the next pass. A debounced gamelist watch re-runs metadata after
+  RetroBat writes play data, on the metadata thread and under the same
+  stopped-RetroBat guard.
 - Save-sync consent and journal state are separate from mount configuration.
   Paths, scopes, and identities are validated before reads or writes.
 

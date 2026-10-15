@@ -15,6 +15,7 @@ pub fn auxiliary_paths(
     ))
 }
 mod metadata;
+mod play_data;
 mod setup;
 mod xml;
 
@@ -26,7 +27,11 @@ pub use installer::{
 };
 pub use metadata::{
     generate_gamelists, publish_gamelists, read_gamelists, FrontendGamelists, MetadataIndex,
-    MetadataPublication,
+    MetadataPublication, PlaySync, PLAY_FAMILY_NAME,
+};
+pub use play_data::{
+    build_remote_play, is_play_field, merge_play, parse_play_fields, render_play_fields,
+    PlayBaseline, PlayMerge, PlayPush, PlayValues, PLAY_FIELDS,
 };
 pub use setup::{
     inspect_setup, linked_systems, setup_roms_link, verify_setup_link, SetupOutcome, SetupRecord,

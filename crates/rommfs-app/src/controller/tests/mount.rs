@@ -314,6 +314,11 @@ fn worker_loop_sweeps_again_after_the_mount_start_sweep() {
             current_save_sync_epoch: 0,
             save_sync_runtime_problem: None,
             save_sync_session_id: 0,
+            play_data_enabled: false,
+            play_data_available: false,
+            play_data_problem: None,
+            play_watch: None,
+            play_watch_checked: Instant::now(),
         };
         worker_loop_with_interval_from(cmd_rx, worker, Duration::from_millis(10));
     });

@@ -20,7 +20,9 @@ use rommfs_core::cache::{CacheIndex, Evictor, FakeClock, LiveState};
 use rommfs_core::catalogue::{build_catalogue, server_id_of, RomKey};
 use rommfs_core::download::DownloadManager;
 use rommfs_core::filesystem::RommFs;
-use rommfs_core::retrobat::{generate_gamelists, FrontendGamelists, MetadataIndex};
+use rommfs_core::retrobat::{
+    generate_gamelists, FrontendGamelists, MetadataIndex, PlayPush, PlaySync,
+};
 use rommfs_core::romm::{Credentials, RommClient};
 use rommfs_core::tree::RommTree;
 use rommfs_fixture::{contract, FixtureServer, ResponseSpec};
@@ -245,6 +247,12 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
         &FrontendGamelists::default(),
         &BTreeMap::new(),
         &HashMap::new(),
+        &mut PlaySync {
+            enabled: false,
+            remote: &HashMap::new(),
+            push: &mut |_: &PlayPush| Ok(()),
+            now: 0,
+        },
     )
     .unwrap();
     let cached = workspace.path().join("cached-artwork.png");

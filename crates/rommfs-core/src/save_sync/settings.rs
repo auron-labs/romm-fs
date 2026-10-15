@@ -80,6 +80,12 @@ impl SaveSyncSettingsStore {
                 CREATE TABLE IF NOT EXISTS save_sync_selection (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     installation_root TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS play_data_consent (
+                    server_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+                    PRIMARY KEY (server_id, account_id)
                 );",
             )
             .map_err(sqlite)?;
@@ -179,6 +185,42 @@ impl SaveSyncSettingsStore {
                     settings.enabled,
                     settings.debounce_secs,
                 ],
+            )
+            .map_err(sqlite)?;
+        Ok(())
+    }
+
+    /// Play-data consent (favourites and play history) is scoped to the
+    /// verified server and account, and is off until the user turns it on. It
+    /// is never inferred from a discovered installation.
+    pub fn load_play_data(&self, server_id: &str, account_id: &str) -> Result<bool> {
+        if server_id.trim().is_empty() || account_id.trim().is_empty() {
+            return Err(Error::Unsupported(
+                "play-data consent requires a server and authenticated account".into(),
+            ));
+        }
+        self.connection
+            .query_row(
+                "SELECT enabled FROM play_data_consent WHERE server_id = ?1 AND account_id = ?2",
+                [server_id, account_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|enabled| enabled.unwrap_or(false))
+            .map_err(sqlite)
+    }
+
+    pub fn save_play_data(&self, server_id: &str, account_id: &str, enabled: bool) -> Result<()> {
+        if server_id.trim().is_empty() || account_id.trim().is_empty() {
+            return Err(Error::Unsupported(
+                "play-data consent requires a server and authenticated account".into(),
+            ));
+        }
+        self.connection
+            .execute(
+                "INSERT INTO play_data_consent (server_id, account_id, enabled) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (server_id, account_id) DO UPDATE SET enabled = excluded.enabled",
+                rusqlite::params![server_id, account_id, enabled],
             )
             .map_err(sqlite)?;
         Ok(())

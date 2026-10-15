@@ -272,6 +272,7 @@ fn preview_reports_mapped_targets_separately_from_empty_existing_saves_before_co
         is_physical: false,
         updated_at: String::new(),
         metadata: Default::default(),
+        rom_user: None,
         fs_path: String::new(),
         files: vec![RomFileDto {
             id: 70,

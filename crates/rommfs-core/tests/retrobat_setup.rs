@@ -345,7 +345,7 @@ fn config_backup_is_local_repeatable_and_missing_emulators_are_not_setting_error
 fn publication_excludes_missing_replaced_and_redirected_links() {
     use rommfs_core::retrobat::{
         generate_gamelists, inspect_setup, linked_systems, publish_gamelists, read_gamelists,
-        MetadataIndex,
+        MetadataIndex, PlayPush, PlaySync,
     };
     use std::collections::{BTreeMap, HashMap};
 
@@ -402,6 +402,12 @@ fn publication_excludes_missing_replaced_and_redirected_links() {
             &frontend,
             &BTreeMap::new(),
             &HashMap::new(),
+            &mut PlaySync {
+                enabled: false,
+                remote: &HashMap::new(),
+                push: &mut |_: &PlayPush| Ok(()),
+                now: 0,
+            },
         )
         .unwrap();
         assert!(publish_gamelists(&install, &linked, &output).is_empty());

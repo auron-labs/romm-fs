@@ -209,6 +209,8 @@ impl Worker {
             self.cancel_metadata();
             return;
         };
+        let client = self.client.clone();
+        let play_enabled = self.play_data_ready() && client.is_some();
         // A running artwork job owns the cancellation flag; a publication with
         // no artwork job publishes under a live flag.
         let active = self
@@ -225,6 +227,8 @@ impl Worker {
             catalogue,
             snapshot,
             artwork,
+            client,
+            play_enabled,
         );
     }
 
@@ -240,6 +244,8 @@ impl Worker {
         catalogue: Catalogue,
         snapshot: CatalogueSnapshot,
         artwork: rommfs_core::retrobat::ArtworkBatch,
+        client: Option<Arc<RommClient>>,
+        play_enabled: bool,
     ) {
         let sink = self.sink.clone();
         let (tx, rx) = mpsc::channel();
@@ -256,6 +262,8 @@ impl Worker {
                 catalogue,
                 snapshot,
                 artwork,
+                client,
+                play_enabled,
             ));
         }));
     }
@@ -459,6 +467,7 @@ impl Worker {
                 self.store_catalogue(catalogue);
             }
             self.refresh_save_sync();
+            self.refresh_play_data();
             Ok(())
         })();
         if let Err(error) = result {
@@ -522,11 +531,39 @@ fn publish_metadata(
     catalogue: Catalogue,
     snapshot: CatalogueSnapshot,
     artwork: rommfs_core::retrobat::ArtworkBatch,
+    client: Option<Arc<RommClient>>,
+    play_enabled: bool,
 ) -> MetadataPublication {
     let mut problems = Vec::new();
     for warning in artwork.warnings() {
         sink.emit(AppEvent::log(Level::Warn, "artwork", warning.clone()));
     }
+    // Pull the remote play state once; a failure just skips reconciliation and
+    // keeps the gamelist's own values for this pass.
+    let mut play_enabled = play_enabled && client.is_some();
+    let mut remote_play = HashMap::new();
+    let mut favorite_collection = None;
+    if play_enabled {
+        if let Some(client) = client.as_ref() {
+            match fetch_play_data(client, &snapshot.roms) {
+                Ok(fetch) => {
+                    remote_play = fetch.remote;
+                    favorite_collection = fetch.favorite_collection;
+                }
+                Err(error) => {
+                    play_enabled = false;
+                    problems.push((
+                        "play data".to_string(),
+                        format!("favourites and play history were not read: {error:#}"),
+                    ));
+                }
+            }
+        }
+    }
+    let mut push_play_data = |plan: &rommfs_core::retrobat::PlayPush| match client.as_ref() {
+        Some(client) => push_play_data(client, &mut favorite_collection, plan),
+        None => Err("play data is unavailable".to_string()),
+    };
     let result = (|| -> anyhow::Result<usize> {
         let linked = rommfs_core::retrobat::linked_systems(&installation, &root, &server)?;
         let frontend = rommfs_core::retrobat::read_gamelists(&installation, &linked);
@@ -540,6 +577,12 @@ fn publish_metadata(
             &frontend,
             &legacy,
             artwork.references(),
+            &mut rommfs_core::retrobat::PlaySync {
+                enabled: play_enabled,
+                remote: &remote_play,
+                push: &mut push_play_data,
+                now: rommfs_core::cache::now_unix_secs() as i64,
+            },
         )?;
         problems.extend(publication.skipped().iter().cloned());
         let changed = publication.gamelists().len();
@@ -583,4 +626,78 @@ fn publish_metadata(
         changed: result.map_err(|error| format!("{error:#}")),
         problems,
     }
+}
+
+struct PlayFetch {
+    remote: HashMap<i64, rommfs_core::romm::RemotePlayData>,
+    favorite_collection: Option<i64>,
+}
+
+/// Read every play-data fact the merge needs: the favourites collection, the
+/// account's play sessions and each ROM's `last_played`/`hidden`.
+fn fetch_play_data(
+    client: &RommClient,
+    roms: &[rommfs_core::romm::RomDto],
+) -> anyhow::Result<PlayFetch> {
+    let collections = client.collections()?;
+    let favorite = collections
+        .into_iter()
+        .find(|collection| collection.is_favorite);
+    let favorite_ids = favorite
+        .as_ref()
+        .map(|collection| collection.rom_ids.clone())
+        .unwrap_or_default();
+    let sessions = client.all_play_sessions()?;
+    let mut rom_user = HashMap::new();
+    for rom in roms {
+        if let Some(user) = &rom.rom_user {
+            rom_user.insert(rom.id, user.clone());
+        }
+    }
+    Ok(PlayFetch {
+        remote: rommfs_core::retrobat::build_remote_play(&rom_user, &favorite_ids, &sessions),
+        favorite_collection: favorite.map(|collection| collection.id),
+    })
+}
+
+/// Execute one game's push. Calls are independent; any failure keeps the local
+/// delta for the next pass and is reported against that game.
+fn push_play_data(
+    client: &RommClient,
+    favorite_collection: &mut Option<i64>,
+    plan: &rommfs_core::retrobat::PlayPush,
+) -> std::result::Result<(), String> {
+    if let Some(favorite) = plan.favorite {
+        let collection = match *favorite_collection {
+            Some(id) => id,
+            None => {
+                let created = client
+                    .create_favorite_collection(rommfs_core::retrobat::PLAY_FAMILY_NAME)
+                    .or_else(|_| {
+                        client
+                            .collections()?
+                            .into_iter()
+                            .find(|collection| collection.is_favorite)
+                            .ok_or_else(|| {
+                                Error::Unsupported("the server has no favourites collection".into())
+                            })
+                    })
+                    .map_err(|error| format!("{error:#}"))?;
+                *favorite_collection = Some(created.id);
+                created.id
+            }
+        };
+        let result = if favorite {
+            client.add_collection_roms(collection, &[plan.rom_id])
+        } else {
+            client.remove_collection_roms(collection, &[plan.rom_id])
+        };
+        result.map_err(|error| format!("{error:#}"))?;
+    }
+    if !plan.sessions.is_empty() {
+        client
+            .ingest_play_sessions(&plan.sessions)
+            .map_err(|error| format!("{error:#}"))?;
+    }
+    Ok(())
 }

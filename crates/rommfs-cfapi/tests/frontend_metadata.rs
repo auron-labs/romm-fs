@@ -3,8 +3,20 @@ use rommfs_cfapi::{
 };
 use rommfs_core::catalogue::build_catalogue;
 use rommfs_core::retrobat::{
-    generate_gamelists, FrontendGamelists, MetadataIndex, MetadataPublication,
+    generate_gamelists, FrontendGamelists, MetadataIndex, MetadataPublication, PlayPush, PlaySync,
 };
+
+/// Reconciliation context with play-data sync off, as most tests run.
+macro_rules! play_off {
+    () => {
+        &mut PlaySync {
+            enabled: false,
+            remote: &HashMap::new(),
+            push: &mut |_: &PlayPush| Ok(()),
+            now: 0,
+        }
+    };
+}
 use rommfs_core::romm::{PlatformDto, RomDto};
 use rommfs_fixture::contract;
 use std::collections::{BTreeMap, HashMap};
@@ -25,6 +37,7 @@ fn publication(legacy: &BTreeMap<String, String>, index: &MetadataIndex) -> Meta
         &FrontendGamelists::default(),
         legacy,
         &HashMap::new(),
+        play_off!(),
     )
     .unwrap()
 }
@@ -162,6 +175,7 @@ fn failed_gamelist_publication_retries_swapped_paths_without_reassigning_history
         &FrontendGamelists::default(),
         &BTreeMap::new(),
         &HashMap::new(),
+        play_off!(),
     )
     .unwrap();
     let old = FrontendGamelists::new(BTreeMap::from([("gb".into(), "<gameList><game><path>./RomM/A.gb</path><playcount>11</playcount></game><game><path>./RomM/B.gb</path><playcount>22</playcount></game></gameList>".into())]));
@@ -177,6 +191,7 @@ fn failed_gamelist_publication_retries_swapped_paths_without_reassigning_history
         &old,
         &BTreeMap::new(),
         &HashMap::new(),
+        play_off!(),
     )
     .unwrap();
     let result = publish_frontend_metadata(&root, "s", prepared.index(), &BTreeMap::new(), || {
@@ -205,6 +220,7 @@ fn failed_gamelist_publication_retries_swapped_paths_without_reassigning_history
         &unreadable,
         &BTreeMap::new(),
         &HashMap::new(),
+        play_off!(),
     )
     .unwrap();
     publish_frontend_metadata(&root, "s", skipped.index(), &BTreeMap::new(), || {
@@ -225,6 +241,7 @@ fn failed_gamelist_publication_retries_swapped_paths_without_reassigning_history
         &old,
         &BTreeMap::new(),
         &HashMap::new(),
+        play_off!(),
     )
     .unwrap();
     assert_eq!(
@@ -257,6 +274,7 @@ fn failed_gamelist_publication_retries_swapped_paths_without_reassigning_history
         &frontend,
         &BTreeMap::new(),
         &HashMap::new(),
+        play_off!(),
     )
     .unwrap();
     assert!(unchanged.gamelists().is_empty());

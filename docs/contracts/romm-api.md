@@ -115,6 +115,58 @@ Sources: [ROM schema](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a86
 [resource prefix](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/config/__init__.py),
 [resource serving](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/docker/nginx/templates/default.conf.template).
 
+## Favourites and play history (source-backed)
+
+Favourites are a per-user collection with `is_favorite: true`.
+`GET /api/collections` (`collections.read`) lists the user's and public
+collections; `CollectionSchema` carries `id`, `name`, `is_favorite` and
+`rom_ids`. `POST /api/collections` (form `name`, `is_favorite`, …) creates one
+(`collections.write`); `POST`/`DELETE /api/collections/{id}/roms` with a JSON
+body `{"rom_ids":[…]}` add or remove members atomically. The API does not
+enforce a single favourite per user; the client takes the first favourite
+collection and creates one when none exists.
+
+RomM has no play-count or play-time field; both are derived from play sessions,
+and `last_played` lives on `RomUser`.
+
+- `GET /api/play-sessions?start_after=<epoch>` (`roms.user.read`) returns the
+  whole history in one page. Per ROM, play count is the number of sessions with
+  `duration_ms > 0` and total time is the sum of `duration_ms`.
+- `POST /api/play-sessions` (`roms.user.write`, body
+  `{"sessions":[{"rom_id","start_time","end_time","duration_ms"}]}`, ≤100)
+  records sessions, dedups on `(rom_id, device, start_time)`, and advances
+  `last_played` to the newest session's `end_time`. This is how a gamelist
+  `lastplayed` is pushed exactly; `PUT /api/roms/{id}/props?update_last_played=true`
+  can only set *now*.
+- `GET /api/roms` embeds `rom_user` per ROM (`last_played`, `hidden`).
+- `PUT /api/roms/{id}/props` (`roms.user.write`, JSON body) sets `hidden` and
+  `rating`.
+
+Scopes `roms.user.read`, `roms.user.write`, `collections.read` and
+`collections.write` are requested at pairing and in the wider password scope set.
+An account without them keeps ROM access; play-data sync simply stays
+unavailable. Consent is off until the user enables it, scoped to the verified
+server and account. `RomUser.rating` (0–10, the user's own rating) does not map
+to the gamelist `rating` (0–1, from `metadatum.average_rating`), so it is not
+synced. `hidden` is not part of play-data sync either; the "hide RomM copies"
+feature owns it, so the route is documented here but not driven by this pass.
+
+On the gamelist side RetroBat's EmulationStation writes `favorite`
+(`true`/`false`), `playcount`, `lastplayed` (`YYYYMMDDTHHMMSS`) and `gametime`
+(minutes); plus `hidden`, which play-data sync leaves untouched. RomMFS reads
+these for its own `./RomM/…` entries only.
+The timestamp is written without a zone and is treated as UTC; a non-UTC local
+time is therefore offset. The first reconciliation for a game adopts the union
+of both sides (highest count and time, later `lastplayed`, either favourite or
+hidden flag) instead of adding two pre-existing histories, so enabling sync on
+an existing install does not double-count plays; pre-existing local plays are
+not re-uploaded.
+
+Sources: [collections](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/endpoints/collections.py),
+[play sessions](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/endpoints/play_sessions.py),
+[play-session ingestion](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/handler/play_session_handler.py),
+[ROM props and `RomUser`](https://github.com/rommapp/romm/blob/95599dadbe93c8f7b8a8647148fafbe293df3167/backend/endpoints/roms/__init__.py).
+
 ## File destinations and remaining limits
 
 | Content | API/source | Generic folders | RetroBat | Launchable metadata |

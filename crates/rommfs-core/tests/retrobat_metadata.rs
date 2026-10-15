@@ -1,7 +1,7 @@
 use rommfs_core::catalogue::{build_catalogue, Catalogue};
 use rommfs_core::retrobat::{
     generate_gamelists, publish_gamelists, read_gamelists, FrontendGamelists, MetadataIndex,
-    MetadataPublication,
+    MetadataPublication, PlayPush, PlaySync,
 };
 use rommfs_core::romm::{PlatformDto, RomDto};
 use rommfs_fixture::contract;
@@ -17,6 +17,18 @@ fn sources(name: &str) -> (Vec<PlatformDto>, Vec<RomDto>) {
     rom["summary"] = json!("Description & details");
     rom["metadatum"] = json!({"genres":["Adventure"],"developers":["Dev"],"publishers":["Pub"],"player_count":"1-2","first_release_date":946684800,"average_rating":85.0});
     (platforms, vec![serde_json::from_value(rom).unwrap()])
+}
+
+/// Reconciliation context with play-data sync off, as most tests run.
+macro_rules! play_off {
+    () => {
+        &mut PlaySync {
+            enabled: false,
+            remote: &HashMap::new(),
+            push: &mut |_: &PlayPush| Ok(()),
+            now: 0,
+        }
+    };
 }
 
 fn frontend(system: &str, xml: &str) -> FrontendGamelists {
@@ -38,6 +50,7 @@ fn generate(
         frontend,
         &BTreeMap::new(),
         &HashMap::new(),
+        play_off!(),
     )
     .unwrap()
 }
@@ -70,6 +83,7 @@ fn generated_entries_live_under_the_romm_folder_and_are_xml_safe() {
         &FrontendGamelists::default(),
         &BTreeMap::new(),
         &art,
+        play_off!(),
     )
     .unwrap();
     let xml = gamelist(&output, "gb");
@@ -166,6 +180,7 @@ fn existing_artwork_is_kept_until_fresh_artwork_is_available() {
         &frontend("gb", &xml),
         &BTreeMap::new(),
         &art,
+        play_off!(),
     )
     .unwrap();
     let xml = gamelist(&fresh, "gb");
@@ -260,6 +275,7 @@ fn an_index_for_another_account_starts_fresh_instead_of_refusing() {
         &FrontendGamelists::default(),
         &BTreeMap::new(),
         &HashMap::new(),
+        play_off!(),
     )
     .unwrap();
     let output = generate(&cat, &roms, other.index(), &FrontendGamelists::default());
@@ -283,6 +299,7 @@ fn legacy_managed_gamelists_contribute_frontend_state() {
         &FrontendGamelists::default(),
         &legacy,
         &HashMap::new(),
+        play_off!(),
     )
     .unwrap();
     let xml = gamelist(&output, "gb");

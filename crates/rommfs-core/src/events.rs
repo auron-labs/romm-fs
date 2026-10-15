@@ -170,6 +170,14 @@ pub enum AppEvent {
         detail: String,
         error: Option<String>,
     },
+    /// Play-data sync (favourites and play history) availability and consent.
+    PlayDataUpdated {
+        /// The session holds all four play-data scopes.
+        available: bool,
+        /// Consent is on for this server and account.
+        enabled: bool,
+        problem: Option<String>,
+    },
     RetroBatSetup {
         running: bool,
         detail: String,

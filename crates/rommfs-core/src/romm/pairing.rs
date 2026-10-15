@@ -37,7 +37,8 @@ impl RommClient {
         let payload = serde_json::json!({
             "client_device_identifier": device_identifier, "name": "RomMFS",
             "client": "rommfs", "platform": "windows", "client_version": env!("CARGO_PKG_VERSION"),
-            "requested_scopes": ["platforms.read", "roms.read", "me.read", "assets.read", "assets.write", "firmware.read"]
+            "requested_scopes": ["platforms.read", "roms.read", "me.read", "assets.read", "assets.write", "firmware.read",
+                "roms.user.read", "roms.user.write", "collections.read", "collections.write"]
         });
         let mut response = self.pairing_post("/api/auth/device/init", payload)?;
         match response.status().as_u16() {

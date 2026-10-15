@@ -1,6 +1,10 @@
+use super::play_data::{
+    is_play_field, merge_play, parse_play_fields, render_play_fields, PlayBaseline, PlayPush,
+    PlayValues,
+};
 use super::setup::ROMM_FOLDER;
 use crate::catalogue::Catalogue;
-use crate::romm::RomDto;
+use crate::romm::{RemotePlayData, RomDto};
 use crate::save_sync::{ensure_no_reparse_components, path_is_reparse_point};
 use anyhow::Context;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
@@ -31,6 +35,13 @@ impl MetadataIndex {
         index.pending_publication = true;
         index
     }
+
+    /// The reconciled play baseline for one game identity (`rom_id:file_id`).
+    pub fn play_baseline(&self, rom_id: i64, file_id: i64) -> Option<&PlayBaseline> {
+        self.games
+            .get(&format!("{rom_id}:{file_id}"))
+            .map(|game| &game.play)
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -40,6 +51,9 @@ struct IndexedGame {
     frontend_fields: Vec<String>,
     #[serde(default = "initially_active")]
     active: bool,
+    /// Last reconciled local and remote play data (favourites and history).
+    #[serde(default)]
+    play: PlayBaseline,
 }
 
 fn initially_active() -> bool {
@@ -106,7 +120,25 @@ struct Captured {
     fields: Vec<String>,
     /// Existing artwork elements, kept until fresh artwork is available.
     artwork: Vec<(String, String)>,
+    /// Play values parsed from `fields`.
+    play: PlayValues,
 }
+
+/// Play-data reconciliation for one publication. `enabled` is only true when
+/// the user consented and the session holds the play-data scopes; otherwise the
+/// gamelist's own values are kept verbatim.
+pub struct PlaySync<'a> {
+    pub enabled: bool,
+    /// Remote values keyed by RomM ROM id.
+    pub remote: &'a HashMap<i64, RemotePlayData>,
+    /// Executes one push. `Err` keeps the local delta for the next pass.
+    pub push: &'a mut dyn FnMut(&PlayPush) -> std::result::Result<(), String>,
+    /// Unix seconds used to bound synthesized sessions.
+    pub now: i64,
+}
+
+/// The name RomMFS gives its favourites collection in RomM.
+pub const PLAY_FAMILY_NAME: &str = "Favourites";
 
 fn element_text(node: &str) -> anyhow::Result<String> {
     #[derive(Deserialize)]
@@ -176,6 +208,7 @@ fn split_gamelist(
                         entry.fields.push(field);
                     }
                 }
+                entry.play = parse_play_fields(&entry.fields);
                 Ok(path
                     .and_then(|path| managed_path(system, &path, legacy))
                     .map(|key| (key.to_lowercase(), entry)))
@@ -211,6 +244,7 @@ pub fn generate_gamelists(
     frontend: &FrontendGamelists,
     legacy: &BTreeMap<String, String>,
     artwork: &HashMap<(i64, &'static str), String>,
+    play: &mut PlaySync,
 ) -> anyhow::Result<MetadataPublication> {
     anyhow::ensure!(account_id > 0, "metadata requires a verified account");
     // An index for another server or account says nothing about these games.
@@ -325,9 +359,56 @@ pub fn generate_gamelists(
                     .unwrap_or_default()
             },
             active: true,
+            play: PlayBaseline::default(),
         });
         state.path = path;
         state.active = true;
+
+        // Reconcile play data before writing the entry. `emit_generated_play`
+        // is false when the feature is off or a push failed, in which case the
+        // gamelist's own nodes are kept exactly as they were.
+        let mut emit_generated_play = false;
+        let mut merged_play = PlayValues::default();
+        if play.enabled {
+            let local_play = captured
+                .get(&key)
+                .map(|captured| captured.play.clone())
+                .unwrap_or_else(|| state.play.synced_local.clone());
+            let remote_play = play
+                .remote
+                .get(&entry.key.rom_id)
+                .cloned()
+                .unwrap_or_default();
+            let merge = merge_play(
+                entry.key.rom_id,
+                &local_play,
+                &remote_play,
+                &state.play,
+                play.now,
+            );
+            for note in &merge.notes {
+                skipped.push((
+                    entry.platform_dir.clone(),
+                    format!("{}: {note}", entry.file_name),
+                ));
+            }
+            let pushed = if merge.push.is_empty() {
+                Ok(())
+            } else {
+                (play.push)(&merge.push)
+            };
+            match pushed {
+                Ok(()) => {
+                    state.play = merge.baseline_after_push;
+                    merged_play = merge.merged;
+                    emit_generated_play = true;
+                }
+                Err(error) => skipped.push((
+                    entry.platform_dir.clone(),
+                    format!("{}: play history not synced: {error}", entry.file_name),
+                )),
+            }
+        }
 
         let mut writer = Writer::new(Vec::new());
         writer.write_event(Event::Start(BytesStart::new("game")))?;
@@ -404,7 +485,16 @@ pub fn generate_gamelists(
                 nodes.len() == 1 && !GENERATED.contains(&nodes[0].0.as_str()),
                 "invalid saved frontend field"
             );
+            // Reconciled play fields are written from RomM's state below.
+            if emit_generated_play && is_play_field(&nodes[0].0) {
+                continue;
+            }
             writer.get_mut().extend_from_slice(raw.as_bytes());
+        }
+        if emit_generated_play {
+            for (name, text) in render_play_fields(&merged_play) {
+                field(&mut writer, name, &text)?;
+            }
         }
         writer.write_event(Event::End(BytesEnd::new("game")))?;
         games

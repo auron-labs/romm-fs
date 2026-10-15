@@ -104,6 +104,7 @@ impl Worker {
             .as_ref()
             .map(|identity| identity.account_id.to_string());
         self.save_sync_identity = identity;
+        self.refresh_play_data();
         self.sink.emit(AppEvent::Connected);
         // Connecting cleared the remembered host/folder facts when this
         // sign-in began; now that the session is authenticated, republish
@@ -426,5 +427,6 @@ impl Worker {
         }
         self.sink.emit(AppEvent::SignedOut);
         self.refresh_save_sync();
+        self.refresh_play_data();
     }
 }

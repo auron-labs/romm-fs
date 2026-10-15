@@ -216,6 +216,31 @@ emulator-modified, or changed-version files are preserved and reported; installi
 a changed server version requires explicitly removing the unchanged owned file
 and rerunning the action. These directories are excluded from save sync.
 
+## Favourites and play history
+
+With RetroBat connected, **Settings → Saves → Play history** syncs favourites,
+last played, play count and play time both ways with RomM for the games in the
+`RomM` folder. It is **off by default** and scoped to the connected server and
+account; consent is never inferred from a discovered installation.
+
+It needs the RomM scopes `roms.user.read`, `roms.user.write`, `collections.read`
+and `collections.write`. If the signed-in account lacks them, ROM access is
+unchanged and **Settings → Account** shows
+`Favourites & play history · Needs permission` with a **Reconnect** action; sign
+in again with the wider permissions to enable it.
+
+Merge rules never lose data. Only the side that changed contributes; play counts
+and times add up; last played takes the later value; a favourite changed on both
+sides keeps the RetroBat value and is logged. A new launch is
+uploaded to RomM as a play session, so RomM's play count, total time and last
+played all advance. A failed upload keeps the local change for the next pass and
+is reported; each game is independent. On the very first sync of a game the two
+existing histories are combined to their union rather than added together, and
+pre-existing local plays are not re-uploaded. RomM's own entries are never
+touched, and an unreadable gamelist is skipped. Because EmulationStation writes
+`lastplayed` without a time zone, it is interpreted as UTC; a non-UTC local time
+is offset.
+
 ## Optional save sync
 
 Save sync is **off by default**. Choose a save-data folder or a RetroBat installation,

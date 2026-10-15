@@ -48,6 +48,7 @@ mod commands;
 mod connection;
 mod installer;
 mod mount;
+mod play_data;
 mod retrobat_setup;
 mod save_files;
 mod save_sync_setup;
@@ -237,6 +238,13 @@ struct Worker {
     current_save_sync_epoch: u64,
     save_sync_runtime_problem: Option<String>,
     save_sync_session_id: u64,
+    play_data_enabled: bool,
+    play_data_available: bool,
+    play_data_problem: Option<String>,
+    /// Linked gamelist modification times seen at the last check. `None` means
+    /// the watch is not running.
+    play_watch: Option<HashMap<String, Option<std::time::SystemTime>>>,
+    play_watch_checked: Instant,
 }
 
 impl Worker {
@@ -299,6 +307,11 @@ impl Worker {
             current_save_sync_epoch,
             save_sync_runtime_problem: None,
             save_sync_session_id: 0,
+            play_data_enabled: false,
+            play_data_available: false,
+            play_data_problem: None,
+            play_watch: None,
+            play_watch_checked: Instant::now(),
         }
     }
 
@@ -383,6 +396,7 @@ fn worker_loop_with_interval_from(
         worker.reap_draining();
         worker.poll_pairing();
         worker.poll_catalogue_refresh();
+        worker.poll_play_watch();
         worker.poll_metadata();
         if worker.installer.poll(&worker.sink) {
             worker.preselect_installed_retrobat();
@@ -404,7 +418,13 @@ fn worker_loop_with_interval_from(
                 next_eviction = Some(Instant::now() + eviction_interval);
                 continue;
             }
-            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            // Wake at least every play-watch interval so a gamelist change is
+            // noticed without an unrelated event.
+            rx.recv_timeout(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(play_data::PLAY_WATCH_INTERVAL),
+            )
         } else {
             next_eviction = None;
             rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
@@ -423,8 +443,12 @@ fn worker_loop_with_interval_from(
                 continue
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                worker.evict_once();
-                next_eviction = Some(Instant::now() + eviction_interval);
+                // A short wake only polls the play-data watch; eviction is
+                // still driven by its own deadline.
+                if Instant::now() >= next_eviction.unwrap_or_else(Instant::now) {
+                    worker.evict_once();
+                    next_eviction = Some(Instant::now() + eviction_interval);
+                }
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -490,6 +514,7 @@ fn worker_loop_with_interval_from(
             }
             Command::SetSaveSyncEnabled { enabled } => worker.set_save_sync_enabled(*enabled),
             Command::SetSaveSyncDebounce { seconds } => worker.set_save_sync_debounce(*seconds),
+            Command::SetPlayDataSync { enabled } => worker.set_play_data_enabled(*enabled),
             Command::ExportSaveSyncIncoming {
                 session_id,
                 incoming_id,
@@ -538,6 +563,7 @@ fn worker_loop_with_interval_from(
                 | Command::SelectSaveSyncInstallation { .. }
                 | Command::SetSaveSyncEnabled { .. }
                 | Command::SetSaveSyncDebounce { .. }
+                | Command::SetPlayDataSync { .. }
                 | Command::ExportSaveSyncIncoming { .. } => {}
                 Command::SelectSaveFolder { .. }
                 | Command::AssociateSaveFile { .. }

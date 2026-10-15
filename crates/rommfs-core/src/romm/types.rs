@@ -54,6 +54,9 @@ pub struct RomDto {
     pub updated_at: String,
     #[serde(default)]
     pub fs_path: String,
+    /// The caller's own play state for this ROM (`last_played`, `hidden`).
+    #[serde(default)]
+    pub rom_user: Option<super::play_data::RomUserDto>,
     #[serde(flatten)]
     pub metadata: RomMetadata,
     #[serde(default)]
