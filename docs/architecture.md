@@ -59,6 +59,14 @@ live RomM instance. `route_hit_count` counts scripted route matches;
 - Worker threads/tasks are owned by the app/controller lifecycle and are joined
   or drained on stop, logout, or quit. Event/session IDs prevent stale work from
   changing a later connection.
+- RetroBat integration coexists with the user's own ROMs. Setup adds only a
+  `roms/<system>/RomM` link per system and records what it owns in
+  `.rommfs-setup.json`; it never moves, replaces or deletes existing files.
+  Gamelists are merged in place: RomMFS rewrites only its `./RomM/…` entries.
+  Publication checks current link targets; missing or redirected links are
+  excluded. Unreadable systems retain their identity state. Gamelist writes
+  are attempted independently; any write failure leaves the identity index
+  staged so a retry cannot recapture old XML against new filename mappings.
 - Save-sync consent and journal state are separate from mount configuration.
   Paths, scopes, and identities are validated before reads or writes.
 

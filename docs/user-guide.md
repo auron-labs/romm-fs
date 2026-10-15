@@ -144,10 +144,9 @@ instant (metadata only); the first launch of a game downloads its file once.
 
 ## Set up RetroBat
 
-> Existing RetroBat system folders are preserved in
-> `<RetroBat>/.rommfs-original-roms` before linking the managed library.
-> No files are deleted or overwritten. These original games are kept in the
-> backup, not merged into the managed library.
+> RomM games appear alongside your own ROMs. RomMFS never moves, replaces or
+> deletes anything already in RetroBat's `roms` folder, including the games
+> and gamelists a fresh RetroBat install ships.
 
 In **Settings → RetroBat**, use **Download official installer** and then
 **Launch installer…**, or select an installation you installed separately. Start RetroBat once and
@@ -161,36 +160,46 @@ Compatible versions are accepted by required layout,
 not version equality; 8.2.1 is the source/package research reference.
 
 In **Settings**, select RetroBat, choose its installation and a separate managed
-ROM folder, then choose **Set up RetroBat**. `<RetroBat>/roms` stays a real
-directory; setup adds a link `roms/<system>` → `<managed folder>/<system>` for
-each system RetroBat defines. Existing system directories, including stock ROMs,
-gamelists and artwork, are moved intact to `.rommfs-original-roms/<system>` first.
-Existing backups are never overwritten; foreign links and files are left in
-place and reported as skipped. Windows can request permission through UAC to
-create the directory links. Other RetroBat folders remain in place.
+ROM folder, then choose **Set up RetroBat**. For each system RetroBat defines,
+setup adds one folder link, `roms/<system>/RomM` → `<managed folder>/<system>`.
+`roms/<system>` stays a real folder holding your own files; setup creates it
+only when RetroBat has none. A system that can't be linked (its folder is a link
+or file of your own, or it already has something named `RomM`) is skipped with
+the reason, and the other systems are still linked. Switch save settings are
+configured where possible; a problem there is reported and never blocks linking.
 
-Setup records the links it created in `<RetroBat>/.rommfs-setup.json`. Rerunning
-with the same server/root verifies them, adds links for newly available
-systems and can recover an interrupted link step. A changed/unowned link is
-preserved and rejected. Older whole-`roms` link installs keep working. Targeted frontend
-settings edits get an `es_settings.cfg.rommfs-<id>.bak` configuration backup.
-The system-level Switch save option is enabled; RetroBat's Eden/Citron launchers
-then generate their distinct save-location keys. Missing emulators are reported
-separately. Existing per-game overrides that disable that option prevent setup.
+Windows needs permission to create folder links. Setup checks this before
+changing anything and asks through UAC when needed; declining the prompt
+leaves RetroBat exactly as it was.
 
-Mounting generates per-platform `gamelist.xml` with actual projected filenames.
-Missing gamelists are written before artwork finishes downloading, including
-when recovering an interrupted publication;
-artwork is added afterward. Artwork caching uses eight concurrent downloads, and
-publication status is reported in the activity log.
-Existing favourites/play history are captured by stable
-ROM/file identity before publication. Complete XML files are replaced atomically
-while the frontend is stopped; ready publication waits while it is running.
-Stop/remount retains these ordinary writable files and their identity index.
-Unrelated unowned content is still refused. Missing artwork does not fail a
-gamelist. Switch update/DLC `.nsp` files go in flat `switchupdates` and are not
-listed as launchable games. Actual RetroBat loading and Windows ACL protection
-remain awaiting native validation.
+Setup records what it did in `<RetroBat>/.rommfs-setup.json`. Rerunning adds
+links for newly available systems and restores removed ones. Changing the games
+folder or server and rerunning moves RomMFS's own links to the new target.
+Installs from earlier versions are converted: a `roms` or `roms/<system>` link
+RomMFS created becomes a real folder again, and any folder an earlier version
+moved to `.rommfs-original-roms` is moved back. Targeted frontend settings edits
+get an `es_settings.cfg.rommfs-<id>.bak` backup. The system-level Switch save
+option is enabled; RetroBat's Eden/Citron launchers then generate their distinct
+save-location keys.
+
+Mounting merges RomM games into each linked system's own
+`roms/<system>/gamelist.xml`, under `./RomM/…` paths. Entries and folders RomMFS
+doesn't own are kept as they are. Systems whose `RomM` link was removed or
+redirected are excluded from publication. Favourites, play counts, last-played times and
+other frontend fields on RomM entries are carried over when RomMFS republishes:
+by stable ROM/file identity, or by path when that identity record is missing.
+Gamelists are written before artwork finishes downloading, keeping the artwork
+entries already show, and are updated again once artwork is cached (eight
+concurrent downloads). A gamelist that can't be read is left untouched and
+reported; other systems are still updated. Each changed gamelist is replaced
+atomically while RetroBat is stopped; publication waits while it is running.
+If a gamelist can't be written, other systems are still attempted and the error
+is reported. After fixing folder access, refresh or remount to retry; saved
+identity state protects favourites and history even if filenames changed.
+Artwork and the identity index live in the managed folder. Switch update/DLC
+`.nsp` files go in flat `switchupdates` and are not listed as launchable games.
+Actual RetroBat loading and Windows ACL protection remain awaiting native
+validation.
 
 **Install library BIOS, keys and cheats** is an explicit separate action while
 the mount and emulators are stopped. It uses RomM's `firmware.read` inventory for
