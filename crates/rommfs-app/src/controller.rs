@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 pub use commands::Command;
 use commands::{invalidates_save_sync_scope, CommandEnvelope};
+use retrobat_setup::MetadataPublication;
 pub use state::*;
 
 mod auxiliary;
@@ -190,6 +191,13 @@ struct Worker {
     metadata_source: Option<(Catalogue, CatalogueSnapshot)>,
     metadata_ready: Option<rommfs_core::retrobat::ArtworkBatch>,
     metadata_wait_reported: bool,
+    /// Gamelist generation and publication run off the worker loop; this is
+    /// the in-flight job's result channel.
+    metadata_publish: Option<mpsc::Receiver<MetadataPublication>>,
+    metadata_publish_handle: Option<JoinHandle<()>>,
+    /// Cancelled worker handles. Joining them on the spot would stall the
+    /// loop behind in-flight HTTP timeouts; the loop reaps them instead.
+    draining: Vec<JoinHandle<()>>,
     #[cfg(test)]
     rom_cache_directory: Option<PathBuf>,
     sink: EventSink,
@@ -201,7 +209,7 @@ struct Worker {
     catalogue_store: Option<CatalogueStore>,
     catalogue_account: Option<String>,
     source_snapshot: Option<CatalogueSnapshot>,
-    refresh_result: Option<mpsc::Receiver<Result<CatalogueSnapshot>>>,
+    refresh_result: Option<mpsc::Receiver<(std::time::Instant, Result<CatalogueSnapshot>)>>,
     refresh_handle: Option<JoinHandle<()>>,
     refresh_active: Option<Arc<std::sync::atomic::AtomicBool>>,
     catalogue_operation_id: u64,
@@ -251,6 +259,9 @@ impl Worker {
             metadata_source: None,
             metadata_ready: None,
             metadata_wait_reported: false,
+            metadata_publish: None,
+            metadata_publish_handle: None,
+            draining: Vec::new(),
             #[cfg(test)]
             rom_cache_directory: None,
             sink,
@@ -335,6 +346,20 @@ impl Worker {
     fn log(&self, level: Level, op: &'static str, message: impl Into<String>) {
         self.sink.emit(AppEvent::log(level, op, message));
     }
+
+    /// Drop finished cancelled workers without blocking on the ones still
+    /// draining in-flight work.
+    fn reap_draining(&mut self) {
+        self.draining.retain(|handle| !handle.is_finished());
+    }
+
+    /// Join every cancelled worker. Used at connection change and shutdown,
+    /// where the owned threads must be fully drained before returning.
+    fn drain_handles(&mut self) {
+        for handle in self.draining.drain(..) {
+            let _ = handle.join();
+        }
+    }
 }
 
 fn worker_loop(
@@ -355,6 +380,7 @@ fn worker_loop_with_interval_from(
 ) {
     let mut next_eviction = None;
     loop {
+        worker.reap_draining();
         worker.poll_pairing();
         worker.poll_catalogue_refresh();
         worker.poll_metadata();
@@ -368,6 +394,7 @@ fn worker_loop_with_interval_from(
             || worker.pairing.is_some()
             || worker.metadata_job.is_some()
             || worker.metadata_ready.is_some()
+            || worker.metadata_publish.is_some()
         {
             rx.recv_timeout(Duration::from_millis(100))
         } else if worker.mount.is_some() {
@@ -390,7 +417,8 @@ fn worker_loop_with_interval_from(
                     || worker.installer.is_running()
                     || worker.pairing.is_some()
                     || worker.metadata_job.is_some()
-                    || worker.metadata_ready.is_some() =>
+                    || worker.metadata_ready.is_some()
+                    || worker.metadata_publish.is_some() =>
             {
                 continue
             }
@@ -537,6 +565,7 @@ fn worker_loop_with_interval_from(
     if worker.installer.is_running() {
         worker.installer.cancel(&worker.sink);
     }
+    worker.drain_handles();
 }
 
 fn fetch_catalogue(

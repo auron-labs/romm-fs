@@ -125,7 +125,7 @@ fn catalogue_pages_are_fetched_once_and_warm_remounts_make_no_http_requests() {
         },
     );
     worker.refresh_catalogue();
-    let result = worker
+    let (_, result) = worker
         .refresh_result
         .take()
         .unwrap()

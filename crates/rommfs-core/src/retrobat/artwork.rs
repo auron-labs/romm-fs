@@ -126,6 +126,8 @@ pub fn cache_artwork_cancellable(
     };
     let mut results = results.into_inner().unwrap_or_else(|e| e.into_inner());
     results.sort_by_key(|(index, _)| *index);
+    // One entry per artless ROM, with the first download error that caused it.
+    let mut artless: BTreeMap<i64, Option<String>> = BTreeMap::new();
     for (index, result) in results {
         let (key, (_, assignments)) = &tasks[index];
         match result {
@@ -141,10 +143,11 @@ pub fn cache_artwork_cancellable(
                 }
             }
             Err(error) if error.needs_sign_in() => return Err(error),
-            Err(error) => batch.warnings.push(format!(
-                "Artwork unavailable for ROM {}: {error}",
-                assignments[0].0
-            )),
+            Err(error) => {
+                artless
+                    .entry(assignments[0].0)
+                    .or_insert(Some(error.to_string()));
+            }
         }
     }
     for rom in roms.iter().filter(|r| platforms.contains_key(&r.id)) {
@@ -154,11 +157,27 @@ pub fn cache_artwork_cancellable(
             }
         }
         if !batch.references.contains_key(&(rom.id, "image")) {
-            batch.warnings.push(format!(
-                "ROM {} has no available server-local cover or screenshot",
-                rom.id
-            ));
+            artless.entry(rom.id).or_insert(None);
         }
+    }
+    // Aggregate rather than one warning per ROM and role: a library with no
+    // server-side artwork should cost one log line, not thousands.
+    if !artless.is_empty() {
+        let count = artless.len();
+        let examples: Vec<String> = artless
+            .keys()
+            .take(3)
+            .map(|id| format!("ROM {id}"))
+            .collect();
+        let mut message = format!(
+            "{count} {} no artwork on the server (e.g. {})",
+            if count == 1 { "ROM has" } else { "ROMs have" },
+            examples.join(", ")
+        );
+        if let Some(error) = artless.values().flatten().next() {
+            message.push_str(&format!("; first error: {error}"));
+        }
+        batch.warnings.push(message);
     }
     Ok(batch)
 }

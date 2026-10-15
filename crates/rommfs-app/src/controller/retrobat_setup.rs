@@ -35,20 +35,7 @@ impl Worker {
         detail: impl Into<String>,
         error: Option<String>,
     ) {
-        let detail = detail.into();
-        // One log line per status: a failure carries its own error text.
-        match &error {
-            Some(error) if pending => {
-                self.log(Level::Warn, "metadata", format!("{detail}: {error}"))
-            }
-            Some(error) => self.log(Level::Error, "metadata", format!("{detail}: {error}")),
-            None => self.log(Level::Info, "metadata", detail.clone()),
-        }
-        self.sink.emit(AppEvent::FrontendMetadata {
-            pending,
-            detail,
-            error,
-        });
+        emit_metadata_status(&self.sink, pending, detail, error);
     }
 
     pub(super) fn cancel_metadata(&mut self) {
@@ -56,9 +43,16 @@ impl Worker {
             active.store(false, std::sync::atomic::Ordering::Release);
         }
         self.metadata_job = None;
+        // Never join here: an in-flight artwork request only notices
+        // cancellation while writing a body, so a join would stall the worker
+        // loop for a whole request timeout. The handle is reaped instead.
         if let Some(handle) = self.metadata_handle.take() {
-            let _ = handle.join();
+            self.draining.push(handle);
         }
+        if let Some(handle) = self.metadata_publish_handle.take() {
+            self.draining.push(handle);
+        }
+        self.metadata_publish = None;
         self.metadata_ready = None;
         self.metadata_source = None;
         self.metadata_wait_reported = false;
@@ -125,6 +119,7 @@ impl Worker {
     }
 
     pub(super) fn poll_metadata(&mut self) {
+        self.poll_metadata_publication();
         if let Some(rx) = &self.metadata_job {
             let result = match rx.try_recv() {
                 Ok(result) => Some(result),
@@ -135,6 +130,7 @@ impl Worker {
             };
             if let Some(result) = result {
                 self.metadata_job = None;
+                // The result has already been sent, so this thread is done.
                 if let Some(handle) = self.metadata_handle.take() {
                     let _ = handle.join();
                 }
@@ -159,7 +155,13 @@ impl Worker {
                 }
             }
         }
-        if self.metadata_ready.is_none() {
+        self.start_metadata_publication();
+    }
+
+    /// Generation and publication read and merge every RetroBat gamelist, so
+    /// they run on their own thread. The worker only polls the result.
+    fn start_metadata_publication(&mut self) {
+        if self.metadata_publish.is_some() || self.metadata_ready.is_none() {
             return;
         }
         let Some(installation) = self
@@ -197,87 +199,98 @@ impl Worker {
                 return;
             }
         };
-        let mut problems = Vec::new();
-        let result = (|| -> anyhow::Result<usize> {
-            let root = &self
-                .mount
-                .as_ref()
-                .context("mount stopped before metadata publication")?
-                .root;
-            let server = self.server_id.as_deref().context("connection ended")?;
-            let account = self
-                .preferences
-                .as_ref()
-                .context("account changed")?
-                .account_id;
-            let (catalogue, snapshot) = self
-                .metadata_source
-                .as_ref()
-                .context("metadata source unavailable")?;
-            let artwork = self
-                .metadata_ready
-                .as_ref()
-                .context("artwork unavailable")?;
-            for warning in artwork.warnings() {
-                self.log(Level::Warn, "artwork", warning.clone());
-            }
-            let linked = rommfs_core::retrobat::linked_systems(&installation, root, server)?;
-            let frontend = rommfs_core::retrobat::read_gamelists(&installation, &linked);
-            let (index, legacy) = rommfs_cfapi::read_frontend_metadata(root, server)?;
-            let publication = rommfs_core::retrobat::generate_gamelists(
-                catalogue,
-                &snapshot.roms,
-                server,
-                account,
-                &index,
-                &frontend,
-                &legacy,
-                artwork.references(),
-            )?;
-            problems.extend(publication.skipped().iter().cloned());
-            let changed = publication.gamelists().len();
-            if changed > 0 || !artwork.files().is_empty() {
-                self.metadata_status(
-                    true,
-                    format!(
-                        "Updating {changed} gamelists and {} artwork files",
-                        artwork.files().len()
-                    ),
-                    None,
-                );
-            }
-            rommfs_cfapi::publish_frontend_metadata(
+        let (Some(root), Some(server), Some(account), Some((catalogue, snapshot)), Some(artwork)) = (
+            self.mount.as_ref().map(|mount| mount.root.clone()),
+            self.server_id.clone(),
+            self.preferences.as_ref().map(|p| p.account_id),
+            self.metadata_source.clone(),
+            self.metadata_ready.take(),
+        ) else {
+            self.cancel_metadata();
+            return;
+        };
+        // A running artwork job owns the cancellation flag; a publication with
+        // no artwork job publishes under a live flag.
+        let active = self
+            .metadata_active
+            .clone()
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        self.spawn_metadata_publication(
+            active,
+            guard,
+            installation,
+            root,
+            server,
+            account,
+            catalogue,
+            snapshot,
+            artwork,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_metadata_publication(
+        &mut self,
+        active: Arc<std::sync::atomic::AtomicBool>,
+        guard: Vec<std::fs::File>,
+        installation: PathBuf,
+        root: PathBuf,
+        server: String,
+        account: i64,
+        catalogue: Catalogue,
+        snapshot: CatalogueSnapshot,
+        artwork: rommfs_core::retrobat::ArtworkBatch,
+    ) {
+        let sink = self.sink.clone();
+        let (tx, rx) = mpsc::channel();
+        self.metadata_publish = Some(rx);
+        self.metadata_publish_handle = Some(std::thread::spawn(move || {
+            let _ = tx.send(publish_metadata(
+                &sink,
+                &active,
+                guard,
+                installation,
                 root,
                 server,
-                publication.index(),
-                artwork.files(),
-                || {
-                    let failures = rommfs_core::retrobat::publish_gamelists(
-                        &installation,
-                        &linked,
-                        &publication,
-                    );
-                    let failed = failures.len();
-                    problems.extend(failures);
-                    // Keep the staged index if any XML is still at its old
-                    // paths; recapturing it with the new mapping loses history.
-                    anyhow::ensure!(failed == 0, "{failed} gamelists could not be written; identity state is staged for retry");
-                    Ok(())
-                },
-            )?;
-            Ok(changed)
-        })();
-        drop(guard);
-        for (system, reason) in &problems {
+                account,
+                catalogue,
+                snapshot,
+                artwork,
+            ));
+        }));
+    }
+
+    fn poll_metadata_publication(&mut self) {
+        let Some(rx) = &self.metadata_publish else {
+            return;
+        };
+        let publication = match rx.try_recv() {
+            Ok(publication) => publication,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => MetadataPublication {
+                changed: Err("metadata publisher stopped".into()),
+                problems: Vec::new(),
+            },
+        };
+        self.metadata_publish = None;
+        if let Some(handle) = self.metadata_publish_handle.take() {
+            let _ = handle.join();
+        }
+        self.finish_metadata_publication(publication);
+    }
+
+    fn finish_metadata_publication(&mut self, publication: MetadataPublication) {
+        for (system, reason) in &publication.problems {
             self.log(Level::Warn, "metadata", format!("{system}: {reason}"));
         }
-        let left_as_is = |text: &str| match problems.len() {
+        let left_as_is = |text: &str| match publication.problems.len() {
             0 => text.to_string(),
             n => format!("{text}; {n} systems left as they were (see the log)"),
         };
-        match result {
-            Ok(changed) if self.metadata_job.is_some() => {
-                self.metadata_ready = None;
+        // A newer artwork batch or a still-running artwork job means this was
+        // not the final publication; keep the job alive for the next pass.
+        match publication.changed {
+            Ok(changed) if self.metadata_job.is_some() || self.metadata_ready.is_some() => {
                 // RetroBat may be started again before artwork finishes.
                 self.metadata_wait_reported = false;
                 self.log(
@@ -302,7 +315,7 @@ impl Worker {
                 self.metadata_status(
                     false,
                     "Frontend metadata was not fully published; existing state was retained",
-                    Some(format!("{error:#}")),
+                    Some(error),
                 );
             }
         }
@@ -455,5 +468,119 @@ impl Worker {
         } else {
             self.emit_integration(None);
         }
+    }
+}
+
+/// Outcome of an off-loop gamelist generation + publication pass.
+pub(super) struct MetadataPublication {
+    /// Gamelists changed on success, or the failure text.
+    pub(super) changed: std::result::Result<usize, String>,
+    /// `(system, reason)` for systems left as they were.
+    pub(super) problems: Vec<(String, String)>,
+}
+
+fn emit_metadata_status(
+    sink: &EventSink,
+    pending: bool,
+    detail: impl Into<String>,
+    error: Option<String>,
+) {
+    let detail = detail.into();
+    // One log line per status: a failure carries its own error text.
+    match &error {
+        Some(error) if pending => sink.emit(AppEvent::log(
+            Level::Warn,
+            "metadata",
+            format!("{detail}: {error}"),
+        )),
+        Some(error) => sink.emit(AppEvent::log(
+            Level::Error,
+            "metadata",
+            format!("{detail}: {error}"),
+        )),
+        None => sink.emit(AppEvent::log(Level::Info, "metadata", detail.clone())),
+    }
+    sink.emit(AppEvent::FrontendMetadata {
+        pending,
+        detail,
+        error,
+    });
+}
+
+/// Read the frontend state, merge the RomM entries and publish both gamelists
+/// and artwork. Runs on the metadata thread; `_guard` holds RetroBat closed
+/// for the whole pass.
+#[allow(clippy::too_many_arguments)]
+fn publish_metadata(
+    sink: &EventSink,
+    active: &std::sync::atomic::AtomicBool,
+    _guard: Vec<std::fs::File>,
+    installation: PathBuf,
+    root: PathBuf,
+    server: String,
+    account: i64,
+    catalogue: Catalogue,
+    snapshot: CatalogueSnapshot,
+    artwork: rommfs_core::retrobat::ArtworkBatch,
+) -> MetadataPublication {
+    let mut problems = Vec::new();
+    for warning in artwork.warnings() {
+        sink.emit(AppEvent::log(Level::Warn, "artwork", warning.clone()));
+    }
+    let result = (|| -> anyhow::Result<usize> {
+        let linked = rommfs_core::retrobat::linked_systems(&installation, &root, &server)?;
+        let frontend = rommfs_core::retrobat::read_gamelists(&installation, &linked);
+        let (index, legacy) = rommfs_cfapi::read_frontend_metadata(&root, &server)?;
+        let publication = rommfs_core::retrobat::generate_gamelists(
+            &catalogue,
+            &snapshot.roms,
+            &server,
+            account,
+            &index,
+            &frontend,
+            &legacy,
+            artwork.references(),
+        )?;
+        problems.extend(publication.skipped().iter().cloned());
+        let changed = publication.gamelists().len();
+        // A cancelled job (stop mount, sign-out) must not publish stale state.
+        if !active.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!("metadata publication cancelled");
+        }
+        if changed > 0 || !artwork.files().is_empty() {
+            emit_metadata_status(
+                sink,
+                true,
+                format!(
+                    "Updating {changed} gamelists and {} artwork files",
+                    artwork.files().len()
+                ),
+                None,
+            );
+        }
+        rommfs_cfapi::publish_frontend_metadata(
+            &root,
+            &server,
+            publication.index(),
+            artwork.files(),
+            || {
+                let failures =
+                    rommfs_core::retrobat::publish_gamelists(&installation, &linked, &publication);
+                let failed = failures.len();
+                problems.extend(failures);
+                // Keep the staged index if any XML is still at its old
+                // paths; recapturing it with the new mapping loses history.
+                anyhow::ensure!(
+                    failed == 0,
+                    "{failed} gamelists could not be written; identity state is staged for retry"
+                );
+                Ok(())
+            },
+        )?;
+        Ok(changed)
+    })();
+    MetadataPublication {
+        changed: result.map_err(|error| format!("{error:#}")),
+        problems,
     }
 }

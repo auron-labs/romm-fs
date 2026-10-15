@@ -32,6 +32,19 @@ fn application_owner_keeps_worker_alive_after_view_handle_drops_and_quit_joins_o
 }
 use std::time::Duration;
 
+/// Publication runs off the worker loop, so tests poll it to completion.
+fn poll_metadata_until(worker: &mut Worker, done: impl Fn(&Worker) -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        worker.poll_metadata();
+        if done(worker) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("metadata publication did not finish in time");
+}
+
 /// A minimal RetroBat installation with one system, set up for `root`.
 #[cfg(unix)]
 fn set_up_retrobat(installation: &std::path::Path, root: &std::path::Path) {
@@ -103,7 +116,10 @@ fn first_gamelists_publish_while_artwork_is_still_pending() {
     let (tx, rx) = mpsc::channel();
     worker.metadata_job = Some(rx);
     worker.metadata_ready = Some(ArtworkBatch::default());
-    worker.poll_metadata();
+    // The first publication lands while artwork is still running.
+    poll_metadata_until(&mut worker, |worker| {
+        worker.metadata_publish.is_none() && worker.metadata_job.is_some()
+    });
     let published = std::fs::read_to_string(&gamelist).unwrap();
     assert!(
         published.contains("<path>./RomM/Game.gb</path>"),
@@ -116,9 +132,8 @@ fn first_gamelists_publish_while_artwork_is_still_pending() {
         AppEvent::Log(line) if line.message == "Gamelists published; caching frontend artwork")));
 
     tx.send(Ok(ArtworkBatch::default())).unwrap();
-    worker.poll_metadata();
+    poll_metadata_until(&mut worker, |worker| worker.metadata_source.is_none());
     assert!(worker.metadata_job.is_none());
-    assert!(worker.metadata_source.is_none());
     assert!(events.try_iter().any(|event| matches!(
         event,
         AppEvent::FrontendMetadata {
@@ -154,10 +169,102 @@ fn first_gamelists_publish_while_artwork_is_still_pending() {
     worker.client = Some(client);
     worker.queue_metadata();
     assert!(worker.metadata_ready.is_some());
-    worker.poll_metadata();
-    assert!(std::fs::read_to_string(&gamelist)
-        .unwrap()
-        .contains("./RomM/Game.gb"));
+    poll_metadata_until(&mut worker, |_| {
+        std::fs::read_to_string(&gamelist)
+            .map(|xml| xml.contains("./RomM/Game.gb"))
+            .unwrap_or(false)
+    });
+    worker.cancel_metadata();
+}
+
+/// Regression for the "refresh stuck at 2471/2471" stall: a finished refresh
+/// must publish without waiting on an in-flight artwork request that only
+/// notices cancellation at its next write.
+#[cfg(unix)]
+#[test]
+fn a_finished_refresh_publishes_while_artwork_is_blocked_on_a_hanging_route() {
+    use rommfs_fixture::contract;
+    use serde_json::json;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("roms");
+    let installation = tmp.path().join("retrobat");
+    std::fs::create_dir(&root).unwrap();
+    rommfs_cfapi::claim_mount_root(&root, "s").unwrap();
+    set_up_retrobat(&installation, &root);
+
+    let resource = "/assets/romm/resources/cover.png";
+    let barrier = FixtureBodyBarrier::new();
+    let fixture = FixtureServer::start();
+    fixture.on(
+        "GET",
+        resource,
+        ResponseSpec::HeldBytes {
+            status: 200,
+            bytes: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+            barrier: barrier.clone(),
+        },
+    );
+
+    let platforms: Vec<PlatformDto> =
+        serde_json::from_str(&contract::platforms(&[(1, "gb", "gb", "Game Boy")])).unwrap();
+    let mut rom = contract::rom(1, "gb", "Game.gb", 3, "hash");
+    rom["path_cover_large"] = json!(resource);
+    let roms = vec![serde_json::from_value(rom).unwrap()];
+    let catalogue =
+        rommfs_core::catalogue::build_catalogue("s", &platforms, &roms, |_| {}).unwrap();
+    let (sink, events) = rommfs_core::events::channel();
+    let mut worker = Worker::new(sink);
+    worker.server_id = Some("s".into());
+    worker.preferences = Some(ConnectionPreferences {
+        server: "s".into(),
+        account_id: 7,
+        device_identifier: "id".into(),
+        mount_root: Some(root.clone()),
+        integration: IntegrationMode::RetroBat,
+        retrobat_root: Some(installation.clone()),
+        start_at_login: false,
+        save_root: None,
+    });
+    worker.mount = Some(ActiveMount {
+        root: root.clone(),
+        stop_fn: Box::new(|| {}),
+    });
+    let snapshot = CatalogueSnapshot {
+        platforms,
+        roms,
+        refreshed_at: 0,
+    };
+    worker.source_snapshot = Some(snapshot.clone());
+    worker.catalogue = Some(catalogue);
+    worker.rom_cache_directory = Some(tmp.path().join("rom-cache"));
+    let client = Arc::new(RommClient::new(fixture.url()).unwrap());
+    worker.fs = Some(
+        worker
+            .build_fs(&client, &root, Arc::new(NoopHydratedRemover))
+            .unwrap(),
+    );
+    worker.catalogue = None;
+    worker.client = Some(client);
+
+    // Artwork for the mounted catalogue is in flight and cannot complete.
+    worker.queue_metadata();
+    assert!(
+        barrier.wait_until_blocked(Duration::from_secs(5)),
+        "the artwork request should be in flight"
+    );
+
+    // Finishing the refresh must not wait on that request's timeout.
+    let started = std::time::Instant::now();
+    worker.finish_catalogue_refresh(Ok(snapshot));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "refresh blocked on artwork for {:?}",
+        started.elapsed()
+    );
+    assert!(events
+        .try_iter()
+        .any(|event| matches!(event, AppEvent::CatalogueLoaded { .. })));
+    barrier.release();
     worker.cancel_metadata();
 }
 

@@ -194,6 +194,40 @@ fn listing_never_requests_rom_bodies() {
 }
 
 #[test]
+fn an_html_error_body_is_reported_as_one_short_line() {
+    let fx = contract_server(
+        vec![contract::rom(7, "nes", "Example Game.nes", 10, "s")],
+        1,
+    );
+    let html = format!(
+        "<html>\n<head><title>404 Not Found</title></head>\n<body>\n<center><h1>404 Not Found</h1></center>\n<hr><center>nginx</center>\n{}\n</body>\n</html>",
+        "x".repeat(500)
+    );
+    fx.on(
+        "GET",
+        "/api/platforms",
+        ResponseSpec::Json {
+            status: 404,
+            body: html,
+        },
+    );
+    let client = authed(&fx);
+    match client.platforms().unwrap_err() {
+        Error::Http { status, message } => {
+            assert_eq!(status, 404);
+            assert!(!message.contains('\n'), "multi-line body: {message:?}");
+            assert!(
+                message.chars().count() <= 200,
+                "uncapped body: {}",
+                message.len()
+            );
+            assert!(message.contains("404 Not Found"));
+        }
+        other => panic!("expected Http, got {other:?}"),
+    }
+}
+
+#[test]
 fn rejected_credentials_and_permissions_map_to_auth_errors() {
     // 401 on the token endpoint -> Auth.
     let fx = FixtureServer::start();

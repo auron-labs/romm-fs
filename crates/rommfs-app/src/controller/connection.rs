@@ -385,6 +385,8 @@ impl Worker {
         self.save_sync_identity = None;
         self.save_sync_scope = None;
         self.save_sync_enabled = false;
+        // The owned worker threads must be gone before a new session starts.
+        self.drain_handles();
     }
 
     pub(super) fn logout(&mut self) {

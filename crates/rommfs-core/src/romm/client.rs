@@ -426,10 +426,18 @@ fn invalid_payload(e: serde_json::Error) -> Error {
     Error::InvalidCatalogue(e.to_string())
 }
 
-/// Short response-body detail for error reporting, credentials excluded.
+/// Short single-line response-body detail for error reporting, credentials
+/// excluded. Whitespace is collapsed so an HTML error page (nginx 404) never
+/// reaches the log as nine wrapped lines.
 fn detail_of(resp: &mut isahc::Response<isahc::Body>) -> String {
     match resp.text() {
-        Ok(t) => t.chars().take(200).collect(),
+        Ok(t) => t
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(200)
+            .collect(),
         Err(_) => "no response body".to_string(),
     }
 }

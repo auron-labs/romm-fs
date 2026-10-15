@@ -117,7 +117,8 @@ impl Worker {
         let (tx, rx) = mpsc::channel();
         self.refresh_result = Some(rx);
         self.refresh_handle = Some(std::thread::spawn(move || {
-            let _ = tx.send(fetch_catalogue(&client, &sink, operation_id));
+            let result = fetch_catalogue(&client, &sink, operation_id);
+            let _ = tx.send((Instant::now(), result));
         }));
     }
 
@@ -125,15 +126,30 @@ impl Worker {
         let Some(rx) = &self.refresh_result else {
             return;
         };
-        let result = match rx.try_recv() {
+        let (finished_at, result) = match rx.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                Err(Error::Transport("catalogue refresh worker stopped".into()))
-            }
+            Err(mpsc::TryRecvError::Disconnected) => (
+                Instant::now(),
+                Err(Error::Transport("catalogue refresh worker stopped".into())),
+            ),
         };
+        // A finished result should be picked up on the next loop turn. A long
+        // wait means the loop was blocked; make that visible in user logs.
+        let waited = finished_at.elapsed();
+        if waited > Duration::from_secs(5) {
+            self.log(
+                Level::Warn,
+                "catalogue",
+                format!(
+                    "Refresh result waited {}s before the worker polled it",
+                    waited.as_secs()
+                ),
+            );
+        }
         self.refresh_result = None;
         self.refresh_active = None;
+        // The result has already been sent, so this thread is done.
         if let Some(handle) = self.refresh_handle.take() {
             let _ = handle.join();
         }
@@ -145,12 +161,23 @@ impl Worker {
             active.store(false, std::sync::atomic::Ordering::Release);
         }
         self.refresh_result = None;
+        // Never join here: an in-flight fetch only notices cancellation at its
+        // next page, so a join would stall the loop. Reap the handle instead.
         if let Some(handle) = self.refresh_handle.take() {
-            let _ = handle.join();
+            self.draining.push(handle);
         }
     }
 
     pub(super) fn finish_catalogue_refresh(&mut self, result: Result<CatalogueSnapshot>) {
+        // Projection and persistence can be slow on a large library; show the
+        // final stage instead of a frozen 100% page bar.
+        self.sink.emit(AppEvent::CatalogueProgress {
+            operation_id: self.catalogue_operation_id,
+            stage: "Finalising library".into(),
+            completed: 0,
+            total: None,
+            elapsed_ms: 0,
+        });
         match result {
             Ok(snapshot) => match self.publish_snapshot(snapshot.clone(), false) {
                 Ok(cat) => {

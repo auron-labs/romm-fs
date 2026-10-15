@@ -146,7 +146,13 @@ fn missing_invalid_images_are_nonfatal_and_cancellation_does_not_publish_cache()
     let catalogue = build_catalogue(fixture.url(), &platforms, &roms, |_| {}).unwrap();
     let cache = tempfile::tempdir().unwrap();
     let batch = cache_artwork(&client, &catalogue, &roms, cache.path()).unwrap();
-    assert!(!batch.warnings().is_empty());
+    // One aggregated line, not one per ROM and role.
+    assert_eq!(batch.warnings().len(), 1, "{:?}", batch.warnings());
+    assert!(
+        batch.warnings()[0].contains("no artwork on the server"),
+        "{:?}",
+        batch.warnings()
+    );
     assert!(batch.references().is_empty() && batch.files().is_empty());
     assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
     assert!(cache_artwork_cancellable(

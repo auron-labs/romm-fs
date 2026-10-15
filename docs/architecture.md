@@ -57,8 +57,17 @@ live RomM instance. `route_hit_count` counts scripted route matches;
 - Mount ownership is recorded beside the root. Cleanup validates ownership and
   does not recursively clear user data.
 - Worker threads/tasks are owned by the app/controller lifecycle and are joined
-  or drained on stop, logout, or quit. Event/session IDs prevent stale work from
-  changing a later connection.
+  or drained on stop, logout, or quit. Cancelling a background job moves its
+  handle to a draining list the worker loop reaps with `is_finished()`, so an
+  in-flight HTTP request cannot stall the loop for its whole timeout; the
+  handles are joined when the connection changes or the app shuts down.
+  Event/session IDs prevent stale work from changing a later connection.
+- Catalogue refresh, artwork caching, and gamelist generation/publication each
+  run on their own thread and are polled by the worker. Gamelist publication
+  reads and merges the RetroBat-owned gamelists, so it never blocks the loop;
+  the mounted tree stays a snapshot and a completed refresh is applied on the
+  next mount. A finished refresh result that waits more than five seconds to be
+  polled is logged as a watchdog warning.
 - RetroBat integration coexists with the user's own ROMs. Setup adds only a
   `roms/<system>/RomM` link per system and records what it owns in
   `.rommfs-setup.json`; it never moves, replaces or deletes existing files.

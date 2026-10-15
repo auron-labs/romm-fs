@@ -680,7 +680,7 @@ impl Render for RommfsWindow {
         // call-site scroll state, every page inherited the previous page's
         // offset and Settings appeared to jump between screens.
         let scrolls = self.page_scrolls.clone();
-        let page = move |index: usize, id: &'static str, body: AnyElement| {
+        let page = move |index: usize, id: &'static str, max_width: f32, body: AnyElement| {
             let handle = scrolls[index].clone();
             div()
                 .id(id)
@@ -690,36 +690,52 @@ impl Render for RommfsWindow {
                 .track_scroll(&handle)
                 .overflow_y_scroll()
                 .vertical_scrollbar(&handle)
-                .child(v_flex().p_6().w_full().max_w(px(960.)).child(body))
+                .child(
+                    v_flex()
+                        .p_6()
+                        .w_full()
+                        .max_w(px(max_width))
+                        .mx_auto()
+                        .child(body),
+                )
         };
+        // Log and table views need the extra room; the reading measure stays
+        // narrow for prose-heavy pages.
+        let wide = 1440.;
         let content = match self.active_view {
             0 => page(
                 0,
                 "overview-view",
+                960.,
                 pages::overview::render(self, window, cx).into_any_element(),
             ),
             1 => page(
                 1,
                 "save-sync-view",
+                wide,
                 pages::save_review::render(self, window, cx).into_any_element(),
             ),
             2 => page(
                 2,
                 "activity-view",
+                wide,
                 pages::activity::render(self, window, cx).into_any_element(),
             ),
             4 => page(
                 4,
                 "setup-view",
+                960.,
                 pages::setup::render(self, window, cx).into_any_element(),
             ),
             _ => page(
                 3,
                 "settings-view",
+                960.,
                 pages::settings::render(self, window, cx).into_any_element(),
             ),
         };
         h_flex()
+            .items_stretch()
             .size_full()
             .min_w_0()
             .min_h_0()
