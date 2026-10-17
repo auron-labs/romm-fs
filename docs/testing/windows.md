@@ -6,6 +6,31 @@ checks, an interactive desktop. The filesystem backend is **CFAPI**. Windows
 10/11 is the client acceptance environment. Windows Server (including Server
 2022) is diagnostic evidence only; it cannot replace a Windows 10/11 client run.
 
+## Guided path
+
+For the easiest operator path, clone the repository on a Windows 10/11 desktop
+and double-click `test-wizard.cmd` in the repository root. The wizard guides the
+remaining human checks and stores resumable evidence under
+`%LOCALAPPDATA%\rommfs\test-wizard`. Rust is needed only if you opt into the
+automated checks/build. This is a guided evidence collector, not automation or
+proof of the complete acceptance procedure below. It has not yet been run under
+Windows PowerShell 5.1 on a Windows desktop.
+
+At a result prompt, `S` records a skip and `Q` packages the partial run; launch
+the wizard again to resume. `C` first asks permission to capture the **full
+desktop on all monitors**, then waits four seconds for you to switch to the app.
+Nothing is uploaded. Review the ZIP's screenshots and best-effort-redacted logs
+for private information, then send the ZIP shown by the wizard. Missing,
+skipped, blocked, partial, and unverified checks are not passes.
+
+The wizard's before/after manifests are deliberately bounded: they hash at most
+500 eligible ordinary, non-placeholder files under the selected `roms`/`saves`
+areas, do not traverse RomM links, and treat `gamelist.xml` merges separately.
+They are not blanket proof that every file is byte-identical. This document
+remains the full source testing and native acceptance procedure. Public usage is
+only `test-wizard.cmd` or
+`powershell -NoProfile -File .\scripts\windows-test-wizard.ps1 -Help`.
+
 Run the available sections and produce the report below. Keep source/build/test
 evidence distinct from native runtime acceptance. A command that runs zero tests
 is not a pass. If a prerequisite blocks a case, continue independent cases and

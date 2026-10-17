@@ -19,6 +19,21 @@ Connect to a reachable RomM server, choose an empty local NTFS mount root, and
 start the games folder. The first read downloads a file; later reads use cached
 bytes. The mount is read-only.
 
+## Testing wizard
+
+On a Windows 10/11 desktop, clone this repository and double-click
+`test-wizard.cmd` in its root. The wizard guides the remaining human checks;
+Rust is not required unless you choose its optional automated checks/build.
+It does not automate or prove the full Windows acceptance procedure.
+
+At each prompt, `S` skips and `Q` saves a partial ZIP and quits; run the launcher
+again to resume. `C` asks permission to capture the full desktop, then waits four
+seconds so you can switch to the app. Evidence stays local under
+`%LOCALAPPDATA%\rommfs\test-wizard`; send the resulting ZIP only after reviewing
+its logs and screenshots for private information. Nothing is uploaded, and a
+missing or skipped check is never a pass. For help, use `test-wizard.cmd -Help` or
+`powershell -NoProfile -File .\scripts\windows-test-wizard.ps1 -Help`.
+
 ## Workspace
 
 | Crate | Responsibility |
