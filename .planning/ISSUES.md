@@ -1,0 +1,3 @@
+- [ ] there's a noticable lag with hover states and clicking links, maybe only 100ms, but still noticable
+- [ ] there's no game metadata at all
+- [ ] there's a ton of errors all over the place, see ../.scratch/human-testing-2026-10-17
