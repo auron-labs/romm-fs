@@ -36,8 +36,8 @@ pub use play_data::{
     PlayBaseline, PlayMerge, PlayPush, PlayValues, PLAY_FIELDS,
 };
 pub use setup::{
-    inspect_setup, linked_systems, setup_needs_migration, setup_roms_link, verify_setup_link,
-    SetupOutcome, SetupRecord, SkippedSystem, ROMM_FOLDER,
+    inspect_setup, linked_systems, linked_systems_with_root_check, setup_needs_migration,
+    setup_roms_link, verify_setup_link, SetupOutcome, SetupRecord, SkippedSystem, ROMM_FOLDER,
 };
 
 /// Resolve effective frontend home/save directories through launcher settings.

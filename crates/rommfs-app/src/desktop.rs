@@ -1,6 +1,6 @@
 //! Small Windows boundary: per-user instance ownership and login registration.
 use rommfs_core::{Error, Result};
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, feature = "ui"))]
 use std::path::Path;
 #[cfg(all(windows, feature = "ui"))]
 pub mod tray;
@@ -157,8 +157,62 @@ fn open_existing() {
     }
 }
 
+/// Open the configured folder itself. Never let the shell interpret an empty
+/// or relative target as its default directory.
+#[cfg(any(feature = "ui", test))]
+pub fn open_games_folder(path: &Path) -> Result<()> {
+    if !path.is_absolute() || !path.is_dir() {
+        return Err(Error::Unsupported(
+            "The configured games folder must be an existing absolute directory".into(),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let target: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        if target[..target.len() - 1].contains(&0) {
+            return Err(Error::Unsupported(
+                "The games folder contains a null character".into(),
+            ));
+        }
+        // SAFETY: both UTF-16 arguments are terminated and live for the call;
+        // the shell opens a directory, with no command string or parameters.
+        let result = unsafe {
+            windows_sys::Win32::UI::Shell::ShellExecuteW(
+                std::ptr::null_mut(),
+                wide("open").as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+            )
+        };
+        if result as isize <= 32 {
+            return Err(Error::Unsupported(format!(
+                "Windows could not open the games folder (shell error {})",
+                result as isize
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        Err(Error::Unsupported(
+            "Opening the managed games folder is available on Windows".into(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn opening_games_folder_rejects_missing_and_relative_targets() {
+        assert!(super::open_games_folder(std::path::Path::new("")).is_err());
+        assert!(super::open_games_folder(std::path::Path::new("relative games")).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(super::open_games_folder(&dir.path().join("missing folder with spaces")).is_err());
+    }
+
     use super::*;
     #[test]
     fn login_command_quotes_the_executable_and_rejects_injection() {

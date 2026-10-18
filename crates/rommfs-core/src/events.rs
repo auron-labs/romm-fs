@@ -24,9 +24,23 @@ pub struct LogLine {
     pub message: String,
 }
 
+/// Current work for one save identity, independent of retained history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveSyncWork {
+    NotChecked,
+    Checking,
+    WaitingToUpload,
+    Uploading,
+    WaitingForRomm,
+    NeedsReview,
+    UpToDate,
+}
+
 /// A durable per-game reconciliation fact for the opt-in save handoff.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SaveSyncGameStatus {
+    pub work: SaveSyncWork,
+    pub local_path: String,
     pub rom_id: i64,
     pub file_id: i64,
     pub rom_name: String,
@@ -150,6 +164,14 @@ pub struct AuxiliarySummary {
 /// Events emitted by workers. UI renders these; tests assert on them.
 #[derive(Clone, Debug)]
 pub enum AppEvent {
+    ShutdownStarting,
+    SaveSyncCheckStarted {
+        session_id: u64,
+    },
+    SaveSyncScanFinished {
+        session_id: u64,
+        completed_at: u64,
+    },
     /// The foreign entries currently blocking a mount/setup, plus which of
     /// them are links the user can safely remove. Emitted alongside a failure
     /// event and cleared by the next attempt.

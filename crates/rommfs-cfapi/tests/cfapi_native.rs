@@ -21,7 +21,7 @@ use rommfs_core::catalogue::{build_catalogue, server_id_of, RomKey};
 use rommfs_core::download::DownloadManager;
 use rommfs_core::filesystem::RommFs;
 use rommfs_core::retrobat::{
-    generate_gamelists, FrontendGamelists, MetadataIndex, PlayPush, PlaySync,
+    generate_gamelists, publish_gamelists, FrontendGamelists, MetadataIndex, PlayPush, PlaySync,
 };
 use rommfs_core::romm::{Credentials, RommClient};
 use rommfs_core::tree::RommTree;
@@ -238,13 +238,20 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     // Ordinary metadata (artwork, identity index) must be writable without
     // hydrating ROMs, while parent delete-child access must still not bypass a
     // ROM's protected descriptor. Gamelists live in RetroBat's own folders.
+    let installation = workspace.path().join("retrobat");
+    let gamelist = installation.join("roms/nes/gamelist.xml");
+    std::fs::create_dir_all(gamelist.parent().unwrap()).unwrap();
+    let frontend = FrontendGamelists::new(BTreeMap::from([(
+        "nes".to_string(),
+        "<gameList><game><path>./RomM/Example Game.nes</path><playcount>7</playcount></game></gameList>".to_string(),
+    )]));
     let publication = generate_gamelists(
         fs.catalogue(),
         &roms,
         &server_id,
         1,
         &MetadataIndex::default(),
-        &FrontendGamelists::default(),
+        &frontend,
         &BTreeMap::new(),
         &HashMap::new(),
         &std::collections::HashSet::new(),
@@ -261,6 +268,8 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     let artwork = BTreeMap::from([("nes/.rommfs-artwork/cover.png".to_string(), cached)]);
     let mut wrote_gamelists = false;
     publish_frontend_metadata(&root, &server_id, publication.index(), &artwork, || {
+        let failures = publish_gamelists(&installation, &["nes".into()], &publication);
+        assert!(failures.is_empty(), "{failures:?}");
         wrote_gamelists = true;
         Ok(())
     })

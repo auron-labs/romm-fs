@@ -11,6 +11,23 @@ impl Worker {
 
     pub(super) fn refresh_save_sync_from(&mut self, input: DiscoveryInput) {
         self.advance_save_sync_session();
+        self.refresh_save_sync_in_session(input);
+    }
+
+    /// A check keeps the selected scope and its last known review visible.
+    /// Its new worker session still rejects completions from the drained actor.
+    pub(super) fn check_save_sync(&mut self) {
+        if self.startup_restoring || (self.startup_requires_mount && self.mount.is_none()) {
+            return;
+        }
+        self.save_sync_session_id = self.save_sync_session_id.saturating_add(1);
+        self.sink.emit(AppEvent::SaveSyncCheckStarted {
+            session_id: self.save_sync_session_id,
+        });
+        self.refresh_save_sync_in_session(save_sync_discovery_input());
+    }
+
+    fn refresh_save_sync_in_session(&mut self, input: DiscoveryInput) {
         self.stop_save_sync_agent();
         if self.preferences.is_some() {
             self.refresh_save_files(input);
@@ -363,7 +380,7 @@ impl Worker {
             return;
         }
         self.save_sync_enabled = enabled;
-        self.refresh_save_sync();
+        self.check_save_sync();
     }
 
     pub(super) fn set_save_sync_debounce(&mut self, seconds: u32) {
@@ -509,8 +526,14 @@ impl Worker {
                 failure = slot.last_failure.clone();
             }
             games.push(SaveSyncGameStatus {
+                work: if slot.needs_attention {
+                    rommfs_core::events::SaveSyncWork::NeedsReview
+                } else {
+                    rommfs_core::events::SaveSyncWork::NotChecked
+                },
                 rom_id: mapping.rom_key.rom_id,
                 file_id: mapping.rom_key.file_id,
+                local_path: mapping.target_path.display().to_string(),
                 rom_name: mapping.visible_rom_name.clone(),
                 local_hash: slot.current_local_hash,
                 remote_id: slot.remote_slot_id,
@@ -531,7 +554,14 @@ impl Worker {
         let pending_outbound = journal
             .snapshots()?
             .iter()
-            .filter(|snapshot| snapshot.state != SnapshotState::RemoteComplete)
+            .filter(|snapshot| {
+                matches!(
+                    snapshot.state,
+                    SnapshotState::Ready
+                        | SnapshotState::RemoteInFlight
+                        | SnapshotState::RemoteAmbiguous
+                )
+            })
             .count()
             + journal.dirty_mappings()?.len();
         self.sink
@@ -542,7 +572,7 @@ impl Worker {
                 // not a fresh inventory verification for this session.
                 reconciled_games: 0,
                 pending_outbound,
-                pending_incoming: incoming.len(),
+                pending_incoming: 0,
                 attention_games,
                 network_paused: false,
                 authentication_required: false,

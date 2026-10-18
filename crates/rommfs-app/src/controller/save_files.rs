@@ -149,6 +149,7 @@ impl Worker {
         let mut problem = self.save_sync_settings_problem.clone();
         let mut games = Vec::new();
         let mut unmatched = Vec::new();
+        let mut scan_completed_at = None;
         let result = (|| -> Result<()> {
             let prefs = self
                 .preferences
@@ -259,12 +260,22 @@ impl Worker {
             )?;
             games = rules.game_names();
             let mut plan = rules.scan(&scope.effective_saves_root)?;
+            scan_completed_at = Some(rommfs_core::cache::now_unix_secs());
             if let Some(directory) = &self.save_sync_storage_dir {
                 let journal = SaveSyncJournal::open(
                     directory.join("save-sync-journal.db"),
                     directory.join("save-sync-snapshots"),
                     scope.clone(),
                 )?;
+                let backups = journal.recorded_backup_paths()?;
+                for file in &mut plan.unmatched {
+                    if backups
+                        .iter()
+                        .any(|backup| *backup == scope.effective_saves_root.join(&file.path))
+                    {
+                        file.reason = "Local backup — not synced".into();
+                    }
+                }
                 for slot in journal.slots()? {
                     if let Ok(Some(mapping)) = rules.tracked_mapping(
                         slot.rom_key.rom_id,
@@ -385,7 +396,7 @@ impl Worker {
             profile_version: profile.map(|p| p.version.clone()),
             account_id: self.save_sync_identity.as_ref().map(|i| i.account_id),
             mapped_targets: report.map_or(0, |r| r.mappings.len()),
-            catalogue_unmapped: unmatched.iter().filter(|file| !file.no_candidate).count(),
+            catalogue_unmapped: unmatched.iter().filter(|file| file.mappable).count(),
             existing_saves: None,
             preview_saves: report
                 .map(|r| {
@@ -404,6 +415,12 @@ impl Worker {
                     .enabled_for(self.current_save_sync_epoch),
             debounce_secs: self.save_sync_debounce_secs,
         });
+        if let Some(completed_at) = scan_completed_at {
+            self.sink.emit(AppEvent::SaveSyncScanFinished {
+                session_id: self.save_sync_session_id,
+                completed_at,
+            });
+        }
         self.sink.emit(AppEvent::SaveFileMappings {
             session_id: self.save_sync_session_id,
             games,

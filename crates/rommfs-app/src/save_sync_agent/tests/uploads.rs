@@ -768,3 +768,34 @@ fn inventory_429_honors_retry_after_on_the_real_worker() {
     drop(jobs);
     worker.join().unwrap();
 }
+
+#[test]
+fn unchanged_watcher_hint_drains_without_leaving_completed_upload_pending() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    fixture.use_romm_save_store(ACCOUNT_ID, 201);
+    let case = case(directory.path(), &fixture, true);
+    let (sink, events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    wait_for_queue_status(&events, Duration::from_secs(5), |status| {
+        status.pending_outbound == 0
+            && status
+                .games
+                .iter()
+                .any(|game| game.work == rommfs_core::events::SaveSyncWork::UpToDate)
+    })
+    .expect("verified upload must drain the queue");
+    let uploads = fixture.saved_saves().len();
+    events.try_iter().for_each(drop);
+    fs::write(&case.mapping.target_path, SAVE_BYTES).unwrap();
+    let settled = wait_for_queue_status(&events, Duration::from_secs(5), |status| {
+        status.pending_outbound == 0
+    })
+    .expect("unchanged watcher hint must publish its drained queue");
+    assert!(settled
+        .games
+        .iter()
+        .all(|game| game.work == rommfs_core::events::SaveSyncWork::UpToDate));
+    assert_eq!(fixture.saved_saves().len(), uploads);
+    agent.stop();
+}

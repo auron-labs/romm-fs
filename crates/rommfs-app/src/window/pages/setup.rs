@@ -59,7 +59,7 @@ impl RommfsWindow {
                                     .label(if mounted {
                                         "Folder is running"
                                     } else {
-                                        "Start games folder"
+                                        "Make games available"
                                     })
                                     .primary()
                                     .disabled(mounted || mounting)

@@ -206,8 +206,10 @@ fn actor_failure_status(
         status.games = mappings
             .iter()
             .map(|mapping| SaveSyncGameStatus {
+                work: rommfs_core::events::SaveSyncWork::NeedsReview,
                 rom_id: mapping.rom_key.rom_id,
                 file_id: mapping.rom_key.file_id,
+                local_path: mapping.target_path.display().to_string(),
                 rom_name: mapping.visible_rom_name.clone(),
                 local_hash: None,
                 remote_id: None,
@@ -224,10 +226,18 @@ fn actor_failure_status(
     let dirty_mappings = journal.dirty_mappings().unwrap_or_default();
     status.pending_outbound = snapshots
         .iter()
-        .filter(|snapshot| snapshot.state != SnapshotState::RemoteComplete)
+        .filter(|snapshot| {
+            matches!(
+                snapshot.state,
+                SnapshotState::Ready
+                    | SnapshotState::RemoteInFlight
+                    | SnapshotState::RemoteAmbiguous
+            )
+        })
         .count()
         + dirty_mappings.len();
-    status.pending_incoming = incoming.len();
+    // Retained remote versions are review records, not queued downloads.
+    status.pending_incoming = 0;
     status.incoming = incoming
         .iter()
         .map(|record| SaveSyncIncomingStatus {
@@ -250,8 +260,10 @@ fn actor_failure_status(
             status.attention_games += 1;
         }
         let mut game = SaveSyncGameStatus {
+            work: rommfs_core::events::SaveSyncWork::NeedsReview,
             rom_id: mapping.rom_key.rom_id,
             file_id: mapping.rom_key.file_id,
+            local_path: mapping.target_path.display().to_string(),
             rom_name: mapping.visible_rom_name.clone(),
             local_hash: slot
                 .as_ref()
@@ -519,6 +531,10 @@ fn run_actor(
                 local_discovery_needed = false;
                 match rules.scan(&scope.effective_saves_root) {
                     Ok(plan) => {
+                        sink.emit(AppEvent::SaveSyncScanFinished {
+                            session_id,
+                            completed_at: rommfs_core::cache::now_unix_secs(),
+                        });
                         discovered.extend(plan.report.mappings);
                         for file in plan.unmatched.iter().take(20) {
                             sink.emit(AppEvent::log(Level::Warn, "save-sync", file.display()));
@@ -858,6 +874,7 @@ fn run_actor(
             state.next_inventory_poll = now + FALLBACK_SCAN_INTERVAL;
         }
 
+        let pending_before_capture = scheduler.pending_count();
         for (key, captured) in scheduler.capture_due(&mut journal, now) {
             match captured {
                 Ok(snapshot) => {
@@ -889,6 +906,11 @@ fn run_actor(
                     emit_queue_status(&context, &mappings, &journal, &scheduler, &state, &sink)?;
                 }
             }
+        }
+        // A watcher hint can settle without capturing a revision (unchanged
+        // bytes, or a removed file). Publish that queue drain too.
+        if scheduler.pending_count() != pending_before_capture {
+            emit_queue_status(&context, &mappings, &journal, &scheduler, &state, &sink)?;
         }
         for snapshot in journal.ready_snapshots()? {
             if state.network_paused
@@ -1038,8 +1060,10 @@ fn handle_reconciled_update(
                         }
                     }
                     let game = SaveSyncGameStatus {
+                        work: rommfs_core::events::SaveSyncWork::NotChecked,
                         rom_id: key.rom_id,
                         file_id: key.file_id,
+                        local_path: mapping.target_path.display().to_string(),
                         rom_name: mapping.visible_rom_name.clone(),
                         local_hash: outcome.local_hash,
                         remote_id: outcome.remote_id,
@@ -1058,7 +1082,7 @@ fn handle_reconciled_update(
                         game,
                         mapped_games: context.mappings.len(),
                         reconciled_games: state.reconciled_keys.len(),
-                        pending_incoming: journal.incoming_saves()?.len(),
+                        pending_incoming: 0,
                         attention_games: state.attention_keys.len(),
                         failure: queue_failure(state, context.mappings),
                     });
@@ -1146,8 +1170,10 @@ fn remember_reconciliation_failure(
         .game_states
         .entry(key.clone())
         .or_insert_with(|| SaveSyncGameStatus {
+            work: rommfs_core::events::SaveSyncWork::NotChecked,
             rom_id: key.rom_id,
             file_id: key.file_id,
+            local_path: mapping.target_path.display().to_string(),
             rom_name: mapping.visible_rom_name.clone(),
             local_hash: None,
             remote_id: None,
@@ -1167,8 +1193,10 @@ fn ensure_game_state(key: &RomKey, mappings: &[SaveMapping], state: &mut ActorSt
         .game_states
         .entry(key.clone())
         .or_insert_with(|| SaveSyncGameStatus {
+            work: rommfs_core::events::SaveSyncWork::NotChecked,
             rom_id: key.rom_id,
             file_id: key.file_id,
+            local_path: mapping.target_path.display().to_string(),
             rom_name: mapping.visible_rom_name.clone(),
             local_hash: None,
             remote_id: None,
@@ -1202,7 +1230,7 @@ fn emit_reconciliation_failure(
     mapping: &SaveMapping,
     message: &str,
     context: &ActorContext<'_>,
-    journal: &SaveSyncJournal,
+    _journal: &SaveSyncJournal,
     state: &ActorState,
     sink: &EventSink,
 ) -> Result<()> {
@@ -1211,8 +1239,10 @@ fn emit_reconciliation_failure(
         .get(key)
         .cloned()
         .unwrap_or(SaveSyncGameStatus {
+            work: rommfs_core::events::SaveSyncWork::NotChecked,
             rom_id: key.rom_id,
             file_id: key.file_id,
+            local_path: mapping.target_path.display().to_string(),
             rom_name: mapping.visible_rom_name.clone(),
             local_hash: None,
             remote_id: None,
@@ -1227,7 +1257,7 @@ fn emit_reconciliation_failure(
         game,
         mapped_games: context.mappings.len(),
         reconciled_games: state.reconciled_keys.len(),
-        pending_incoming: journal.incoming_saves()?.len(),
+        pending_incoming: 0,
         attention_games: state.attention_keys.len(),
         failure: queue_failure(state, context.mappings),
     });
@@ -1475,31 +1505,97 @@ fn emit_queue_status(
     let pending_outbound = scheduler.pending_count()
         + snapshots
             .iter()
-            .filter(|snapshot| snapshot.state != SnapshotState::RemoteComplete)
+            .filter(|snapshot| {
+                matches!(
+                    snapshot.state,
+                    SnapshotState::Ready
+                        | SnapshotState::RemoteInFlight
+                        | SnapshotState::RemoteAmbiguous
+                )
+            })
             .count();
-    let mut games = state.game_states.values().cloned().collect::<Vec<_>>();
+    // Include every mapped identity, including saves still awaiting inventory.
+    let mut games = mappings
+        .iter()
+        .map(|mapping| {
+            state
+                .game_states
+                .get(&mapping.rom_key)
+                .cloned()
+                .unwrap_or_else(|| SaveSyncGameStatus {
+                    work: rommfs_core::events::SaveSyncWork::NotChecked,
+                    rom_id: mapping.rom_key.rom_id,
+                    file_id: mapping.rom_key.file_id,
+                    local_path: mapping.target_path.display().to_string(),
+                    rom_name: mapping.visible_rom_name.clone(),
+                    local_hash: None,
+                    remote_id: None,
+                    remote_hash: None,
+                    incoming_ids: Vec::new(),
+                    issue: None,
+                    installed_incoming: false,
+                })
+        })
+        .collect::<Vec<_>>();
     for game in &mut games {
         if let Some(mapping) = mappings.iter().find(|mapping| {
             (mapping.rom_key.rom_id, mapping.rom_key.file_id) == (game.rom_id, game.file_id)
         }) {
-            if let Some(slot) = journal.slot(&mapping.rom_key)? {
+            let slot = journal.slot(&mapping.rom_key)?;
+            let needs_attention = slot.as_ref().is_some_and(|slot| slot.needs_attention);
+            if let Some(slot) = slot {
                 game.local_hash = slot.current_local_hash;
                 game.remote_id = slot.remote_slot_id;
                 game.remote_hash = slot.remote_baseline_hash;
+                game.issue = slot.last_failure;
             }
             if let Some(failure) = game_failure(&mapping.rom_key, state) {
                 game.issue = Some(failure.to_owned());
             }
+            use rommfs_core::events::SaveSyncWork;
+            let pending = scheduler.has_pending(&mapping.rom_key)
+                || snapshots.iter().any(|snapshot| {
+                    snapshot.rom_key == mapping.rom_key
+                        && matches!(
+                            snapshot.state,
+                            SnapshotState::Ready
+                                | SnapshotState::RemoteInFlight
+                                | SnapshotState::RemoteAmbiguous
+                        )
+                });
+            game.work = if needs_attention || state.attention_keys.contains(&mapping.rom_key) {
+                SaveSyncWork::NeedsReview
+            } else if state.network_paused
+                && (pending || !state.reconciled_keys.contains(&mapping.rom_key))
+            {
+                SaveSyncWork::WaitingForRomm
+            } else if state.dispatched.values().any(|key| key == &mapping.rom_key) {
+                SaveSyncWork::Uploading
+            } else if pending {
+                SaveSyncWork::WaitingToUpload
+            } else if game.issue.is_some() {
+                SaveSyncWork::NeedsReview
+            } else if !state.reconciled_keys.contains(&mapping.rom_key) {
+                SaveSyncWork::Checking
+            } else if game.local_hash.is_some() && game.local_hash == game.remote_hash {
+                SaveSyncWork::UpToDate
+            } else {
+                SaveSyncWork::NotChecked
+            };
         }
     }
     games.sort_by_key(|game| (game.rom_id, game.file_id));
+    let attention_games = games
+        .iter()
+        .filter(|game| game.work == rommfs_core::events::SaveSyncWork::NeedsReview)
+        .count();
     sink.emit(AppEvent::SaveSyncQueueUpdated(SaveSyncQueueStatus {
         session_id: context.session_id,
         mapped_games: mappings.len(),
         reconciled_games: state.reconciled_keys.len(),
         pending_outbound,
-        pending_incoming: incoming.len(),
-        attention_games: state.attention_keys.len(),
+        pending_incoming: 0,
+        attention_games,
         network_paused: state.network_paused,
         authentication_required: state.authentication_required,
         actor_failed: false,

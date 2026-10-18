@@ -3,7 +3,13 @@ use crate::controller::{parse_progress_counts, RetroBatStep, StepStatus};
 use rommfs_core::retrobat::SkippedSystem;
 
 /// The Settings tabs (phase 2c). The selected index lives in view state.
-const SETTINGS_TABS: [&str; 5] = ["Account", "Games folder", "RetroBat", "Saves", "App"];
+const SETTINGS_TABS: [&str; 5] = [
+    "RomM connection",
+    "Games folder",
+    "RetroBat",
+    "Saves",
+    "Application",
+];
 
 /// Settings page: a tab bar with one scroll region per tab (phase 2c).
 pub fn render(
@@ -435,7 +441,7 @@ impl RommfsWindow {
         let available = self.state.save_sync_available;
         let switch = Switch::new("save-sync-enabled")
             .checked(enabled)
-            .label("Save sync")
+            .label("Automatic save sync")
             .disabled(!available && !enabled);
         let switch = if !available && !enabled {
             switch.tooltip("Choose a save folder first.")
@@ -498,6 +504,7 @@ impl RommfsWindow {
                             .gap_2()
                             .items_center()
                             .child(switch.on_change(cx.listener(|view, checked, _, cx| {
+                                view.state.request_save_sync_enabled(*checked);
                                 view.controller.send(Command::SetSaveSyncEnabled {
                                     enabled: *checked,
                                 });
@@ -736,7 +743,6 @@ impl RommfsWindow {
         let installed = self.state.retrobat_root.clone();
         let running = self.state.installer_running;
         let ready = self.state.installer_ready;
-        let version = self.state.save_sync_profile_version.clone();
         let button = |id: &'static str, label: &'static str, main: bool| {
             let b = Button::new(id).label(label);
             if main {
@@ -748,13 +754,7 @@ impl RommfsWindow {
         v_flex()
             .gap_2()
             .when_some(installed.clone(), |this, root| {
-                this.child(muted(
-                    match version {
-                        Some(v) => format!("Using {root} (version {v})"),
-                        None => format!("Using {root}"),
-                    },
-                    cx,
-                ))
+                this.child(muted(format!("Using {root}"), cx))
             })
             .when(installed.is_none(), |this| {
                 this.child(

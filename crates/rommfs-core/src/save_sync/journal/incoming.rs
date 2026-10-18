@@ -233,6 +233,20 @@ impl SaveSyncJournal {
         })
     }
 
+    /// Recorded local replacement backups in this consent scope, including
+    /// completed publications. This is descriptive evidence, not deletion authority.
+    pub fn recorded_backup_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut statement = self.connection.prepare("SELECT replacement_backup FROM save_sync_incoming WHERE server_id=?1 AND account_id=?2 AND installation_root=?3 AND effective_saves_root=?4 AND replacement_backup IS NOT NULL").map_err(sqlite)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params_from_iter(scope_only_params(&self.scope)),
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(sqlite)?;
+        rows.map(|row| row.map(PathBuf::from).map_err(sqlite))
+            .collect()
+    }
+
     pub fn incoming_saves(&self) -> Result<Vec<IncomingSaveRecord>> {
         let mut statement = self
             .connection

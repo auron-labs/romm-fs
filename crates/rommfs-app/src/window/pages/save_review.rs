@@ -6,58 +6,68 @@ use std::cell::Cell;
 /// through search, filtering, and paging — never behind a truncated dump.
 const REVIEW_PAGE_SIZE: usize = 50;
 
-/// Per-row status words (UI-PLAN §5). `Incoming` covers remote saves the
-/// journal keeps for explicit review; "Synced" is never claimed — every row
-/// status derives from the live queue or the last scan.
+/// Current work leads each row; retained versions stay inside save details.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RowStatus {
     NeedsAttention,
-    Incoming,
+    ConflictingChanges,
     NotLinked,
-    Linked,
+    NotChecked,
+    Checking,
+    WaitingToUpload,
+    Uploading,
+    WaitingForRomm,
+    UpToDate,
     Excluded,
 }
 
 impl RowStatus {
     fn label(self) -> &'static str {
         match self {
-            Self::NeedsAttention => "Needs attention",
-            Self::Incoming => "Incoming",
+            Self::NeedsAttention => "Needs review",
+            Self::ConflictingChanges => "Conflicting changes",
             Self::NotLinked => "Not linked",
-            Self::Linked => "Linked",
-            Self::Excluded => "Excluded",
+            Self::NotChecked => "Not checked",
+            Self::Checking => "Checking for changes…",
+            Self::WaitingToUpload => "Waiting to upload",
+            Self::Uploading => "Uploading to RomM…",
+            Self::WaitingForRomm => "Waiting for RomM",
+            Self::UpToDate => "Up to date",
+            Self::Excluded => "Skipped",
         }
     }
-
     fn kind(self) -> StatusKind {
         match self {
-            Self::NeedsAttention => StatusKind::Danger,
-            Self::Incoming | Self::NotLinked => StatusKind::Warning,
-            Self::Linked => StatusKind::Success,
-            Self::Excluded => StatusKind::Muted,
+            Self::NeedsAttention
+            | Self::ConflictingChanges
+            | Self::NotLinked
+            | Self::WaitingForRomm => StatusKind::Warning,
+            Self::UpToDate => StatusKind::Success,
+            _ => StatusKind::Muted,
         }
     }
-
-    /// Rows needing a decision sort ahead of healthy and excluded ones.
     fn rank(self) -> usize {
         match self {
-            Self::NeedsAttention => 0,
-            Self::Incoming => 1,
-            Self::NotLinked => 2,
-            Self::Linked => 3,
-            Self::Excluded => 4,
+            Self::NeedsAttention | Self::ConflictingChanges => 0,
+            Self::NotLinked | Self::WaitingForRomm => 1,
+            Self::WaitingToUpload | Self::Uploading | Self::Checking => 2,
+            Self::NotChecked => 3,
+            Self::UpToDate => 4,
+            Self::Excluded => 5,
         }
     }
 }
-
-/// Status filter dropdown options; index 0 means "no filter".
 const STATUS_FILTERS: &[Option<RowStatus>] = &[
     None,
     Some(RowStatus::NeedsAttention),
-    Some(RowStatus::Incoming),
+    Some(RowStatus::ConflictingChanges),
     Some(RowStatus::NotLinked),
-    Some(RowStatus::Linked),
-    Some(RowStatus::Excluded),
+    Some(RowStatus::NotChecked),
+    Some(RowStatus::Checking),
+    Some(RowStatus::WaitingToUpload),
+    Some(RowStatus::Uploading),
+    Some(RowStatus::WaitingForRomm),
+    Some(RowStatus::UpToDate),
 ];
 
 /// Everything a row's expanded detail needs — keyed by domain identity
@@ -75,6 +85,7 @@ enum RowPayload {
     },
     /// A linked game in the live reconciliation queue.
     Game {
+        local_path: String,
         rom_id: i64,
         file_id: i64,
         issue: Option<String>,
@@ -83,8 +94,7 @@ enum RowPayload {
         remote_hash: Option<String>,
         installed_incoming: bool,
     },
-    /// A verified remote save kept in the journal for review/export.
-    Incoming(SaveSyncIncomingStatus),
+
     /// A card whose local and remote copies both changed; the remote copy is
     /// kept beside the local card for review.
     MemoryCard(MemoryCardConflictStatus),
@@ -100,8 +110,8 @@ struct ReviewRow {
     payload: RowPayload,
 }
 
-/// One flat review list: queue failures and incoming saves first, then
-/// unlinked files, linked games, and structural exclusions.
+/// One row per supported identity, plus eligible unlinked files. Structural
+/// exclusions are collected separately for the skipped-files disclosure.
 fn collect_review_rows(state: &UiState, show_ignored: bool) -> Vec<ReviewRow> {
     let mut rows = Vec::new();
 
@@ -119,7 +129,7 @@ fn collect_review_rows(state: &UiState, show_ignored: bool) -> Vec<ReviewRow> {
     }
 
     for file in &state.save_file_unmatched {
-        if file.no_candidate && !show_ignored {
+        if !file.mappable && !show_ignored {
             continue;
         }
         let path = file.path.display().to_string();
@@ -149,25 +159,53 @@ fn collect_review_rows(state: &UiState, show_ignored: bool) -> Vec<ReviewRow> {
 
     if let Some(queue) = &state.save_sync_queue {
         for game in &queue.games {
-            let detail = match &game.issue {
-                Some(issue) => issue.clone(),
-                None => format!(
-                    "local {} · remote ID {} · remote {}",
-                    game.local_hash.as_deref().unwrap_or("unknown"),
-                    game.remote_id.as_deref().unwrap_or("none"),
-                    game.remote_hash.as_deref().unwrap_or("unknown"),
-                ),
+            use rommfs_core::events::SaveSyncWork;
+            let confirmed_conflict = state
+                .save_sync_review_versions(game.rom_id, game.file_id)
+                .any(|version| version.reason == "two_sided_conflict");
+            let status = if confirmed_conflict {
+                RowStatus::ConflictingChanges
+            } else if game.work == SaveSyncWork::NeedsReview || !game.incoming_ids.is_empty() {
+                RowStatus::NeedsAttention
+            } else if state.save_sync_checking && state.save_sync_enabled {
+                RowStatus::Checking
+            } else {
+                match game.work {
+                    SaveSyncWork::NotChecked => RowStatus::NotChecked,
+                    SaveSyncWork::Checking => RowStatus::Checking,
+                    SaveSyncWork::WaitingToUpload => RowStatus::WaitingToUpload,
+                    SaveSyncWork::Uploading => RowStatus::Uploading,
+                    SaveSyncWork::WaitingForRomm => RowStatus::WaitingForRomm,
+                    SaveSyncWork::NeedsReview => RowStatus::NeedsAttention,
+                    SaveSyncWork::UpToDate => RowStatus::UpToDate,
+                }
+            };
+            let detail = if matches!(
+                status,
+                RowStatus::NeedsAttention | RowStatus::ConflictingChanges
+            ) {
+                "Review details".to_string()
+            } else if !state.save_sync_enabled {
+                "Last known result · automatic sync is off".to_string()
+            } else if status == RowStatus::UpToDate {
+                "Local and RomM copies match".to_string()
+            } else {
+                "Save details".to_string()
             };
             rows.push(ReviewRow {
                 key: SharedString::from(format!("game:{}:{}", game.rom_id, game.file_id)),
-                item: game.rom_name.clone(),
-                status: if game.issue.is_some() {
-                    RowStatus::NeedsAttention
-                } else {
-                    RowStatus::Linked
-                },
+                item: format!(
+                    "{} · {}",
+                    game.rom_name,
+                    std::path::Path::new(&game.local_path)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ),
+                status,
                 detail,
                 payload: RowPayload::Game {
+                    local_path: game.local_path.clone(),
                     rom_id: game.rom_id,
                     file_id: game.file_id,
                     issue: game.issue.clone(),
@@ -176,15 +214,6 @@ fn collect_review_rows(state: &UiState, show_ignored: bool) -> Vec<ReviewRow> {
                     remote_hash: game.remote_hash.clone(),
                     installed_incoming: game.installed_incoming,
                 },
-            });
-        }
-        for incoming in &queue.incoming {
-            rows.push(ReviewRow {
-                key: SharedString::from(format!("incoming:{}", incoming.incoming_id)),
-                item: incoming.rom_name.clone(),
-                status: RowStatus::Incoming,
-                detail: format!("{} · remote save {}", incoming.reason, incoming.remote_id),
-                payload: RowPayload::Incoming(incoming.clone()),
             });
         }
     }
@@ -196,7 +225,7 @@ fn collect_review_rows(state: &UiState, show_ignored: bool) -> Vec<ReviewRow> {
                 conflict.emulator, conflict.card_name
             )),
             item: format!("{} · {}", conflict.card_name, conflict.emulator),
-            status: RowStatus::NeedsAttention,
+            status: RowStatus::ConflictingChanges,
             detail: format!(
                 "local and remote both changed · remote version {}",
                 conflict.remote_version_id
@@ -248,28 +277,11 @@ impl RommfsWindow {
     ) -> impl IntoElement {
         let enabled = self.state.save_sync_enabled;
         let (status, status_kind) = self.save_sync_status();
-        // One compact identity line replaces the old server/account/folder/
-        // last-action block (phase 2b). Last action now lives in Activity.
-        let identity = match (
-            &self.state.save_sync_server_id,
-            self.state.save_sync_account_id,
-        ) {
-            (Some(server), Some(_)) => {
-                let user = self.user_input.read(cx).value().to_string();
-                if user.is_empty() {
-                    server.clone()
-                } else {
-                    format!("{server} · {user}")
-                }
-            }
-            _ => "Server and account not verified".into(),
-        };
         let checked = self
             .state
-            .save_sync_profile_version
-            .as_deref()
-            .map(|version| format!("checked {version}"))
-            .unwrap_or_else(|| "save folder not checked".into());
+            .save_scan_at
+            .map(|at| format!("Last successful scan: {}", relative_time(at)))
+            .unwrap_or_else(|| "Last scan time unavailable".into());
         let failure = self
             .state
             .save_sync_queue
@@ -283,63 +295,63 @@ impl RommfsWindow {
             .gap_2()
             .child(
                 h_flex()
+                    .flex_wrap()
+                    .gap_2()
                     .justify_between()
                     .items_center()
                     .child(status_marker(status_kind, status, cx))
                     .child(
                         h_flex()
+                            .flex_wrap()
                             .gap_2()
                             .items_center()
                             .child(
                                 Button::new("save-sync-refresh")
-                                    .label("Refresh")
+                                    .label("Check for changes")
+                                    .disabled(self.state.save_sync_checking)
                                     .outline()
                                     .small()
-                                    .on_click(cx.listener(|view, _, _, _cx| {
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.state.save_sync_checking = true;
                                         view.controller.send(Command::RefreshSaveSync);
+                                        cx.notify();
                                     })),
                             )
-                            .child(if enabled {
-                                Button::new("save-sync-toggle")
-                                    .label("Disable save sync")
-                                    .outline()
-                                    .small()
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        view.state.save_sync_enabled = false;
-                                        view.controller
-                                            .send(Command::SetSaveSyncEnabled { enabled: false });
+                            .child(
+                                Switch::new("save-sync-toggle")
+                                    .label(if enabled {
+                                        "Automatic save sync: On"
+                                    } else {
+                                        "Automatic save sync: Off"
+                                    })
+                                    .checked(enabled)
+                                    .disabled(!enabled && !self.state.save_sync_available)
+                                    .on_change(cx.listener(|view, checked, _, cx| {
+                                        view.state.request_save_sync_enabled(*checked);
+                                        view.controller.send(Command::SetSaveSyncEnabled {
+                                            enabled: *checked,
+                                        });
                                         cx.notify();
-                                    }))
-                            } else {
-                                Button::new("save-sync-toggle")
-                                    .label("Enable save sync")
-                                    .primary()
-                                    .small()
-                                    .disabled(!self.state.save_sync_available)
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        view.controller
-                                            .send(Command::SetSaveSyncEnabled { enabled: true });
-                                        cx.notify();
-                                    }))
-                            }),
+                                    })),
+                            ),
                     ),
             )
-            .child(muted_xs(format!("{identity} · {checked}"), cx))
+            .child(muted_xs(checked, cx))
             .child(
                 h_flex()
                     .gap_2()
                     .flex_wrap()
                     .child(chip(format!(
-                        "{} mapped",
-                        fmt_count(self.state.save_sync_mapped_targets)
+                        "{} tracked",
+                        plural(self.state.save_sync_mapped_targets, "save")
                     )))
                     .child(chip(format!(
-                        "{} unmatched",
+                        "{} eligible unlinked saves",
                         fmt_count(self.state.save_sync_catalogue_unmapped)
                     )))
                     .when(self.state.save_files_ignored() > 0, |this| {
                         this.child(chip(format!(
-                            "{} ignored",
+                            "{} skipped files",
                             fmt_count(self.state.save_files_ignored())
                         )))
                     })
@@ -380,15 +392,6 @@ impl RommfsWindow {
         if let Some(failure) = failure {
             card = card.child(error_line(format!("Last failure: {failure}"), cx));
         }
-        for path in &self.state.save_sync_preview {
-            card = card.child(
-                div()
-                    .text_xs()
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .text_color(cx.theme().muted_foreground)
-                    .child(path.clone()),
-            );
-        }
         div()
             .rounded(cx.theme().radius)
             .border_1()
@@ -404,6 +407,7 @@ impl RommfsWindow {
         row: &ReviewRow,
         has_games: bool,
         can_export: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let mut detail = v_flex().gap_2().px_3().py_2();
@@ -512,12 +516,13 @@ impl RommfsWindow {
                     ));
                 } else {
                     detail = detail.child(muted_xs(
-                        "Excluded from save sync; it stays unmatched for every game.",
+                        "This file is skipped. It is preserved locally and is not waiting to be linked.",
                         cx,
                     ));
                 }
             }
             RowPayload::Game {
+                local_path,
                 rom_id,
                 file_id,
                 issue,
@@ -526,50 +531,42 @@ impl RommfsWindow {
                 remote_hash,
                 installed_incoming,
             } => {
-                detail = detail
-                    .child(muted_xs(format!("ROM {rom_id} · file {file_id}"), cx))
-                    .child(muted_xs(
-                        format!(
-                            "local {} · remote ID {} · remote {}",
-                            local_hash.as_deref().unwrap_or("unknown"),
-                            remote_id.as_deref().unwrap_or("none"),
-                            remote_hash.as_deref().unwrap_or("unknown"),
-                        ),
-                        cx,
-                    ));
+                let path_state = window.use_keyed_state(
+                    SharedString::from(format!("save-local-path-{}", row.key)),
+                    cx,
+                    |window, cx| InputState::new(window, cx).default_value(local_path.clone()),
+                );
+                detail = detail.child(muted(format!("Linked to {}", row.item), cx))
+                    .child(Input::new(&path_state).readonly(true).w_full())
+                    .child(details_disclosure(SharedString::from(format!("save-diagnostics-{}", row.key)), format!("ROM {rom_id} · file {file_id}\nLocal hash: {}\nRemote ID: {}\nRemote hash: {}\n{}", local_hash.as_deref().unwrap_or("unknown"), remote_id.as_deref().unwrap_or("none"), remote_hash.as_deref().unwrap_or("unknown"), issue.as_deref().unwrap_or("")), window, cx));
                 if *installed_incoming {
                     detail = detail.child(muted_xs(
-                        "A reviewed remote save was installed for this game.",
+                        "A verified remote save was installed for this game.",
                         cx,
                     ));
                 }
                 if let Some(issue) = issue {
-                    detail = detail.child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().warning)
-                            .child(format!("Attention: {issue}")),
-                    );
+                    detail = detail.child(section_heading("This save needs review"));
+                    detail = detail.child(muted(if row.status == RowStatus::ConflictingChanges { "Local and RomM copies have diverged. Automatic sync is paused for this save; review both copies before recovering your progress." } else if issue.contains("outside the verified owned revision format; no remote file was adopted") {
+                        "RomM returned a save version that RomM-FS could not verify. This unverified version was not applied. Automatic sync is paused for this save."
+                    } else {
+                        "Automatic sync needs attention for this save. Open Technical details for the reported issue."
+                    }, cx));
                 }
-            }
-            RowPayload::Incoming(incoming) => {
-                detail = detail
-                    .child(muted_xs(
-                        format!("ROM {} · {}", incoming.rom_id, incoming.rom_name),
-                        cx,
-                    ))
-                    .child(muted_xs(
-                        format!(
-                            "remote save {} · pending revision {} · {}",
-                            incoming.remote_id, incoming.incoming_id, incoming.state,
-                        ),
-                        cx,
-                    ))
-                    .child(muted_xs(
-                        format!("{} · {}", incoming.reason, incoming.content_hash),
-                        cx,
-                    ))
-                    .child(self.render_incoming_row(incoming, can_export, cx));
+                let records = self
+                    .state
+                    .save_sync_review_versions(*rom_id, *file_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !records.is_empty() {
+                    detail = detail.child(section_heading("Remote versions to review"));
+                    for (index, record) in records.into_iter().enumerate() {
+                        detail = detail
+                            .child(muted(format!("Remote version {}", index + 1), cx))
+                            .child(self.render_incoming_row(&record, can_export, window, cx));
+                    }
+                    detail = detail.child(muted("No automatic recovery is available for these review records. Export a copy for inspection; automatic sync cannot adopt an unverified version.", cx));
+                }
             }
             RowPayload::MemoryCard(conflict) => {
                 detail = detail
@@ -615,22 +612,32 @@ impl RommfsWindow {
         let expanded = view_expanded(self, &row.key);
         let click_key = row.key.clone();
         let action_key = row.key.clone();
+        let click_focus = focus_handle.clone();
 
         let row_el = h_flex()
             .id(SharedString::from(format!("save-review-row-{}", row.key)))
+            .role(gpui_kit::Role::Button)
+            .aria_label(SharedString::from(format!(
+                "{} — {} — Save details",
+                row.item,
+                row.status.label()
+            )))
+            .aria_expanded(expanded)
             .key_context("Disclosure")
             .track_focus(&focus_handle)
             .on_action(cx.listener(move |view, _: &ActivateControl, _window, cx| {
                 toggle_expanded(view, &action_key);
                 cx.notify();
             }))
-            .on_click(cx.listener(move |view, _, _, cx| {
+            .on_click(cx.listener(move |view, _, window, cx| {
+                window.focus(&click_focus, cx);
                 toggle_expanded(view, &click_key);
                 cx.notify();
             }))
             .w_full()
             .gap_3()
-            .h_9()
+            .min_h_9()
+            .py_1()
             .px_3()
             .items_center()
             .border_1()
@@ -646,7 +653,7 @@ impl RommfsWindow {
                     .min_w_0()
                     .child(div().truncate().child(row.item.clone())),
             )
-            .child(div().w(px(112.)).flex_shrink_0().child(status_marker(
+            .child(div().w_40().flex_shrink_0().child(status_marker(
                 row.status.kind(),
                 row.status.label(),
                 cx,
@@ -670,7 +677,8 @@ impl RommfsWindow {
 
         let mut entry = v_flex().child(row_el);
         if expanded {
-            entry = entry.child(self.save_review_row_detail(row, has_games, can_export, cx));
+            entry =
+                entry.child(self.save_review_row_detail(row, has_games, can_export, window, cx));
         }
         if !is_last {
             entry = entry.border_b_1().border_color(cx.theme().border);
@@ -678,85 +686,21 @@ impl RommfsWindow {
         entry
     }
 
-    /// Footer row for files the scan never listed: type a save-root-relative
-    /// path, pick the owning game, and Map file — the same AssociateSaveFile
-    /// path the old typed input used.
-    fn save_review_manual_row(
+    /// Secondary linking form outside the current-saves table.
+    fn save_review_link_action(
         &mut self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        const MANUAL_KEY: &str = "manual-map";
-        let focus_handle = window
-            .use_keyed_state(
-                SharedString::from("save-review-focus-manual"),
-                cx,
-                |_, cx| cx.focus_handle().tab_stop(true),
-            )
-            .read(cx)
-            .clone();
-        let focused = focus_handle.is_focused(window);
-        let key = SharedString::from(MANUAL_KEY);
+        let key = SharedString::from("manual-map");
         let expanded = view_expanded(self, &key);
-        let click_key = key.clone();
-        let action_key = key.clone();
-
-        let row_el = h_flex()
-            .id(SharedString::from("save-review-row-manual"))
-            .key_context("Disclosure")
-            .track_focus(&focus_handle)
-            .on_action(cx.listener(move |view, _: &ActivateControl, _window, cx| {
-                toggle_expanded(view, &action_key);
-                cx.notify();
-            }))
+        let row_el = Button::new("link-save-file")
+            .label("Link a save file…")
+            .outline()
             .on_click(cx.listener(move |view, _, _, cx| {
-                toggle_expanded(view, &click_key);
+                toggle_expanded(view, &key);
                 cx.notify();
-            }))
-            .w_full()
-            .gap_3()
-            .h_9()
-            .px_3()
-            .items_center()
-            .border_1()
-            .border_color(if focused {
-                cx.theme().primary
-            } else {
-                gpui_kit::transparent_black()
-            })
-            .when(expanded, |this| this.bg(cx.theme().accent))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().truncate().child("Link a file by path")),
-            )
-            .child(div().w(px(112.)).flex_shrink_0().child(status_marker(
-                RowStatus::NotLinked.kind(),
-                "Manual",
-                cx,
-            )))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        div()
-                            .truncate()
-                            .child("For saves the folder scan didn't list"),
-                    ),
-            )
-            .child(
-                Icon::new(if expanded {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .small()
-                .text_color(cx.theme().muted_foreground),
-            );
-
+            }));
         let mut entry = v_flex()
             .border_t_1()
             .border_color(cx.theme().border)
@@ -853,11 +797,20 @@ pub fn render(
         .value()
         .to_string()
         .to_lowercase();
-    let rows = collect_review_rows(&view.state, view.save_review_show_ignored);
+    let rows = collect_review_rows(&view.state, false);
     let total_rows = rows.len();
     let filtered: Vec<&ReviewRow> = rows
         .iter()
-        .filter(|row| status_filter.is_none_or(|status| row.status == status))
+        .filter(|row| {
+            if view.save_review_attention_only {
+                matches!(
+                    row.status,
+                    RowStatus::NeedsAttention | RowStatus::ConflictingChanges
+                )
+            } else {
+                status_filter.is_none_or(|status| row.status == status)
+            }
+        })
         .filter(|row| row_matches_query(row, &query))
         .collect();
 
@@ -868,7 +821,7 @@ pub fn render(
     let page_rows = &filtered[start..end];
 
     let count_text = if filtered.len() == total_rows {
-        format!("{} items", fmt_count(total_rows))
+        plural(total_rows, "item")
     } else {
         format!(
             "{} of {} items",
@@ -888,21 +841,16 @@ pub fn render(
             .border_b_1()
             .border_color(cx.theme().border)
             .child(div().flex_1().min_w_0().child(muted_xs("File", cx)))
-            .child(
-                div()
-                    .w(px(112.))
-                    .flex_shrink_0()
-                    .child(muted_xs("Status", cx)),
-            )
+            .child(div().w_40().flex_shrink_0().child(muted_xs("Status", cx)))
             .child(div().flex_1().min_w_0().child(muted_xs("Detail", cx)))
             .child(div().w_4().flex_shrink_0()),
     );
     if page_rows.is_empty() {
         let empty = if !query.is_empty() || status_filter.is_some() {
-            "Nothing matches the current search or filter.".to_string()
+            "No results match this filter.".to_string()
         } else {
             match view.state.save_sync_summary() {
-                SaveSyncSummary::Off => "Save sync is off. Enable it to review files.".into(),
+                SaveSyncSummary::Off => "No supported saves found. Automatic save sync is off.".into(),
                 SaveSyncSummary::NeedsSetup => {
                     "Save sync needs a save folder. Configure one in Settings.".into()
                 }
@@ -910,7 +858,7 @@ pub fn render(
                     "Checking saves…".into()
                 }
                 SaveSyncSummary::NoLinkedFiles => "Nothing to sync yet.".into(),
-                _ => "Nothing to review.".into(),
+                _ => "No supported saves found. Check your save folder in Settings, then check for changes.".into(),
             }
         };
         table = table.child(div().px_3().py_4().child(muted(empty, cx)));
@@ -927,9 +875,6 @@ pub fn render(
             ));
         }
     }
-    if has_games {
-        table = table.child(view.save_review_manual_row(window, cx));
-    }
 
     let ignored = view.state.save_files_ignored();
     let ignored_row = (ignored > 0).then(|| {
@@ -938,15 +883,16 @@ pub fn render(
             .gap_2()
             .items_center()
             .child(muted_xs(
-                format!(
-                    "{} don't belong to a game in your library",
-                    plural(ignored, "file")
-                ),
+                format!("{} skipped files", plural(ignored, "file")),
                 cx,
             ))
             .child(
                 Button::new("save-review-toggle-ignored")
-                    .label(if shown { "Hide" } else { "Show" })
+                    .label(if shown {
+                        "Hide skipped files"
+                    } else {
+                        "Show skipped files"
+                    })
                     .outline()
                     .small()
                     .on_click(cx.listener(|view, _, _, cx| {
@@ -956,13 +902,47 @@ pub fn render(
                     })),
             )
     });
+    let skipped = if view.save_review_show_ignored {
+        let rows = collect_review_rows(&view.state, true)
+            .into_iter()
+            .filter(|row| row.status == RowStatus::Excluded)
+            .collect::<Vec<_>>();
+        let mut details = v_flex().gap_2().child(section_heading("Skipped files"));
+        let pages = rows.len().div_ceil(REVIEW_PAGE_SIZE).max(1);
+        let page = view.save_review_skipped_page.min(pages - 1);
+        for row in rows
+            .iter()
+            .skip(page * REVIEW_PAGE_SIZE)
+            .take(REVIEW_PAGE_SIZE)
+        {
+            details = details.child(view.save_review_row(row, has_games, false, false, window, cx));
+        }
+        if pages > 1 {
+            let weak = cx.weak_entity();
+            details = details.child(
+                Pagination::new("skipped-files-pagination")
+                    .current_page(page + 1)
+                    .total_pages(pages)
+                    .small()
+                    .on_click(move |target, _, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.save_review_skipped_page = target.saturating_sub(1);
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
+        Some(details)
+    } else {
+        None
+    };
     let mut section = v_flex()
         .gap_2()
         .child(
             h_flex()
                 .justify_between()
                 .items_end()
-                .child(section_heading("Review files"))
+                .child(section_heading("Current saves"))
                 .child(muted_xs(count_text, cx)),
         )
         .child(
@@ -985,7 +965,25 @@ pub fn render(
                     )),
                 ),
         )
+        .when(view.save_review_attention_only, |this| {
+            this.child(
+                h_flex()
+                    .gap_2()
+                    .child(muted("Showing saves needing review", cx))
+                    .child(
+                        Button::new("save-review-show-all")
+                            .label("Show all saves")
+                            .outline()
+                            .small()
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.save_review_attention_only = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+        })
         .children(ignored_row)
+        .when_some(skipped, |this, details| this.child(details))
         .child(
             div()
                 .rounded(cx.theme().radius)
@@ -994,7 +992,7 @@ pub fn render(
                 .child(table),
         );
 
-    if !page_rows.is_empty() {
+    if total_pages > 1 {
         let weak = cx.weak_entity();
         section = section.child(
             h_flex()
@@ -1021,9 +1019,12 @@ pub fn render(
 
     v_flex()
         .gap_4()
-        .child(page_heading("Save sync"))
+        .child(page_heading("Saves"))
         .child(view.save_review_status_strip(window, cx))
         .child(section)
+        .when(has_games, |this| {
+            this.child(view.save_review_link_action(window, cx))
+        })
 }
 
 impl RommfsWindow {
@@ -1031,6 +1032,7 @@ impl RommfsWindow {
         &mut self,
         incoming: &SaveSyncIncomingStatus,
         can_export: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let incoming = incoming.clone();
@@ -1046,24 +1048,31 @@ impl RommfsWindow {
             .cloned();
         let mut row = v_flex()
             .gap_1()
-            .child(div().text_xs().child(format!(
-                "{} · RomM save {} · pending revision {} · {} · {} · {}",
-                incoming.rom_name,
-                incoming.remote_id,
-                incoming.incoming_id,
-                incoming.state,
-                incoming.reason,
-                incoming.content_hash,
-            )))
+            .child(details_disclosure(
+                SharedString::from(format!("incoming-details-{}", incoming.incoming_id)),
+                format!(
+                    "{} · RomM save {} · revision {} · {} · {} · {}",
+                    incoming.rom_name,
+                    incoming.remote_id,
+                    incoming.incoming_id,
+                    incoming.state,
+                    incoming.reason,
+                    incoming.content_hash
+                ),
+                window,
+                cx,
+            ))
             .child(
-                Button::new(format!("export-{}", incoming.incoming_id))
-                    .label("Export…")
-                    .outline()
-                    .small()
-                    .disabled(!can_export)
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.prompt_export(incoming.clone(), cx);
-                    })),
+                h_flex().child(
+                    Button::new(format!("export-{}", incoming.incoming_id))
+                        .label("Export…")
+                        .outline()
+                        .small()
+                        .disabled(!can_export)
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.prompt_export(incoming.clone(), cx);
+                        })),
+                ),
             );
         if let Some(error) = error {
             row = row.child(error_line(format!("Export failed: {error}"), cx));
@@ -1084,7 +1093,7 @@ impl RommfsWindow {
 /// counts read as numbers, the prose moves behind a disclosure).
 fn existing_save_inventory(preview: Option<&ExistingSavePreview>) -> (Vec<String>, Option<String>) {
     let Some(preview) = preview else {
-        return (vec!["No save scan yet".into()], None);
+        return (vec![], None);
     };
     match preview.status {
         ExistingSaveScanStatus::Unavailable => (

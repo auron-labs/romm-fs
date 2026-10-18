@@ -188,7 +188,7 @@ fn progress_counts_are_parsed_from_status_lines() {
 }
 
 #[test]
-fn files_matching_no_game_are_counted_as_ignored() {
+fn eligible_files_remain_linkable_even_without_automatic_candidates() {
     use rommfs_core::save_sync::UnmatchedFile;
     let mut ui = linked_ui();
     let file = |name: &str, no_candidate| UnmatchedFile {
@@ -198,5 +198,5 @@ fn files_matching_no_game_are_counted_as_ignored() {
         no_candidate,
     };
     ui.save_file_unmatched = vec![file("a.nvmem", true), file("b.sav", false)];
-    assert_eq!(ui.save_files_ignored(), 1);
+    assert_eq!(ui.save_files_ignored(), 0);
 }

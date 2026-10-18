@@ -139,8 +139,19 @@ fn expected_record(
     managed: &Path,
     server: &str,
 ) -> anyhow::Result<SetupRecord> {
+    expected_record_with_root_check(installation, managed, server, |root| {
+        ensure_no_reparse_components(root).map_err(anyhow::Error::from)
+    })
+}
+
+fn expected_record_with_root_check(
+    installation: &Path,
+    managed: &Path,
+    server: &str,
+    check_root: impl FnOnce(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<SetupRecord> {
     inspect_installation(installation)?;
-    ensure_no_reparse_components(managed)?;
+    check_root(managed)?;
     anyhow::ensure!(
         managed.is_absolute() && managed.is_dir(),
         "managed ROM root must be an existing absolute directory"
@@ -216,7 +227,18 @@ fn probe_link_permission(installation: &Path, target: &Path) -> anyhow::Result<(
 /// layout. Individual links are not checked: a system whose link was removed
 /// or changed is simply no longer linked.
 pub fn verify_setup_link(installation: &Path, managed: &Path, server: &str) -> anyhow::Result<()> {
-    let expected = expected_record(installation, managed, server)?;
+    verify_setup_with_root_check(installation, managed, server, |root| {
+        ensure_no_reparse_components(root).map_err(anyhow::Error::from)
+    })
+}
+
+fn verify_setup_with_root_check(
+    installation: &Path,
+    managed: &Path,
+    server: &str,
+    check_root: impl FnOnce(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let expected = expected_record_with_root_check(installation, managed, server, check_root)?;
     let record = load_record(installation)?
         .context("run RetroBat setup before mounting this integration")?;
     anyhow::ensure!(
@@ -245,7 +267,18 @@ pub fn inspect_setup(
     managed: &Path,
     server: &str,
 ) -> anyhow::Result<SetupOutcome> {
-    verify_setup_link(installation, managed, server)?;
+    inspect_setup_with_root_check(installation, managed, server, |root| {
+        ensure_no_reparse_components(root).map_err(anyhow::Error::from)
+    })
+}
+
+fn inspect_setup_with_root_check(
+    installation: &Path,
+    managed: &Path,
+    server: &str,
+    check_root: impl FnOnce(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<SetupOutcome> {
+    verify_setup_with_root_check(installation, managed, server, check_root)?;
     let record = load_record(installation)?.context("missing RetroBat setup record")?;
     let mut outcome = SetupOutcome::from_record(record);
     outcome.linked.clear();
@@ -265,6 +298,18 @@ pub fn inspect_setup(
         }
     }
     Ok(outcome)
+}
+
+/// Inspect linked systems using the owning backend's managed-root validation.
+/// The check must reject foreign or redirected roots before setup identity is
+/// compared. Ordinary save/setup callers continue to reject all reparse points.
+pub fn linked_systems_with_root_check(
+    installation: &Path,
+    managed: &Path,
+    server: &str,
+    check_root: impl FnOnce(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<Vec<String>> {
+    Ok(inspect_setup_with_root_check(installation, managed, server, check_root)?.linked)
 }
 
 /// Systems whose `RomM` folder setup linked, for gamelist publication.

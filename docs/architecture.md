@@ -78,6 +78,16 @@ live RomM instance. `route_hit_count` counts scripted route matches;
 - Catalogue snapshots are scoped by normalized server and authenticated account.
   Tokens remain in memory; only paired secrets use Windows Credential Manager.
 - ROM content cache and save-sync state are separate persistence areas.
+- Save presentation uses current per-identity work emitted by the actor, not
+  historical transfer stages. A settled unchanged watcher hint publishes its
+  drained queue. Retained remote review versions remain attached to their save
+  identity and are excluded from queued-download counts. Persisted consent,
+  checking, current transfers and last successful scan time are separate facts.
+  See [UI remediation](ux-remediation.md) for the affected journeys and limits.
+- Metadata setup inspection validates the managed root through the CFAPI owner
+  before comparing its setup record. Ordinary save/setup paths still reject
+  reparse points. Artwork publication and favourites/history failures have
+  separate presentation state.
 - Mount ownership is recorded beside the root. Cleanup validates ownership and
   does not recursively clear user data.
 - Worker threads/tasks are owned by the app/controller lifecycle and are joined

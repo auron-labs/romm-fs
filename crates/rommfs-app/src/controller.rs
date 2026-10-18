@@ -7,7 +7,7 @@ use crate::save_sync_agent::{
 };
 use anyhow::Context as _;
 use rommfs_core::cache::clock::{Clock, SystemClock, DEFAULT_EVICTION_THRESHOLD_SECS};
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 use rommfs_core::cache::NoopHydratedRemover;
 use rommfs_core::cache::{CacheIndex, Evictor, HydratedRemover, LiveState};
 #[cfg(test)]
@@ -166,14 +166,23 @@ impl Controller {
     pub fn sink(&self) -> EventSink {
         self.sink.clone()
     }
-    pub fn shutdown(&self) {
-        self.send(Command::Shutdown);
-        if let Some(worker) = self
+    /// Request cleanup once and transfer the join to the caller. Desktop UI
+    /// callers join off-thread so the closing window remains responsive.
+    pub fn begin_shutdown(&self) -> Option<JoinHandle<()>> {
+        let worker = self
             .worker
             .lock()
             .expect("controller worker mutex poisoned")
-            .take()
-        {
+            .take();
+        if worker.is_some() {
+            self.sink.emit(AppEvent::ShutdownStarting);
+            self.send(Command::Shutdown);
+        }
+        worker
+    }
+
+    pub fn shutdown(&self) {
+        if let Some(worker) = self.begin_shutdown() {
             let _ = worker.join();
         }
     }
@@ -548,7 +557,7 @@ fn worker_loop_with_interval_from(
             Command::RestartMount { path } => worker.restart_mount(path),
             Command::RefreshCatalogue => worker.refresh_catalogue(),
             Command::RefreshMetadata => worker.queue_metadata(),
-            Command::RefreshSaveSync => worker.refresh_save_sync(),
+            Command::RefreshSaveSync => worker.check_save_sync(),
             Command::SelectSaveSyncInstallation { path } => {
                 worker.select_save_sync_installation(path)
             }

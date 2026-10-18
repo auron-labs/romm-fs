@@ -11,17 +11,7 @@ pub fn render(
     window: &mut Window,
     cx: &mut Context<RommfsWindow>,
 ) -> impl IntoElement {
-    // Page-private scroll state: window.rs's event pump still writes the
-    // shared `log_scroll` field on every new log line — that write is what
-    // pinned the old log to the top (ISSUES.md). This handle is private to
-    // the log region below, so the log stays scrollable and Follow works.
-    let log_scroll = window
-        .use_keyed_state("activity-log-scroll", cx, |_, _| ScrollHandle::new())
-        .read(cx)
-        .clone();
-    if view.activity_follow_log {
-        log_scroll.scroll_to_bottom();
-    }
+    let log_scroll = view.log_scroll.clone();
 
     v_flex()
         .w_full()
@@ -31,20 +21,38 @@ pub fn render(
             this.child(section)
         })
         .child(operations_section(view, cx))
-        .child(log_section(view, window, log_scroll, cx))
+        .child(
+            h_flex().child(
+                Button::new("toggle-technical-log")
+                    .label(if view.activity_log_open {
+                        "Hide technical log"
+                    } else {
+                        "Technical log"
+                    })
+                    .outline()
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.activity_log_open = !view.activity_log_open;
+                        cx.notify();
+                    })),
+            ),
+        )
+        .when(view.activity_log_open, |this| {
+            this.child(log_section(view, window, log_scroll, cx))
+        })
 }
 
 /// One consistent treatment for anything needing action (phase 2a rule 5):
 /// a headline naming what failed, a primary action, and the raw text behind
 /// "Details".
 fn attention_row(
-    id: &'static str,
+    id: impl Into<SharedString>,
     headline: impl Into<SharedString>,
     detail: Option<String>,
     action: Option<Button>,
     window: &mut Window,
     cx: &mut Context<RommfsWindow>,
 ) -> impl IntoElement {
+    let id = id.into();
     v_flex()
         .gap_1()
         .child(
@@ -190,8 +198,72 @@ fn attention_section(
             .into_any_element(),
         );
     }
+    for game in state.save_sync_games.iter().filter(|game| {
+        game.work == rommfs_core::events::SaveSyncWork::NeedsReview || !game.incoming_ids.is_empty()
+    }) {
+        let key = SharedString::from(format!("game:{}:{}", game.rom_id, game.file_id));
+        rows.push(
+            attention_row(
+                SharedString::from(format!("attention-save-{}-{}", game.rom_id, game.file_id)),
+                format!("{} — save needs review", game.rom_name),
+                game.issue.clone(),
+                Some(
+                    Button::new(SharedString::from(format!("review-{}", key)))
+                        .label("Review details")
+                        .outline()
+                        .small()
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            view.active_view = 1;
+                            view.save_review_attention_only = true;
+                            view.save_review_expanded = Some(key.clone());
+                            view.save_review_page = 0;
+                            view.save_review_search
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            cx.notify();
+                        })),
+                ),
+                window,
+                cx,
+            )
+            .into_any_element(),
+        );
+    }
+    if !state.memory_card_conflicts.is_empty() {
+        rows.push(
+            attention_row(
+                "attention-memory-cards",
+                format!(
+                    "{} have conflicting changes",
+                    plural(state.memory_card_conflicts.len(), "memory card")
+                ),
+                None,
+                Some(
+                    Button::new("review-memory-card-conflicts")
+                        .label("Review details")
+                        .outline()
+                        .small()
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.active_view = 1;
+                            view.save_review_attention_only = true;
+                            view.save_review_page = 0;
+                            view.save_review_search
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            cx.notify();
+                        })),
+                ),
+                window,
+                cx,
+            )
+            .into_any_element(),
+        );
+    }
     let save_sync_error = state.save_sync_attention();
-    if let Some(error) = save_sync_error {
+    if let Some(error) = save_sync_error.filter(|_| {
+        !state.save_sync_games.iter().any(|game| {
+            game.work == rommfs_core::events::SaveSyncWork::NeedsReview
+                || !game.incoming_ids.is_empty()
+        })
+    }) {
         rows.push(
             attention_row(
                 "attention-save-sync",
@@ -279,7 +351,7 @@ fn attention_section(
         rows.push(
             attention_row(
                 "attention-metadata",
-                "Frontend metadata refresh failed",
+                "Couldn't update artwork and game information",
                 Some(error.clone()),
                 Some(retry_button("retry-metadata", cx, |view, _| {
                     view.controller.send(Command::RefreshMetadata);
@@ -380,7 +452,7 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
                     .into_any_element(),
             };
             running.push(
-                op_row(cx.theme().accent, "Mounting games folder", Some(detail)).into_any_element(),
+                op_row(cx.theme().accent, "Preparing games…", Some(detail)).into_any_element(),
             );
         }
         MountState::Mounted => {
@@ -391,7 +463,7 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
             recent.push(
                 op_row(
                     StatusKind::Success.color(cx),
-                    "Games folder running",
+                    "Made games available",
                     detail,
                 )
                 .into_any_element(),
@@ -400,12 +472,18 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
         MountState::Failed | MountState::NotMounted => {}
     }
 
+    if state.mount_stopping {
+        running.push(
+            op_row(cx.theme().muted_foreground, "Stopping games folder…", None).into_any_element(),
+        );
+    }
+
     // Catalogue refresh
     if let Some((stage, completed, total, elapsed)) = &state.catalogue_progress {
         running.push(
             op_row(
                 cx.theme().accent,
-                "Refreshing library catalogue",
+                "Checking for library changes…",
                 Some(
                     operation_progress(
                         "catalogue-progress",
@@ -424,7 +502,7 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
         recent.push(
             op_row(
                 StatusKind::Muted.color(cx),
-                "Library catalogue refreshed",
+                "Checked for library changes",
                 Some(muted_xs(relative_time(at), cx).into_any_element()),
             )
             .into_any_element(),
@@ -455,52 +533,50 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
         .cloned()
         .collect();
 
-    // Save sync — derived summary plus live transfers.
-    if state.save_sync_enabled || !state.save_sync_transfers.is_empty() {
-        let (label, kind) = view.save_sync_status();
-        let queue_detail = state.save_sync_queue.as_ref().map(|queue| {
-            let mut parts = Vec::new();
-            if queue.pending_outbound > 0 {
-                parts.push(format!("{} outgoing", fmt_count(queue.pending_outbound)));
-            }
-            if queue.pending_incoming > 0 {
-                parts.push(format!("{} incoming", queue.pending_incoming));
-            }
-            if queue.attention_games > 0 {
-                parts.push(format!("{} need review", queue.attention_games));
-            }
-            if queue.network_paused {
-                parts.push("paused (offline)".to_string());
-            }
-            parts.join(" · ")
-        });
-        let detail = queue_detail.and_then(|text| {
-            if text.is_empty() {
-                None
+    // Stages share the revision identity; terminal stages live in recent history.
+    for transfer in state.save_sync_transfers.iter().rev() {
+        let name = state
+            .save_sync_games
+            .iter()
+            .find(|game| game.rom_id == transfer.rom_id)
+            .map(|game| game.rom_name.clone())
+            .unwrap_or_else(|| format!("Save for game {}", transfer.rom_id));
+        let label = match transfer.phase.as_str() {
+            "captured" => "Waiting to upload",
+            "uploading" => "Uploading to RomM…",
+            "verified" => "Uploaded to RomM",
+            "retry_wait" | "paused" => "Waiting for RomM",
+            _ => "Needs review",
+        };
+        let detail = Some(muted_xs(relative_time(transfer.updated_at), cx).into_any_element());
+        let row = op_row(
+            if transfer.phase == "verified" {
+                StatusKind::Success.color(cx)
             } else {
-                Some(muted_xs(text, cx).into_any_element())
-            }
-        });
-        recent.push(
-            op_row(kind.color(cx), format!("Save sync · {label}"), detail).into_any_element(),
-        );
-        for transfer in &state.save_sync_transfers {
-            let detail = transfer
-                .detail
-                .as_ref()
-                .map(|detail| muted_xs(detail.clone(), cx).into_any_element());
-            running.push(
-                op_row(
-                    cx.theme().accent,
-                    format!(
-                        "Save sync · game {} · rev {} · {}",
-                        transfer.rom_id, transfer.revision, transfer.phase
-                    ),
-                    detail,
-                )
-                .into_any_element(),
-            );
+                cx.theme().muted_foreground
+            },
+            format!("{name} — {label}"),
+            detail,
+        )
+        .into_any_element();
+        if transfer.phase == "verified" {
+            recent.push(row);
+        } else if matches!(
+            transfer.phase.as_str(),
+            "captured" | "uploading" | "retry_wait" | "paused"
+        ) {
+            running.push(row);
         }
+    }
+    if state.save_sync_checking {
+        running.push(
+            op_row(
+                cx.theme().muted_foreground,
+                "Checking saves for changes…",
+                None,
+            )
+            .into_any_element(),
+        );
     }
 
     // RetroBat setup
@@ -596,18 +672,25 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
                 block.into_any_element()
             }
         };
-        running
-            .push(op_row(cx.theme().accent, "Frontend metadata", Some(detail)).into_any_element());
+        running.push(
+            op_row(
+                cx.theme().accent,
+                "Artwork and game information",
+                Some(detail),
+            )
+            .into_any_element(),
+        );
     }
 
-    let idle = running.is_empty() && failed.is_empty() && recent.is_empty() && completed.is_empty();
+    let idle = running.is_empty();
     v_flex()
         .gap_2()
-        .child(section_heading("Operations"))
+        .child(section_heading("In progress"))
         .when(idle, |this| {
-            this.child(muted("Nothing happening right now", cx))
+            this.child(muted("No operations in progress", cx))
         })
         .children(running)
+        .child(section_heading("Recent activity"))
         .children(failed)
         .children(recent)
         .when(!completed.is_empty(), |this| {
@@ -630,7 +713,7 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
                     )
                     .child(
                         Button::new("clear-completed")
-                            .label("Clear")
+                            .label("Clear completed downloads")
                             .outline()
                             .small()
                             .on_click(cx.listener(|view, _, _, cx| {
@@ -743,6 +826,9 @@ fn log_section(
                                 .label("Follow")
                                 .on_change(cx.listener(|view, checked, _, cx| {
                                     view.activity_follow_log = *checked;
+                                    if *checked {
+                                        view.log_scroll.scroll_to_bottom();
+                                    }
                                     cx.notify();
                                 })),
                         )
@@ -981,7 +1067,11 @@ fn render_log_line(
                         Button::new(key)
                             .ghost()
                             .small()
-                            .label(if is_open { "Less" } else { "More" })
+                            .label(if is_open {
+                                "Hide full message"
+                            } else {
+                                "Show full message"
+                            })
                             .on_click(cx.listener(move |_, _, _, cx| {
                                 toggle.update(cx, |open, _| open.set(!open.get()));
                                 cx.notify();

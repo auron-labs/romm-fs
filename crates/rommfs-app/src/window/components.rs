@@ -37,7 +37,7 @@ pub(super) fn status_marker(
     h_flex()
         .gap_2()
         .child(status_dot(kind.color(cx)))
-        .child(div().whitespace_nowrap().child(text.into()))
+        .child(div().min_w_0().child(text.into()))
 }
 
 pub(super) fn muted(text: impl Into<String>, cx: &App) -> impl IntoElement {
@@ -106,19 +106,34 @@ pub(super) fn details_disclosure(
     window: &mut Window,
     cx: &mut Context<RommfsWindow>,
 ) -> impl IntoElement {
+    text_disclosure(id, "Technical details", detail, window, cx)
+}
+
+pub(super) fn text_disclosure(
+    id: impl Into<SharedString>,
+    label: &'static str,
+    detail: String,
+    window: &mut Window,
+    cx: &mut Context<RommfsWindow>,
+) -> impl IntoElement {
     let id = id.into();
     let open = window.use_keyed_state(SharedString::from(format!("{id}-open")), cx, |_, _| {
         std::cell::Cell::new(false)
     });
     let is_open = open.read(cx).get();
     let toggle = open.clone();
+    let copied = detail.clone();
     v_flex()
         .gap_1()
         .child(
             disclosure_toggle(
-                id,
+                id.clone(),
                 is_open,
-                if is_open { "Hide details" } else { "Details" },
+                if is_open {
+                    format!("Hide {}", label.to_lowercase())
+                } else {
+                    label.to_owned()
+                },
             )
             .on_click(cx.listener(move |_, _, _, cx| {
                 toggle.update(cx, |open, _| open.set(!open.get()));
@@ -126,7 +141,26 @@ pub(super) fn details_disclosure(
             })),
         )
         .when(is_open, |this| {
+            use std::hash::{Hash, Hasher};
+            let mut content = std::collections::hash_map::DefaultHasher::new();
+            detail.hash(&mut content);
+            let text = window.use_keyed_state(
+                SharedString::from(format!("{id}-text-{}", content.finish())),
+                cx,
+                |window, cx| {
+                    gpui_kit::component::input::TextareaState::new(window, cx).default_value(detail)
+                },
+            );
             this.child(
+                Button::new(SharedString::from(format!("{id}-copy")))
+                    .label("Copy details")
+                    .ghost()
+                    .small()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))
+                    })),
+            )
+            .child(
                 div()
                     .w_full()
                     .p_2()
@@ -136,7 +170,12 @@ pub(super) fn details_disclosure(
                     .rounded(cx.theme().radius)
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_xs()
-                    .child(detail),
+                    .child(
+                        gpui_kit::component::input::Textarea::new(&text)
+                            .readonly(true)
+                            .w_full()
+                            .h_32(),
+                    ),
             )
         })
 }
@@ -269,11 +308,14 @@ pub(super) fn status_row(
     cx: &App,
 ) -> impl IntoElement {
     h_flex()
+        .flex_wrap()
         .justify_between()
         .gap_3()
         .child(section_heading(label))
         .child(
             h_flex()
+                .min_w_0()
+                .flex_wrap()
                 .gap_3()
                 .items_center()
                 .child(status_marker(kind, status, cx))

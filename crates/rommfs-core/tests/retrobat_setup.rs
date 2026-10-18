@@ -439,3 +439,26 @@ fn publication_excludes_missing_replaced_and_redirected_links() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn metadata_uses_backend_root_check_and_still_checks_setup_identity() {
+    use rommfs_core::retrobat::linked_systems_with_root_check;
+    let dir = tempfile::tempdir().unwrap();
+    let (install, managed) = installation(dir.path());
+    setup_roms_link(&install, &managed, "s").unwrap();
+    let called = std::cell::Cell::new(false);
+    let systems = linked_systems_with_root_check(&install, &managed, "s", |path| {
+        called.set(true);
+        assert_eq!(path, managed);
+        Ok(())
+    })
+    .unwrap();
+    assert!(called.get());
+    assert!(systems.iter().any(|system| system == "gb"));
+    assert!(
+        linked_systems_with_root_check(&install, &managed, "s", |_| anyhow::bail!("foreign root"))
+            .is_err()
+    );
+    assert!(linked_systems_with_root_check(&install, &managed, "other", |_| Ok(())).is_err());
+}

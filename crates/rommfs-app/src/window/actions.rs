@@ -33,10 +33,12 @@ impl RommfsWindow {
         cx.notify();
         self.controller.send(Command::StartMount { path });
     }
-    pub(super) fn on_stop_mount(&mut self, _cx: &mut Context<Self>) {
-        if self.state.mount != MountState::Mounted {
+    pub(super) fn on_stop_mount(&mut self, cx: &mut Context<Self>) {
+        if self.state.mount != MountState::Mounted || self.state.mount_stopping {
             return;
         }
+        self.state.mount_stopping = true;
+        cx.notify();
         self.controller.send(Command::StopMount);
     }
     /// The RetroBat installation the Settings tab currently points at: the
@@ -225,27 +227,6 @@ impl RommfsWindow {
             .collect::<Vec<_>>()
             .join("\n");
         cx.write_to_clipboard(ClipboardItem::new_string(body));
-    }
-    /// A button that just switches destination — for "go fix this" actions on
-    /// summary cards.
-    pub(super) fn nav_button(
-        &mut self,
-        id: &'static str,
-        label: &'static str,
-        view: usize,
-        primary: bool,
-        cx: &mut Context<Self>,
-    ) -> Button {
-        let button = Button::new(id).label(label);
-        let button = if primary {
-            button.primary()
-        } else {
-            button.outline()
-        };
-        button.on_click(cx.listener(move |this, _, _, cx| {
-            this.active_view = view;
-            cx.notify();
-        }))
     }
     /// A "go fix this" button that opens Settings on a specific tab.
     pub(super) fn settings_nav_button(

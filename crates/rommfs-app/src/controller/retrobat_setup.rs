@@ -344,6 +344,7 @@ impl Worker {
                 changed: Err("metadata publisher stopped".into()),
                 problems: Vec::new(),
                 hidden: 0,
+                play_problem: None,
             },
         };
         self.metadata_publish = None;
@@ -354,6 +355,12 @@ impl Worker {
     }
 
     fn finish_metadata_publication(&mut self, publication: MetadataPublication) {
+        self.play_data_problem = publication.play_problem.clone();
+        self.sink.emit(AppEvent::PlayDataUpdated {
+            available: self.play_data_available,
+            enabled: self.play_data_enabled,
+            problem: self.play_data_problem.clone(),
+        });
         for (system, reason) in &publication.problems {
             self.log(Level::Warn, "metadata", format!("{system}: {reason}"));
         }
@@ -562,6 +569,7 @@ pub(super) struct MetadataPublication {
     pub(super) problems: Vec<(String, String)>,
     /// How many entries RomMFS hid because the user already has a copy.
     pub(super) hidden: usize,
+    pub(super) play_problem: Option<String>,
 }
 
 fn emit_metadata_status(
@@ -617,6 +625,7 @@ fn publish_metadata(
     hide_enabled: bool,
 ) -> MetadataPublication {
     let mut problems = Vec::new();
+    let mut play_problem = None;
     for warning in artwork.warnings() {
         sink.emit(AppEvent::log(Level::Warn, "artwork", warning.clone()));
     }
@@ -634,9 +643,13 @@ fn publish_metadata(
                 }
                 Err(error) => {
                     play_enabled = false;
-                    problems.push((
-                        "play data".to_string(),
-                        format!("favourites and play history were not read: {error:#}"),
+                    play_problem = Some(format!(
+                        "favourites and play history were not read: {error:#}"
+                    ));
+                    sink.emit(AppEvent::log(
+                        Level::Warn,
+                        "play-data",
+                        play_problem.clone().unwrap_or_default(),
                     ));
                 }
             }
@@ -647,7 +660,12 @@ fn publish_metadata(
         None => Err("play data is unavailable".to_string()),
     };
     let result = (|| -> anyhow::Result<(usize, usize)> {
-        let linked = rommfs_core::retrobat::linked_systems(&installation, &root, &server)?;
+        let linked = rommfs_core::retrobat::linked_systems_with_root_check(
+            &installation,
+            &root,
+            &server,
+            |root| rommfs_cfapi::check_mount_root(root, &server).map(|_| ()),
+        )?;
         let frontend = rommfs_core::retrobat::read_gamelists(&installation, &linked);
         let (index, legacy) = rommfs_cfapi::read_frontend_metadata(&root, &server)?;
         // The user's own files, read-only, for "hide RomM copies". A system
@@ -729,6 +747,7 @@ fn publish_metadata(
             .map_err(|error| format!("{error:#}"))
             .map(|(changed, _)| changed),
         problems,
+        play_problem,
         hidden,
     }
 }

@@ -262,7 +262,16 @@ impl SaveFileRules {
                 if shared_path(&display) {
                     plan.unmatched.push(UnmatchedFile {
                         path: relative.to_path_buf(),
-                        reason: "shared saves/cards are not supported".into(),
+                        reason: if display
+                            .replace('\\', "/")
+                            .split('/')
+                            .any(|part| part.contains(".rommfs-") || part.starts_with(".rommfs"))
+                        {
+                            "RomM-FS auxiliary or recovery file — not synced".into()
+                        } else {
+                            "Shared memory-card locations are not supported by save-file sync"
+                                .into()
+                        },
                         mappable: false,
                         no_candidate: false,
                     });

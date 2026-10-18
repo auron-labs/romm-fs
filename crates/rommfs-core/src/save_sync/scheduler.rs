@@ -375,6 +375,11 @@ impl SaveSyncScheduler {
         );
     }
 
+    /// Whether this save has an unsettled local observation.
+    pub fn has_pending(&self, key: &RomKey) -> bool {
+        self.pending.contains_key(key)
+    }
+
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }

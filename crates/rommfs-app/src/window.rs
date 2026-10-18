@@ -29,9 +29,9 @@ use gpui_kit::component::{
     StyledExt as _, Theme, ThemeMode,
 };
 use gpui_kit::{
-    actions, div, point, prelude::*, px, size, AnyElement, App, Bounds, ClipboardItem, Context,
-    Entity, Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollHandle,
-    SharedString, Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
+    actions, div, prelude::*, px, size, AnyElement, App, Bounds, ClipboardItem, Context, Entity,
+    Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollHandle, SharedString,
+    Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use rommfs_core::connection_settings::IntegrationMode;
 use rommfs_core::events::{
@@ -133,6 +133,8 @@ struct RommfsWindow {
     /// Whether files that match no game in the library are listed.
     #[allow(dead_code)] // read by pages/save_review.rs
     save_review_show_ignored: bool,
+    save_review_attention_only: bool,
+    save_review_skipped_page: usize,
     // --- Activity page state (window/pages/activity.rs) ---
     /// Minimum log severity shown: 0 = everything, 1 = warnings+errors,
     /// 2 = errors only.
@@ -141,6 +143,7 @@ struct RommfsWindow {
     /// Follow the newest log entry; scrolling up unsets it.
     #[allow(dead_code)] // read by pages/activity.rs
     activity_follow_log: bool,
+    activity_log_open: bool,
     /// Substring filter for the technical log (UI-PLAN §6 search).
     #[allow(dead_code)] // read by pages/activity.rs
     activity_search: Entity<InputState>,
@@ -375,8 +378,11 @@ impl RommfsWindow {
             save_review_page: 0,
             save_review_expanded: None,
             save_review_show_ignored: false,
+            save_review_attention_only: false,
+            save_review_skipped_page: 0,
             activity_min_level: 0,
             activity_follow_log: true,
+            activity_log_open: false,
             activity_search,
             log_scroll: ScrollHandle::new(),
             tray_hides,
@@ -479,9 +485,13 @@ impl RommfsWindow {
             self.sync_install_select(window, cx);
             self.sync_settings_install_select(window, cx);
         }
-        if new_logs {
+        if new_logs && self.activity_follow_log {
             let max = self.log_scroll.max_offset();
-            self.log_scroll.set_offset(point(px(0.), max.y));
+            if self.log_scroll.offset().y <= -max.y + px(2.) {
+                self.log_scroll.scroll_to_bottom();
+            } else {
+                self.activity_follow_log = false;
+            }
         }
         if changed {
             cx.notify();
@@ -582,10 +592,13 @@ impl RommfsWindow {
     /// The folder marker derives from `UiState::folder_summary` — real mount
     /// events plus persisted config, never the connection state.
     fn mount_status(&self, _cx: &App) -> (SharedString, StatusKind) {
+        if self.state.mount_stopping {
+            return ("Stopping…".into(), StatusKind::Muted);
+        }
         let summary = self.state.folder_summary();
         let kind = match summary {
             FolderSummary::SetupNeeded | FolderSummary::Stopped => StatusKind::Muted,
-            FolderSummary::Starting => StatusKind::Warning,
+            FolderSummary::Starting => StatusKind::Muted,
             FolderSummary::Ready => StatusKind::Success,
             FolderSummary::Failed => StatusKind::Danger,
         };
@@ -594,23 +607,27 @@ impl RommfsWindow {
 
     /// The single derived save-sync status (UI-PLAN §5): zero linked files
     /// is "No files ready to sync", never "Up to date".
-    fn save_sync_status(&self) -> (&'static str, StatusKind) {
+    fn save_sync_status(&self) -> (String, StatusKind) {
         let summary = self.state.save_sync_summary();
         let kind = match summary {
-            SaveSyncSummary::AuthRequired
-            | SaveSyncSummary::Offline
-            | SaveSyncSummary::NeedsAttention
-            | SaveSyncSummary::Paused => StatusKind::Danger,
-            SaveSyncSummary::NeedsSetup
-            | SaveSyncSummary::Checking
-            | SaveSyncSummary::Reconciling
-            | SaveSyncSummary::Syncing => StatusKind::Warning,
+            SaveSyncSummary::AuthRequired | SaveSyncSummary::Offline => StatusKind::Danger,
+            SaveSyncSummary::NeedsAttention => {
+                if self.state.save_sync_review_count() > 0 {
+                    StatusKind::Warning
+                } else {
+                    StatusKind::Danger
+                }
+            }
+            SaveSyncSummary::NeedsSetup | SaveSyncSummary::Paused => StatusKind::Warning,
+            SaveSyncSummary::Checking | SaveSyncSummary::Reconciling | SaveSyncSummary::Syncing => {
+                StatusKind::Muted
+            }
             // Nothing to sync yet is not a warning — it is simply empty (WS6.6).
             SaveSyncSummary::NoLinkedFiles => StatusKind::Muted,
             SaveSyncSummary::Off => StatusKind::Muted,
             SaveSyncSummary::UpToDate => StatusKind::Success,
         };
-        (summary.label(), kind)
+        (self.state.save_sync_summary_text(), kind)
     }
 
     /// The ~190px left navigation: four destinations, and the server host
@@ -627,7 +644,7 @@ impl RommfsWindow {
             .unwrap_or_else(|| self.url_input.read(cx).value().to_string());
         let active = self.active_view;
         let mut menu = SidebarMenu::new();
-        for (index, label) in ["Overview", "Save sync", "Activity", "Settings"]
+        for (index, label) in ["Overview", "Saves", "Activity", "Settings"]
             .into_iter()
             .enumerate()
         {
@@ -675,6 +692,12 @@ impl Render for RommfsWindow {
     /// The four-destination shell (UI-PLAN §2): persistent left nav, one
     /// changing detail region, content kept to a readable ~960px measure.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.state.closing {
+            return v_flex().size_full().p_6().gap_3().bg(cx.theme().background).text_color(cx.theme().foreground)
+                .child(page_heading("Closing RomM-FS…"))
+                .child(muted("Stopping the games folder and finishing cleanup. Keep this window open until RomM-FS exits.", cx))
+                .child(Progress::new("shutdown-progress").loading(true)).into_any_element();
+        }
         // Each destination tracks its own scroll handle: with one shared
         // call-site scroll state, every page inherited the previous page's
         // offset and Settings appeared to jump between screens.
@@ -745,6 +768,7 @@ impl Render for RommfsWindow {
             .text_sm()
             .child(self.render_sidebar(cx))
             .child(content)
+            .into_any_element()
     }
 }
 
@@ -823,10 +847,14 @@ pub fn run() {
             let quit_session = session.clone();
             let instance = Rc::new(instance);
             let quit_instance = instance.clone();
-            cx.on_app_quit(move |_| {
+            cx.on_app_quit(move |cx| {
                 let _instance = &quit_instance;
-                quit_session.borrow().shutdown();
-                std::future::ready(())
+                let worker = quit_session.borrow().controller().begin_shutdown();
+                cx.background_spawn(async move {
+                    if let Some(worker) = worker {
+                        let _ = worker.join();
+                    }
+                })
             })
             .detach();
             cx.on_window_closed(|cx, _| {
@@ -910,8 +938,19 @@ pub fn run() {
                                                 crate::desktop::tray::show(hwnd)
                                             }
                                             crate::desktop::tray::Action::Quit => {
-                                                cx.update(|cx| cx.quit());
-                                                return;
+                                                let worker = tray_session
+                                                    .borrow()
+                                                    .controller()
+                                                    .begin_shutdown();
+                                                if let Some(worker) = worker {
+                                                    crate::desktop::tray::show(hwnd);
+                                                    cx.background_spawn(async move {
+                                                        let _ = worker.join();
+                                                    })
+                                                    .await;
+                                                    cx.update(|cx| cx.quit());
+                                                    return;
+                                                }
                                             }
                                         }
                                     }

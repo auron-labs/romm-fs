@@ -45,7 +45,25 @@ fn queue(
         authentication_required: false,
         actor_failed: false,
         failure: None,
-        games: Vec::new(),
+        games: (0..mapped)
+            .map(|ix| rommfs_core::events::SaveSyncGameStatus {
+                work: if ix < reconciled {
+                    rommfs_core::events::SaveSyncWork::UpToDate
+                } else {
+                    rommfs_core::events::SaveSyncWork::Checking
+                },
+                local_path: format!("C:/Saves/save-{ix}.sav"),
+                rom_id: ix as i64,
+                file_id: ix as i64,
+                rom_name: format!("Game {ix}"),
+                local_hash: Some("verified".into()),
+                remote_hash: Some("verified".into()),
+                remote_id: Some(ix.to_string()),
+                incoming_ids: Vec::new(),
+                issue: None,
+                installed_incoming: false,
+            })
+            .collect(),
         incoming: Vec::new(),
     }
 }
@@ -58,6 +76,7 @@ fn enabled_ui() -> UiState {
     ui.apply_event(&AppEvent::SaveSyncSessionChanged { session_id: 1 });
     ui.save_sync_enabled = true;
     ui.save_sync_available = true;
+    ui.save_sync_checking = false;
     ui
 }
 

@@ -242,6 +242,19 @@ fn tracked_local_removal_and_missing_remote_never_delete_or_resurrect_local_save
     })
     .is_some());
     agent.stop();
+    let status = events
+        .try_iter()
+        .filter_map(|event| match event {
+            AppEvent::SaveSyncQueueUpdated(status) => Some(status),
+            _ => None,
+        })
+        .last()
+        .expect("removal has a current queue result");
+    assert_eq!(status.attention_games, 1);
+    assert_eq!(
+        status.games[0].work,
+        rommfs_core::events::SaveSyncWork::NeedsReview
+    );
     assert!(!removed_case.mapping.target_path.exists());
     let journal = SaveSyncJournal::open(
         &removed_case.database,

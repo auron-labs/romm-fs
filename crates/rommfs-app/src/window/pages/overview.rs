@@ -57,7 +57,7 @@ impl RommfsWindow {
             .child(
                 v_flex()
                     .gap_2()
-                    .child(status_row("Save sync", sync_kind, sync_text, None, cx))
+                    .child(status_row("Saves", sync_kind, sync_text, None, cx))
                     .when_some(
                         self.state
                             .save_sync_attention()
@@ -77,16 +77,42 @@ impl RommfsWindow {
                             ))
                         },
                     )
-                    .child(self.nav_button("overview-saves", "Review saves", 1, false, cx)),
+                    .child(
+                        h_flex().child(
+                            Button::new("overview-saves")
+                                .label(if self.state.save_sync_review_count() > 0 {
+                                    "Review saves"
+                                } else {
+                                    "View saves"
+                                })
+                                .outline()
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.active_view = 1;
+                                    view.save_review_attention_only =
+                                        view.state.save_sync_review_count() > 0;
+                                    if view.save_review_attention_only {
+                                        view.save_review_search.update(cx, |input, cx| {
+                                            input.set_value("", window, cx)
+                                        });
+                                        view.save_review_page = 0;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
             )
             .child(Separator::horizontal())
-            .child(self.render_overview_retrobat(cx))
+            .child(self.render_overview_retrobat(window, cx))
     }
 
     /// §3 RetroBat summary: installed directory, running/error state, and
     /// the manage action (the install buttons live in Settings). An earlier
     /// build's setup record gets an inline Update action that runs step 2.
-    fn render_overview_retrobat(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_overview_retrobat(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let migration = self.state.retrobat_setup_migration
             && !self.state.retrobat_setup_ok
             && !self.state.retrobat_setup_running;
@@ -95,7 +121,7 @@ impl RommfsWindow {
         } else if self.state.retrobat_setup_error.is_some() {
             ("Setup failed", StatusKind::Danger)
         } else if self.state.retrobat_setup_ok {
-            ("Ready", StatusKind::Success)
+            ("Configured", StatusKind::Success)
         } else if migration {
             ("Needs a quick update", StatusKind::Warning)
         } else if self.state.retrobat_root.is_some() {
@@ -137,19 +163,47 @@ impl RommfsWindow {
                         cx,
                     )),
             )
+            .when_some(self.state.play_data_problem.clone(), |this, problem| {
+                this.child(status_row(
+                    "Favourites and play history",
+                    StatusKind::Warning,
+                    if problem.contains("403") {
+                        "RomM denied access to favourites and play history."
+                    } else {
+                        "Couldn't update favourites and play history"
+                    },
+                    None,
+                    cx,
+                ))
+                .child(details_disclosure("play-data-problem", problem, window, cx))
+                .child(self.settings_nav_button(
+                    "play-data-connection",
+                    "Connection settings",
+                    0,
+                    false,
+                    cx,
+                ))
+            })
             .when(self.state.retrobat_setup_ok, |this| {
                 this.child(Separator::horizontal())
-                    .child(self.render_overview_metadata(cx))
+                    .child(self.render_overview_metadata(window, cx))
             })
     }
 
     /// WS4.2: the frontend metadata stage with live counts while it runs, or
     /// "up to date · N ago", with a Retry after a failure.
-    fn render_overview_metadata(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_overview_metadata(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let error = self.state.frontend_metadata_error.clone();
         let pending = self.state.frontend_metadata_pending;
         let (kind, text) = if error.is_some() {
-            (StatusKind::Danger, "Needs attention".to_string())
+            (
+                StatusKind::Danger,
+                "Couldn't update artwork and game information".to_string(),
+            )
         } else if pending {
             (
                 StatusKind::Warning,
@@ -168,7 +222,8 @@ impl RommfsWindow {
         };
         let retry = error.as_ref().map(|_| {
             Button::new("overview-metadata-retry")
-                .label("Retry")
+                .label("Retry update")
+                .accessibility_label("Retry artwork and game information update")
                 .primary()
                 .small()
                 .on_click(cx.listener(|view, _, _, cx| {
@@ -178,7 +233,7 @@ impl RommfsWindow {
         });
         v_flex()
             .gap_2()
-            .child(status_row("Artwork & gamelists", kind, text, retry, cx))
+            .child(status_row("Artwork and game information", kind, text, retry, cx))
             .when(pending, |this| {
                 this.child(match self.state.frontend_metadata_progress {
                     Some((completed, total)) => v_flex()
@@ -207,6 +262,6 @@ impl RommfsWindow {
                         .into_any_element(),
                 })
             })
-            .when_some(error, |this, error| this.child(error_line(error, cx)))
+            .when_some(error, |this, error| this.child(muted(if self.state.mount == MountState::Mounted && !self.state.mount_stopping { "Your games are available, but artwork and game information may be missing or out of date." } else { "Artwork and game information may be missing or out of date." }, cx)).child(details_disclosure("overview-metadata-error", error, window, cx)))
     }
 }

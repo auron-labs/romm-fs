@@ -49,10 +49,14 @@ impl ApplicationSession {
             ConnectionState::Connecting => "connecting",
             _ => "not connected",
         };
-        let mount = match self.state.mount {
-            MountState::Mounted => "mounted",
-            MountState::Mounting => "mounting",
-            _ => "not mounted",
+        let mount = if self.state.mount_stopping {
+            "stopping"
+        } else {
+            match self.state.mount {
+                MountState::Mounted => "available",
+                MountState::Mounting => "preparing games",
+                _ => "stopped",
+            }
         };
         format!(
             "RomMFS · {connection} · {mount} · saves {}",
@@ -62,8 +66,5 @@ impl ApplicationSession {
                 "off"
             }
         )
-    }
-    pub fn shutdown(&self) {
-        self.controller.shutdown();
     }
 }

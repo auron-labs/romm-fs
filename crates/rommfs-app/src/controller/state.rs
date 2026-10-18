@@ -40,8 +40,8 @@ impl FolderSummary {
         match self {
             Self::SetupNeeded => "No games folder chosen yet",
             Self::Stopped => "Games folder stopped",
-            Self::Starting => "Starting games folder…",
-            Self::Ready => "Games folder ready",
+            Self::Starting => "Preparing games…",
+            Self::Ready => "Available",
             Self::Failed => "Couldn't start the games folder",
         }
     }
@@ -147,15 +147,15 @@ impl SaveSyncSummary {
         match self {
             Self::AuthRequired => "Sign-in required",
             Self::Offline => "RomM unreachable",
-            Self::Off => "Save sync off",
+            Self::Off => "Automatic save sync is off",
             Self::NeedsSetup => "Save sync needs setup",
-            Self::Checking => "Checking saves…",
+            Self::Checking => "Checking for changes…",
             Self::NoLinkedFiles => "Nothing to sync yet",
-            Self::Reconciling => "Checking saves…",
+            Self::Reconciling => "Checking for changes…",
             Self::Syncing => "Syncing saves…",
             Self::NeedsAttention => "Save sync needs attention",
             Self::Paused => "Save sync paused",
-            Self::UpToDate => "Linked saves are up to date",
+            Self::UpToDate => "Tracked saves are up to date",
         }
     }
 }
@@ -175,6 +175,7 @@ pub struct DownloadView {
 pub struct SaveSyncTransferView {
     pub rom_id: i64,
     pub revision: String,
+    pub updated_at: u64,
     pub phase: String,
     pub detail: Option<String>,
 }
@@ -183,8 +184,16 @@ pub struct SaveSyncTransferView {
 /// dropped first (the log carries the durable record anyway).
 const MAX_DOWNLOAD_ROWS: usize = 128;
 
+#[derive(PartialEq, Eq)]
+struct SaveScanScope {
+    server: Option<String>,
+    account: Option<i64>,
+    root: Option<String>,
+}
+
 /// Everything the window draws — derived ONLY from real worker events.
 pub struct UiState {
+    pub closing: bool,
     pub auxiliary_running: bool,
     pub start_at_login: bool,
     pub startup_error: Option<String>,
@@ -236,6 +245,11 @@ pub struct UiState {
     pub conn: ConnectionState,
     pub conn_error: Option<String>,
     pub mount: MountState,
+    pub mount_stopping: bool,
+    pub save_sync_checking: bool,
+    pub save_scan_at: Option<u64>,
+    save_scan_scope: Option<SaveScanScope>,
+    pub folder_open_error: Option<String>,
     pub mount_path: Option<String>,
     pub mount_error: Option<String>,
     /// Classified foreign entries blocking a mount/setup, for remediation UI.
@@ -269,6 +283,7 @@ pub struct UiState {
     pub save_sync_available: bool,
     pub save_sync_problem: Option<String>,
     pub save_sync_enabled: bool,
+    requested_save_sync_consent: Option<(u64, bool)>,
     pub save_sync_debounce_secs: u32,
     pub save_sync_games: Vec<SaveSyncGameStatus>,
     pub save_sync_reconciled_games: usize,
@@ -294,6 +309,7 @@ pub struct UiState {
 impl UiState {
     pub fn new(log_cap: usize) -> Self {
         Self {
+            closing: false,
             start_at_login: false,
             auxiliary_running: false,
             auxiliary_detail: None,
@@ -332,6 +348,11 @@ impl UiState {
             conn: ConnectionState::Idle,
             conn_error: None,
             mount: MountState::NotMounted,
+            mount_stopping: false,
+            save_sync_checking: false,
+            save_scan_at: None,
+            save_scan_scope: None,
+            folder_open_error: None,
             mount_path: None,
             mount_error: None,
             foreign_root: None,
@@ -360,6 +381,7 @@ impl UiState {
             save_sync_available: false,
             save_sync_problem: None,
             save_sync_enabled: false,
+            requested_save_sync_consent: None,
             save_sync_debounce_secs: rommfs_core::save_sync::DEFAULT_DEBOUNCE_SECS,
             save_sync_games: Vec::new(),
             save_sync_reconciled_games: 0,
@@ -384,6 +406,23 @@ impl UiState {
     /// Apply one worker event. This is THE transition table the UI uses.
     pub fn apply_event(&mut self, event: &AppEvent) {
         match event {
+            AppEvent::ShutdownStarting => self.closing = true,
+            AppEvent::SaveSyncCheckStarted { session_id } => {
+                if *session_id > self.save_sync_session_id {
+                    self.save_sync_session_id = *session_id;
+                    self.save_sync_checking = true;
+                    self.save_sync_transfers
+                        .retain(|transfer| transfer.phase == "verified");
+                }
+            }
+            AppEvent::SaveSyncScanFinished {
+                session_id,
+                completed_at,
+            } => {
+                if *session_id == self.save_sync_session_id {
+                    self.save_scan_at = Some(*completed_at);
+                }
+            }
             AppEvent::ForeignRootEntries {
                 root,
                 entries,
@@ -590,6 +629,12 @@ impl UiState {
                 }
             }
             AppEvent::SignedOut => {
+                self.save_sync_enabled = false;
+                self.requested_save_sync_consent = None;
+                self.save_sync_checking = false;
+                self.save_scan_at = None;
+                self.save_scan_scope = None;
+                self.mount_stopping = false;
                 self.conn = ConnectionState::Idle;
                 self.conn_error = None;
                 self.catalogue = None;
@@ -626,6 +671,9 @@ impl UiState {
                 }
             }
             AppEvent::Connecting => {
+                self.save_scan_at = None;
+                self.save_scan_scope = None;
+                self.folder_open_error = None;
                 self.conn = ConnectionState::Connecting;
                 self.conn_error = None;
                 // A new connection attempt supersedes any prior session's
@@ -653,6 +701,7 @@ impl UiState {
                 self.save_sync_export_errors.clear();
                 self.save_sync_export_feedback.clear();
                 self.save_sync_enabled = false;
+                self.requested_save_sync_consent = None;
                 self.save_sync_available = false;
                 self.save_sync_account_id = None;
                 self.save_sync_server_id = None;
@@ -750,6 +799,7 @@ impl UiState {
                 self.foreign_removal = None;
             }
             AppEvent::MountStarted { path } => {
+                self.mount_stopping = false;
                 self.mount = MountState::Mounted;
                 self.catalogue_pending_remount = false;
                 self.mount_progress = None;
@@ -760,8 +810,9 @@ impl UiState {
                 self.mount = MountState::Failed;
                 self.mount_error = Some(reason.clone());
             }
-            AppEvent::MountStopping => {}
+            AppEvent::MountStopping => self.mount_stopping = true,
             AppEvent::MountStopped => {
+                self.mount_stopping = false;
                 self.mount = MountState::NotMounted;
                 // In-flight transfers died with the mount; don't leave rows
                 // looking like they are still downloading.
@@ -794,6 +845,28 @@ impl UiState {
                 if *session_id != self.save_sync_session_id {
                     return;
                 }
+                self.save_sync_checking = false;
+                let scan_scope = SaveScanScope {
+                    server: server_id.clone(),
+                    account: *account_id,
+                    root: effective_saves_root.clone(),
+                };
+                if self.save_scan_scope.as_ref() != Some(&scan_scope) {
+                    self.save_scan_at = None;
+                    self.save_scan_scope = Some(scan_scope);
+                }
+                let scan_at = existing_saves
+                    .as_ref()
+                    .filter(|preview| {
+                        matches!(
+                            preview.status,
+                            rommfs_core::save_sync::ExistingSaveScanStatus::Complete
+                        )
+                    })
+                    .map(|_| rommfs_core::cache::now_unix_secs());
+                if scan_at.is_some() {
+                    self.save_scan_at = scan_at;
+                }
                 self.save_sync_candidates = candidates.clone();
                 self.save_sync_server_id = server_id.clone();
                 self.save_sync_skipped = *skipped;
@@ -811,7 +884,13 @@ impl UiState {
                     .as_deref()
                     .map(|raw| crate::problem::UserProblem::from_text("Save sync", raw))
                     .and_then(|problem| problem.cause);
-                self.save_sync_enabled = *enabled;
+                if self
+                    .requested_save_sync_consent
+                    .is_none_or(|(requested_in, _)| *session_id > requested_in)
+                {
+                    self.save_sync_enabled = *enabled;
+                    self.requested_save_sync_consent = None;
+                }
                 self.save_sync_debounce_secs = *debounce_secs;
             }
             AppEvent::SaveSyncReconciliation {
@@ -848,9 +927,12 @@ impl UiState {
                 if *session_id != self.save_sync_session_id {
                     return;
                 }
+                self.save_sync_transfers
+                    .retain(|transfer| transfer.revision != *revision);
                 self.save_sync_transfers.push(SaveSyncTransferView {
                     rom_id: *rom_id,
                     revision: revision.clone(),
+                    updated_at: rommfs_core::cache::now_unix_secs(),
                     phase: phase.clone(),
                     detail: detail.clone(),
                 });
@@ -863,7 +945,7 @@ impl UiState {
                     self.save_file_games.clear();
                     self.save_file_unmatched.clear();
                     self.save_sync_session_id = *session_id;
-                    self.save_sync_enabled = false;
+                    self.save_sync_checking = true;
                     self.save_sync_available = false;
                     self.save_sync_account_id = None;
                     self.save_sync_server_id = None;
@@ -1072,12 +1154,11 @@ impl UiState {
         }
     }
 
-    /// Save files that match no game in the library (stock emulator data and
-    /// the like). They are never synced; the review page collapses them.
+    /// Structural exclusions are skipped; eligible unlinked saves stay actionable.
     pub fn save_files_ignored(&self) -> usize {
         self.save_file_unmatched
             .iter()
-            .filter(|file| file.no_candidate)
+            .filter(|file| !file.mappable)
             .count()
     }
 
@@ -1085,12 +1166,13 @@ impl UiState {
     /// silent until the user enables it: a missing folder or unverified
     /// account is a setup hint then, not something needing attention.
     pub fn save_sync_attention(&self) -> Option<String> {
-        if !self.save_sync_enabled {
-            return None;
-        }
         self.save_sync_failure
             .clone()
-            .or_else(|| self.save_sync_problem.clone())
+            .or_else(|| {
+                self.save_sync_enabled
+                    .then(|| self.save_sync_problem.clone())
+                    .flatten()
+            })
             .or_else(|| {
                 self.save_sync_queue
                     .as_ref()
@@ -1117,6 +1199,16 @@ impl UiState {
         if !self.save_sync_enabled {
             return SaveSyncSummary::Off;
         }
+        if self.save_sync_checking {
+            return if self.save_sync_attention_games > 0 || self.save_sync_attention().is_some() {
+                SaveSyncSummary::NeedsAttention
+            } else {
+                SaveSyncSummary::Checking
+            };
+        }
+        if !self.memory_card_conflicts.is_empty() {
+            return SaveSyncSummary::NeedsAttention;
+        }
         if !self.save_sync_available {
             return SaveSyncSummary::NeedsSetup;
         }
@@ -1126,14 +1218,14 @@ impl UiState {
         if queue.actor_failed || queue.failure.is_some() || self.save_sync_failure.is_some() {
             return SaveSyncSummary::NeedsAttention;
         }
+        if queue.attention_games > 0 {
+            return SaveSyncSummary::NeedsAttention;
+        }
         if queue.network_paused {
             return SaveSyncSummary::Paused;
         }
         if queue.mapped_games == 0 {
             return SaveSyncSummary::NoLinkedFiles;
-        }
-        if queue.reconciled_games < queue.mapped_games {
-            return SaveSyncSummary::Reconciling;
         }
         if queue.pending_outbound > 0 {
             return SaveSyncSummary::Syncing;
@@ -1141,7 +1233,127 @@ impl UiState {
         if queue.attention_games > 0 || queue.pending_incoming > 0 {
             return SaveSyncSummary::NeedsAttention;
         }
+        if queue.reconciled_games < queue.mapped_games {
+            return SaveSyncSummary::Reconciling;
+        }
+        if queue.games.len() != queue.mapped_games
+            || queue
+                .games
+                .iter()
+                .any(|game| game.work != rommfs_core::events::SaveSyncWork::UpToDate)
+        {
+            return SaveSyncSummary::Reconciling;
+        }
         SaveSyncSummary::UpToDate
+    }
+
+    /// Review versions belong to the existing save identity, never to a
+    /// game title or to a count of queued downloads.
+    pub fn save_sync_review_versions(
+        &self,
+        rom_id: i64,
+        file_id: i64,
+    ) -> impl Iterator<Item = &rommfs_core::events::SaveSyncIncomingStatus> {
+        let game = self
+            .save_sync_games
+            .iter()
+            .find(|game| (game.rom_id, game.file_id) == (rom_id, file_id));
+        self.save_sync_queue
+            .iter()
+            .flat_map(|queue| queue.incoming.iter())
+            .filter(move |incoming| {
+                incoming.rom_id == rom_id
+                    && game.is_some_and(|game| game.incoming_ids.contains(&incoming.incoming_id))
+            })
+    }
+
+    /// Keep a deliberate consent change visible until a newer worker session
+    /// acknowledges it. Old discovery results cannot undo the user's choice.
+    pub fn request_save_sync_enabled(&mut self, enabled: bool) {
+        self.save_sync_enabled = enabled;
+        self.requested_save_sync_consent = Some((self.save_sync_session_id, enabled));
+    }
+
+    pub fn save_sync_review_count(&self) -> usize {
+        self.save_sync_games
+            .iter()
+            .filter(|game| {
+                game.work == rommfs_core::events::SaveSyncWork::NeedsReview
+                    || !game.incoming_ids.is_empty()
+            })
+            .count()
+            + self.memory_card_conflicts.len()
+    }
+
+    pub fn save_sync_summary_text(&self) -> String {
+        use rommfs_core::events::SaveSyncWork;
+        let review = self.save_sync_review_count();
+        let active = self
+            .save_sync_games
+            .iter()
+            .filter(|game| game.work == SaveSyncWork::Uploading)
+            .count();
+        let waiting = self
+            .save_sync_games
+            .iter()
+            .filter(|game| game.work == SaveSyncWork::WaitingToUpload)
+            .count();
+        let mut parts = Vec::new();
+        if !self.save_sync_enabled {
+            parts.push("Automatic save sync is off".to_owned());
+        }
+        let summary = self.save_sync_summary();
+        if matches!(
+            summary,
+            SaveSyncSummary::AuthRequired
+                | SaveSyncSummary::Offline
+                | SaveSyncSummary::NeedsSetup
+                | SaveSyncSummary::Paused
+        ) || (summary == SaveSyncSummary::NeedsAttention && review == 0)
+        {
+            parts.push(summary.label().to_owned());
+        }
+        if review > 0 {
+            parts.push(format!(
+                "{review} {} review",
+                if review == 1 {
+                    "save needs"
+                } else {
+                    "saves need"
+                }
+            ));
+        }
+        if self.save_sync_checking && review == 0 {
+            parts.push(SaveSyncSummary::Checking.label().to_owned());
+        }
+        if active > 0 && !self.save_sync_checking {
+            parts.push(format!(
+                "Uploading {active} {}",
+                if active == 1 { "save" } else { "saves" }
+            ));
+        }
+        if waiting > 0 && !self.save_sync_checking {
+            parts.push(format!(
+                "{waiting} {} waiting to upload",
+                if waiting == 1 { "save" } else { "saves" }
+            ));
+        }
+        if parts.is_empty() {
+            if self.save_sync_summary() == SaveSyncSummary::UpToDate {
+                parts.push(format!(
+                    "{} tracked {} up to date",
+                    self.save_sync_games.len(),
+                    if self.save_sync_games.len() == 1 {
+                        "save"
+                    } else {
+                        "saves"
+                    }
+                ));
+            } else {
+                parts.push(self.save_sync_summary().label().to_owned());
+            }
+        }
+        parts.join(" · ")
     }
 
     /// Mark a mount request pending immediately so a second UI click cannot

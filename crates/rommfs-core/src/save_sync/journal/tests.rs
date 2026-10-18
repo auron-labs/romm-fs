@@ -560,3 +560,30 @@ fn journal_rejects_wrong_rom_server_and_remote_ambiguous_result_is_durable() {
         vec![persisted[0].clone()]
     );
 }
+
+#[test]
+fn backup_descriptions_use_scoped_publication_records_not_filename_guesses() {
+    let dir = tempfile::tempdir().unwrap();
+    let saves = dir.path().join("retrobat/saves");
+    let target = saves.join("gb/Tetris.srm");
+    let (mut journal, mapping) = confirmed_journal(dir.path(), &saves, &target);
+    let incoming = journal
+        .stage_incoming(&mapping, "31", b"incoming", "remote_only", None, None, None)
+        .unwrap();
+    journal
+        .begin_incoming_publication(&incoming.id, &mapping)
+        .unwrap();
+    let backup = saves.join("gb/.Tetris.srm.rommfs-backup-recorded");
+    let lookalike = saves.join("gb/.Tetris.srm.rommfs-backup-unrecorded");
+    fs::write(&backup, b"preserved local save").unwrap();
+    fs::write(&lookalike, b"unowned file").unwrap();
+    journal
+        .record_incoming_backup(&incoming.id, &backup)
+        .unwrap();
+    assert_eq!(
+        journal.recorded_backup_paths().unwrap(),
+        vec![backup.clone()]
+    );
+    assert_eq!(fs::read(&backup).unwrap(), b"preserved local save");
+    assert_eq!(fs::read(&lookalike).unwrap(), b"unowned file");
+}

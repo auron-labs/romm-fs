@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn arguments_round_trip_through_windows_parser() {
-        use windows_sys::Win32::System::Memory::LocalFree;
+        use windows_sys::Win32::Foundation::LocalFree;
         use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
         let values = [
             "program",
