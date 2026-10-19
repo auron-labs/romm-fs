@@ -58,6 +58,13 @@ mod pages;
 const LOG_CAP: usize = 500;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+#[cfg(all(feature = "mcp", debug_assertions))]
+fn install_mcp_bridge(window: &mut Window, cx: &App) -> anyhow::Result<gpui_mcp::BridgeHandle> {
+    let app_id = gpui_mcp::AppId::new("rommfs")?;
+    let config = gpui_mcp::BridgeConfig::new(app_id, "RomMFS");
+    Ok(gpui_mcp::BridgeHandle::install(window, cx, config)?)
+}
+
 mod components;
 use components::*;
 
@@ -93,6 +100,9 @@ fn fmt_count(n: usize) -> String {
 // ---------------------------------------------------------------------------
 
 struct RommfsWindow {
+    /// Retain the local automation endpoint for this window's lifetime.
+    #[cfg(all(feature = "mcp", debug_assertions))]
+    _mcp_bridge: Option<gpui_mcp::BridgeHandle>,
     controller: Rc<Controller>,
     session: Rc<RefCell<crate::session::ApplicationSession>>,
     state: UiState,
@@ -162,6 +172,25 @@ impl RommfsWindow {
         tray_hides: bool,
     ) -> Self {
         let controller = session.borrow().controller();
+        #[cfg(all(feature = "mcp", debug_assertions))]
+        let mcp_bridge = match install_mcp_bridge(window, cx) {
+            Ok(bridge) => {
+                controller.sink().emit(AppEvent::log(
+                    Level::Info,
+                    "automation",
+                    "GPUI MCP bridge ready",
+                ));
+                Some(bridge)
+            }
+            Err(error) => {
+                controller.sink().emit(AppEvent::log(
+                    Level::Error,
+                    "automation",
+                    format!("Could not start GPUI MCP bridge: {error:#}"),
+                ));
+                None
+            }
+        };
         let page_scrolls: Vec<ScrollHandle> = (0..5).map(|_| ScrollHandle::new()).collect();
 
         let url_input =
@@ -350,6 +379,8 @@ impl RommfsWindow {
         .detach();
 
         let view = Self {
+            #[cfg(all(feature = "mcp", debug_assertions))]
+            _mcp_bridge: mcp_bridge,
             controller,
             session,
             state: UiState::new(LOG_CAP),
@@ -864,6 +895,8 @@ pub fn run() {
             })
             .detach();
             let startup = std::env::args().any(|a| a == "--startup");
+            let mcp_background = cfg!(all(feature = "mcp", debug_assertions))
+                && std::env::args().any(|a| a == "--mcp-background");
             #[cfg(windows)]
             let tray = match crate::desktop::tray::Tray::new() {
                 Ok(tray) => Some(tray),
@@ -887,6 +920,7 @@ pub fn run() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     window_min_size: Some(size(px(720.0), px(480.0))),
+                    focus: !mcp_background,
                     titlebar: Some(gpui_kit::TitlebarOptions {
                         title: Some("RomMFS".into()),
                         ..Default::default()
@@ -965,7 +999,7 @@ pub fn run() {
                 },
             )
             .expect("failed to open window");
-            if !startup {
+            if !startup && !mcp_background {
                 cx.activate(true);
             }
         });

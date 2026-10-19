@@ -68,8 +68,11 @@ last complete account-scoped snapshot and schedules one background refresh.
 loaded catalogue rather than fetching it twice. Structural changes take effect
 on the next mount; a failed refresh retains the previous complete snapshot.
 
-The **Activity** view shows operations and diagnostics. **Activity → Open log
-folder** opens `%LOCALAPPDATA%\rommfs\logs`. Logs rotate at 2 MiB with three
+The **Activity** view shows operations and diagnostics. Its technical log groups
+repeated diagnostics with the same severity, operation, and message into one
+entry with an occurrence count across the retained scrollback.
+**Activity → Open log folder** opens `%LOCALAPPDATA%\rommfs\logs`.
+Logs rotate at 2 MiB with three
 archives; relevant paths, IDs and error stages are retained, not sign-in secrets.
 
 ## Test

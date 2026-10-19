@@ -420,10 +420,10 @@ impl Worker {
                 .is_some_and(|p| p.integration == IntegrationMode::RetroBat);
         self.cancel_metadata();
         if had_metadata {
-            self.metadata_status(
-                false,
+            self.log(
+                Level::Info,
+                "metadata",
                 "Frontend files are retained while the mount is stopped",
-                None,
             );
         }
         self.sink.emit(AppEvent::MountStopping);

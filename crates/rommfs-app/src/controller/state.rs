@@ -530,6 +530,8 @@ impl UiState {
                 if *job_id == self.frontend_metadata_job_id {
                     self.frontend_metadata_pending = false;
                     self.frontend_metadata_progress = None;
+                    self.frontend_metadata_error = None;
+                    self.frontend_metadata_detail = None;
                 }
             }
             AppEvent::PlayDataUpdated {

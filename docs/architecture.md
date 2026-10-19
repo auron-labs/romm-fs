@@ -104,7 +104,13 @@ live RomM instance. `route_hit_count` counts scripted route matches;
   polled is logged as a watchdog warning.
 - The frontend metadata pass is visible: it reports a stage ("Downloading
   artwork", "Writing N gamelists", "Artwork & gamelists up to date") and artwork
-  counts as `FrontendMetadataProgress`. Artwork uses eight bounded workers
+  counts as `FrontendMetadataProgress`. These counts describe artwork checks,
+  including cache hits, rather than the whole update. Once they finish, the UI
+  uses an indeterminate indicator while game information is prepared and
+  published. A blocked exclusive-access guard remains a pending wait with its
+  diagnostic available; it is not a terminal failure or a reason to restart the
+  update. Cancelling/stopping a pass does not advance the last-success time.
+  Artwork uses eight bounded workers
   (`CONCURRENCY` in `retrobat/artwork.rs`, matching this note), and progress is
   throttled to about 4 Hz with the completed count only moving forward (the
   reporter takes the maximum under its own lock, so out-of-order worker

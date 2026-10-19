@@ -1089,7 +1089,7 @@ pub(crate) fn stopped_retrobat_guard(installation: &Path) -> anyhow::Result<Vec<
                 continue;
             }
             guards.push(std::fs::OpenOptions::new().read(true).write(true).share_mode(0)
-                .open(&path).with_context(|| format!("Stop RetroBat and its emulators before setup or metadata publication; exclusive access to {} is unavailable", path.display()))?);
+                .open(&path).with_context(|| format!("Exclusive access to {} is unavailable for RetroBat setup or metadata publication; close RetroBat, its emulators, or any other program using this file", path.display()))?);
         }
         Ok(guards)
     }

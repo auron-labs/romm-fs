@@ -15,6 +15,7 @@ anyhow.workspace = true
 chrono.workspace = true
 # gpui-kit = GPUI + gpui-base + gpui-component + default icon assets.
 gpui-kit = { workspace = true, optional = true }
+gpui-mcp = { git = "https://github.com/themixednuts/gpui-mcp", rev = "eb248ccf43847797b9067c47eeef1dd188dc03a6", default-features = false, features = ["gpui-pre"], optional = true }
 httpdate.workspace = true
 notify.workspace = true
 rommfs-cfapi.workspace = true
@@ -41,3 +42,5 @@ windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_Li
 [features]
 default = ["ui"]
 ui = ["dep:gpui-kit"]
+# Local automation is opt-in and the bridge is installed only in debug builds.
+mcp = ["ui", "dep:gpui-mcp"]

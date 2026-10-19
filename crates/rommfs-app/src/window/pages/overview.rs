@@ -199,18 +199,18 @@ impl RommfsWindow {
     ) -> impl IntoElement {
         let error = self.state.frontend_metadata_error.clone();
         let pending = self.state.frontend_metadata_pending;
-        let (kind, text) = if error.is_some() {
-            (
-                StatusKind::Danger,
-                "Couldn't update artwork and game information".to_string(),
-            )
-        } else if pending {
+        let (kind, text) = if pending {
             (
                 StatusKind::Warning,
                 self.state
                     .frontend_metadata_detail
                     .clone()
                     .unwrap_or_else(|| "Updating…".into()),
+            )
+        } else if error.is_some() {
+            (
+                StatusKind::Danger,
+                "Couldn't update artwork and game information".to_string(),
             )
         } else if let Some(at) = self.state.frontend_metadata_updated_at {
             (
@@ -220,7 +220,7 @@ impl RommfsWindow {
         } else {
             (StatusKind::Muted, "Not synced yet".to_string())
         };
-        let retry = error.as_ref().map(|_| {
+        let retry = error.as_ref().filter(|_| !pending).map(|_| {
             Button::new("overview-metadata-retry")
                 .label("Retry update")
                 .accessibility_label("Retry artwork and game information update")
@@ -236,11 +236,11 @@ impl RommfsWindow {
             .child(status_row("Artwork and game information", kind, text, retry, cx))
             .when(pending, |this| {
                 this.child(match self.state.frontend_metadata_progress {
-                    Some((completed, total)) => v_flex()
+                    Some((completed, total)) if completed < total => v_flex()
                         .gap_1()
                         .child(muted(
                             format!(
-                                "{} / {} artwork files",
+                                "{} / {} artwork files checked",
                                 fmt_count(completed),
                                 fmt_count(total)
                             ),
@@ -256,9 +256,12 @@ impl RommfsWindow {
                                 .small(),
                         )
                         .into_any_element(),
-                    None => Progress::new("overview-metadata-progress")
-                        .loading(true)
-                        .small()
+                    progress => v_flex()
+                        .gap_1()
+                        .when(progress.is_some(), |this| {
+                            this.child(muted("Artwork checks complete", cx))
+                        })
+                        .child(Progress::new("overview-metadata-progress").loading(true).small())
                         .into_any_element(),
                 })
             })

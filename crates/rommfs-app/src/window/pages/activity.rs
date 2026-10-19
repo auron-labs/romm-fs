@@ -347,7 +347,11 @@ fn attention_section(
             .into_any_element(),
         );
     }
-    if let Some(error) = &state.frontend_metadata_error {
+    if let Some(error) = state
+        .frontend_metadata_error
+        .as_ref()
+        .filter(|_| !state.frontend_metadata_pending)
+    {
         rows.push(
             attention_row(
                 "attention-metadata",
@@ -643,13 +647,13 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
     // Frontend metadata fetch
     if state.frontend_metadata_pending {
         let detail = match state.frontend_metadata_progress {
-            Some((completed, total)) => v_flex()
+            Some((completed, total)) if completed < total => v_flex()
                 .gap_1()
                 .when_some(state.frontend_metadata_detail.clone(), |this, stage| {
                     this.child(muted_xs(stage, cx))
                 })
                 .child(muted_xs(
-                    format!("{} / {} artwork files", completed, total),
+                    format!("{} / {} artwork files checked", completed, total),
                     cx,
                 ))
                 .child(
@@ -662,10 +666,13 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
                         .small(),
                 )
                 .into_any_element(),
-            None => {
+            progress => {
                 let mut block = v_flex()
                     .gap_1()
                     .child(Progress::new("metadata-progress").loading(true).small());
+                if progress.is_some() {
+                    block = block.child(muted_xs("Artwork checks complete", cx));
+                }
                 if let Some(detail) = state.frontend_metadata_detail.clone() {
                     block = block.child(muted_xs(detail, cx));
                 }
@@ -760,7 +767,8 @@ fn log_section(
     // §6: repeated diagnostics collapse into one entry keyed by the
     // stable reason (level + op + message) with an occurrence count,
     // instead of flooding the log.
-    let mut runs: Vec<(&rommfs_core::events::LogLine, usize)> = Vec::new();
+    let mut entries: Vec<(&rommfs_core::events::LogLine, usize)> = Vec::new();
+    let mut reasons = std::collections::HashMap::new();
     for line in view.state.log.lines() {
         if !level_visible(line.level, min_level) {
             continue;
@@ -771,18 +779,16 @@ fn log_section(
         {
             continue;
         }
-        match runs.last_mut() {
-            Some((last, count))
-                if last.level == line.level
-                    && last.op == line.op
-                    && last.message == line.message =>
-            {
-                *count += 1;
-            }
-            _ => runs.push((line, 1)),
+        let reason = (level_str(line.level), line.op, line.message.as_str());
+        if let Some(&index) = reasons.get(&reason) {
+            let (_, count) = &mut entries[index];
+            *count += 1;
+        } else {
+            reasons.insert(reason, entries.len());
+            entries.push((line, 1));
         }
     }
-    let lines: Vec<AnyElement> = runs
+    let lines: Vec<AnyElement> = entries
         .into_iter()
         .map(|(line, count)| render_log_line(line, count, window, cx).into_any_element())
         .collect();
@@ -1033,7 +1039,12 @@ fn render_log_line(
     // One line by default; the toggle reveals the whole entry. A short entry
     // that still spans lines (embedded newlines) gets the toggle too (WS6.13).
     let long = body.chars().count() > 72 || body.contains('\n') || body.contains('\r');
-    let key = SharedString::from(format!("log-line-{body}"));
+    // A reason has one row even when its occurrences are interleaved with
+    // other diagnostics. Keep its identity independent of the display count.
+    let key = SharedString::from(format!(
+        "log-line-{:?}-{:?}-{:?}",
+        line.level, line.op, line.message
+    ));
     let open = window.use_keyed_state(key.clone(), cx, |_, _| std::cell::Cell::new(false));
     let is_open = open.read(cx).get();
     let toggle = open.clone();

@@ -29,6 +29,39 @@ and native CFAPI tests. The native acceptance procedure, including live and
 manual cases, is in [Windows testing](testing/windows.md). Compilation and
 portable fixtures do not establish native runtime behavior.
 
+## GPUI MCP automation
+
+For local agent-driven UI checks, run the opt-in debug build:
+
+```powershell
+mise x -- mbx run --locked -p rommfs-app --features mcp
+```
+
+Append `-- --mcp-background` to open the automation window without requesting
+desktop focus. This flag applies only to the opt-in debug build.
+
+Quit any existing RomMFS instance first: single-instance activation otherwise
+reopens that process. The bridge advertises application ID `rommfs` through
+the MCP server's private local discovery directory. It lives with the window,
+is absent from default builds, and is never installed in release builds.
+The password field is redacted from semantic frame observation.
+
+The bridge and its required `gpui-pre` patch are pinned to the same
+[`gpui-mcp` revision](https://github.com/themixednuts/gpui-mcp/tree/eb248ccf43847797b9067c47eeef1dd188dc03a6).
+Cargo applies that framework patch to every UI build, including builds with
+the bridge feature disabled. The MCP dependencies require Rust 1.96 or later;
+the repository's mise toolchain satisfies this requirement.
+
+Install the matching server with `mise x -- mbx install --git
+https://github.com/themixednuts/gpui-mcp --rev
+eb248ccf43847797b9067c47eeef1dd188dc03a6 --locked gpui-mcp-server`, then register
+its `gpui-mcp` executable as a stdio MCP server in the agent client. The
+`--app-id rommfs` server argument limits discovery to RomMFS. Agent actions
+operate on the actual application and retain its current account, settings,
+and save-sync consent; use test roots/accounts for scenarios that change data.
+Pointer and keyboard actions are injected into GPUI rather than the global
+desktop input stream. Native dialogs and tray UI need separate coverage.
+
 ## Where to change and verify
 
 | Change | Primary code | Useful tests/docs |

@@ -1,7 +1,6 @@
 [tools]
 betterleaks = "1.9.0"
 "cargo:cargo-deny" = "0.20.2"
-"github:rui314/mold" = "3.0.0"
 hk = { version = "2.6.0", workflow = "release.yml" }
 "npm:dclint" = "3.1.0"
 pkl = "0.32.1"

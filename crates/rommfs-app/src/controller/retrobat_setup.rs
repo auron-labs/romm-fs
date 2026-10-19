@@ -138,10 +138,10 @@ impl Worker {
                         || next.is_launchable(&a.key) != catalogue.is_launchable(&b.key)
                 })
         }) {
-            self.metadata_status(
-                true,
+            self.log(
+                Level::Info,
+                "metadata",
                 "Frontend metadata retained; library changes apply on the next remount",
-                None,
             );
             return;
         }
@@ -160,7 +160,7 @@ impl Worker {
         self.metadata_ready = Some(rommfs_core::retrobat::ArtworkBatch::default());
         let (tx, rx) = mpsc::channel();
         self.metadata_job = Some(rx);
-        self.metadata_status(true, "Downloading artwork", None);
+        self.metadata_status(true, "Checking and downloading artwork", None);
         let sink = self.sink.clone();
         self.metadata_handle = Some(std::thread::spawn(move || {
             let progress = move |completed: usize, total: usize| {
@@ -249,7 +249,7 @@ impl Worker {
                 if !self.metadata_wait_reported {
                     self.metadata_status(
                         true,
-                        "Gamelists are ready; waiting for RetroBat and its emulators to close",
+                        "Waiting for exclusive access to RetroBat files",
                         Some(format!("{error:#}")),
                     );
                     self.metadata_wait_reported = true;
@@ -276,6 +276,7 @@ impl Worker {
             .metadata_active
             .clone()
             .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        self.metadata_status(true, "Preparing game information", None);
         self.spawn_metadata_publication(
             self.metadata_job_id,
             active,
@@ -385,7 +386,7 @@ impl Worker {
                 );
                 self.metadata_status(
                     true,
-                    left_as_is("Gamelists published; caching frontend artwork"),
+                    left_as_is("Game information published; checking artwork"),
                     None,
                 );
             }
@@ -671,6 +672,13 @@ fn publish_metadata(
         // The user's own files, read-only, for "hide RomM copies". A system
         // that can't be read is reported and left visible; the rest proceed.
         let mut local = hide_enabled.then(|| {
+            emit_metadata_status(
+                sink,
+                job_id,
+                true,
+                "Checking games already installed in RetroBat",
+                None,
+            );
             rommfs_core::retrobat::LocalFiles::scan(
                 &installation,
                 &linked,
@@ -684,6 +692,7 @@ fn publish_metadata(
         if let Some(local) = &local {
             problems.extend(local.problems().iter().cloned());
         }
+        emit_metadata_status(sink, job_id, true, "Preparing gamelists", None);
         let publication = rommfs_core::retrobat::generate_gamelists(
             &catalogue,
             &snapshot.roms,
@@ -716,7 +725,7 @@ fn publish_metadata(
                 sink,
                 job_id,
                 true,
-                format!("Writing {changed} gamelists"),
+                format!("Writing {changed} gamelists and artwork"),
                 None,
             );
         }

@@ -61,7 +61,7 @@ impl RommfsWindow {
                     .content(v_flex().gap_3()
                         .child(h_flex().gap_3().items_stretch()
                             .child(div().flex_1().min_w_0().child(field_column("Username", Input::new(&self.user_input).w_full(), cx)))
-                            .child(div().flex_1().min_w_0().child(field_column("Password", Input::new(&self.password_input).w_full().content_type(InputContentType::Password).mask_toggle(), cx))))
+                            .child(div().id("password-field").frame_redacted(true).flex_1().min_w_0().child(field_column("Password", Input::new(&self.password_input).w_full().content_type(InputContentType::Password).mask_toggle(), cx))))
                         .child(Button::new("connect").label("Connect with password")
                             .on_click(cx.listener(|view,_,_,cx| view.on_connect(cx)))))))
             .when_some(self.state.pairing_code.clone(), |this, code| this.child(muted(format!("Approve RomMFS in your browser · code {code}"), cx)))
@@ -366,10 +366,9 @@ impl RommfsWindow {
                 self.state.catalogue,
                 |this, (platforms, games, files, skipped)| {
                     this.child(
-                        h_flex()
+                        v_flex()
+                            .w_full()
                             .gap_2()
-                            .items_center()
-                            .flex_wrap()
                             .child(muted(
                                 format!(
                                     "{} · {} games",

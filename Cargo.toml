@@ -43,3 +43,8 @@ windows-sys = {
     "Win32_System_Threading",
   ]
 }
+
+# The opt-in MCP bridge needs GPUI's frame-observation and injected-input APIs.
+# Keep the framework and bridge on the same reviewed upstream revision.
+[patch.crates-io]
+gpui-pre = { git = "https://github.com/themixednuts/gpui-mcp", rev = "eb248ccf43847797b9067c47eeef1dd188dc03a6" }

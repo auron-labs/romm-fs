@@ -883,7 +883,11 @@ pub fn render(
             .gap_2()
             .items_center()
             .child(muted_xs(
-                format!("{} skipped files", plural(ignored, "file")),
+                format!(
+                    "{} skipped {}",
+                    fmt_count(ignored),
+                    if ignored == 1 { "file" } else { "files" }
+                ),
                 cx,
             ))
             .child(
