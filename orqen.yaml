@@ -3,6 +3,7 @@ agent:
     - codex
     - claude
 scope: project
+extends: [core,workflow]
 skills:
     - source: https://github.com/jeffallan/claude-skills
       skills:
