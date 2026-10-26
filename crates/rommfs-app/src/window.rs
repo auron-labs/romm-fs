@@ -25,9 +25,11 @@ use gpui_kit::component::{
     switch::Switch,
     tab::{Tab, TabBar},
     tag::Tag,
-    try_parse_color, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
+    try_parse_color, v_flex, ActiveTheme as _, Disableable as _, Icon, Sizable as _,
     StyledExt as _, Theme, ThemeMode,
 };
+// The full Lucide catalog (the component IconName is a retained subset).
+use gpui_kit::assets::IconName;
 use gpui_kit::{
     actions, div, prelude::*, px, size, AnyElement, App, Bounds, ClipboardItem, Context, Entity,
     Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollHandle, SharedString,
@@ -140,11 +142,9 @@ struct RommfsWindow {
     /// Row key expanded to its detail block (file id or title key).
     #[allow(dead_code)] // read by pages/save_review.rs
     save_review_expanded: Option<SharedString>,
-    /// Whether files that match no game in the library are listed.
-    #[allow(dead_code)] // read by pages/save_review.rs
-    save_review_show_ignored: bool,
-    save_review_attention_only: bool,
-    save_review_skipped_page: usize,
+    /// Active Saves filter pill: 0 = All, 1 = Needs review, 2 = Tracked,
+    /// 3 = Not linked, 4 = Skipped (pages/save_review.rs).
+    save_review_filter: usize,
     // --- Activity page state (window/pages/activity.rs) ---
     /// Minimum log severity shown: 0 = everything, 1 = warnings+errors,
     /// 2 = errors only.
@@ -408,9 +408,7 @@ impl RommfsWindow {
             save_review_search,
             save_review_page: 0,
             save_review_expanded: None,
-            save_review_show_ignored: false,
-            save_review_attention_only: false,
-            save_review_skipped_page: 0,
+            save_review_filter: 0,
             activity_min_level: 0,
             activity_follow_log: true,
             activity_log_open: false,
@@ -661,6 +659,33 @@ impl RommfsWindow {
         (self.state.save_sync_summary_text(), kind)
     }
 
+    /// The save-sync status as a short pill label for card title rows; the
+    /// full sentence stays in the card body (`save_sync_summary_text`).
+    fn save_sync_pill(&self) -> (SharedString, StatusKind) {
+        let summary = self.state.save_sync_summary();
+        let (_, kind) = self.save_sync_status();
+        let text = match summary {
+            SaveSyncSummary::AuthRequired => "Sign in",
+            SaveSyncSummary::Offline => "Offline",
+            SaveSyncSummary::NeedsAttention => {
+                if self.state.save_sync_review_count() > 0 {
+                    "Needs review"
+                } else {
+                    "Needs attention"
+                }
+            }
+            SaveSyncSummary::NeedsSetup => "Not set up",
+            SaveSyncSummary::Paused => "Paused",
+            SaveSyncSummary::Checking => "Checking",
+            SaveSyncSummary::Reconciling => "Reconciling",
+            SaveSyncSummary::Syncing => "Syncing",
+            SaveSyncSummary::NoLinkedFiles => "Nothing to sync",
+            SaveSyncSummary::Off => "Off",
+            SaveSyncSummary::UpToDate => "Up to date",
+        };
+        (text.into(), kind)
+    }
+
     /// The ~190px left navigation: four destinations, and the server host
     /// plus a labelled RomM connection status pinned at the bottom
     /// (UI-PLAN §2). Nav clicks reach the view through its WeakEntity.
@@ -674,47 +699,69 @@ impl RommfsWindow {
             .filter(|server| !server.is_empty())
             .unwrap_or_else(|| self.url_input.read(cx).value().to_string());
         let active = self.active_view;
+        let review_count = self.state.save_sync_review_count();
+        let items: [(IconName, &str); 4] = [
+            (IconName::LayoutGrid, "Overview"),
+            (IconName::Save, "Saves"),
+            (IconName::Activity, "Activity"),
+            (IconName::Settings, "Settings"),
+        ];
         let mut menu = SidebarMenu::new();
-        for (index, label) in ["Overview", "Saves", "Activity", "Settings"]
-            .into_iter()
-            .enumerate()
-        {
+        for (index, (icon, label)) in items.into_iter().enumerate() {
             let weak = weak.clone();
-            menu = menu.child(
-                SidebarMenuItem::new(label)
-                    .active(active == index)
-                    .on_click(move |_, _, cx| {
-                        if weak
-                            .update(cx, |view, _cx| view.active_view = index)
-                            .is_ok()
-                        {
-                            cx.notify(weak.entity_id());
-                        }
-                    }),
-            );
+            let mut item = SidebarMenuItem::new(label)
+                .icon(Icon::new(icon))
+                .active(active == index)
+                .on_click(move |_, _, cx| {
+                    if weak
+                        .update(cx, |view, _cx| view.active_view = index)
+                        .is_ok()
+                    {
+                        cx.notify(weak.entity_id());
+                    }
+                });
+            // The Saves badge is the review backlog count — the design's amber pill.
+            if index == 1 && review_count > 0 {
+                item = item.suffix(move |_, cx| {
+                    count_badge(review_count, StatusKind::Warning, cx).into_any_element()
+                });
+            }
+            menu = menu.child(item);
         }
         Sidebar::new("app-nav")
-            .w(px(190.))
+            .w(px(208.))
             .collapsible(SidebarCollapsible::None)
             .header(
-                div()
-                    .text_base()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("RomMFS"),
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::Gamepad2)
+                            .size_5()
+                            .text_color(cx.theme().primary),
+                    )
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("RomMFS"),
+                    ),
             )
             .child(menu)
             .footer(
                 v_flex()
-                    .gap_1()
-                    .child(muted_xs(
-                        if host.is_empty() {
-                            "No server configured".to_string()
-                        } else {
-                            host
-                        },
-                        cx,
-                    ))
-                    .child(status_marker(conn_kind, conn_text, cx)),
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().sidebar_foreground)
+                            .child(if host.is_empty() {
+                                "No server configured".to_string()
+                            } else {
+                                host
+                            }),
+                    )
+                    .child(status_pill(conn_kind, conn_text, cx)),
             )
     }
 }
@@ -803,25 +850,37 @@ impl Render for RommfsWindow {
     }
 }
 
-/// The app's dark palette — blue-gray tones per the mockup, applied over the
+/// The app's dark palette — near-black surfaces, hairline borders, and a
+/// restrained accent set per the `.scratch/design` mockups, applied over the
 /// built-in dark theme so any token left unset keeps its library default.
 fn apply_rommfs_theme(theme: &mut Theme) {
     fn color(hex: &str) -> Hsla {
         try_parse_color(hex).expect("static hex literal must parse")
     }
-    theme.background = color("#1c1e2e");
-    theme.foreground = color("#e2e5f3");
-    theme.muted = color("#161826");
-    theme.muted_foreground = color("#8b90b0");
-    theme.border = color("#363a55");
-    theme.input = color("#3c4165");
-    theme.accent = color("#2a2e4a");
-    theme.accent_foreground = color("#e2e5f3");
-    theme.secondary = color("#2b3358");
-    theme.secondary_foreground = color("#dfe2f4");
-    theme.secondary_hover = color("#343d66");
-    theme.popover = color("#252840");
-    theme.popover_foreground = color("#e2e5f3");
+    theme.background = color("#0f1218");
+    theme.foreground = color("#e5e8f0");
+    theme.muted = color("#161a22");
+    theme.muted_foreground = color("#8b93a5");
+    theme.border = color("#242b38");
+    theme.input = color("#242b38");
+    theme.accent = color("#1d2330");
+    theme.accent_foreground = color("#e5e8f0");
+    theme.secondary = color("#1a1f2a");
+    theme.secondary_foreground = color("#dfe3ee");
+    theme.secondary_hover = color("#232a38");
+    theme.button = theme.secondary;
+    theme.button_foreground = theme.secondary_foreground;
+    theme.button_hover = theme.secondary_hover;
+    theme.button_active = theme.secondary;
+    theme.group_box = color("#141822");
+    theme.group_box_foreground = color("#e5e8f0");
+    theme.popover = color("#161b26");
+    theme.popover_foreground = color("#e5e8f0");
+    theme.sidebar = color("#0b0e14");
+    theme.sidebar_foreground = color("#c7ccd9");
+    theme.sidebar_accent = color("#1c2230");
+    theme.sidebar_accent_foreground = color("#f2f4fa");
+    theme.sidebar_border = color("#1b2130");
     theme.primary = color("#3b82f6");
     theme.primary_foreground = color("#f5f8ff");
     theme.primary_hover = color("#4f8df7");
@@ -833,7 +892,7 @@ fn apply_rommfs_theme(theme: &mut Theme) {
     theme.ring = theme.primary;
     theme.selection = theme.primary.opacity(0.35);
     theme.success = color("#4ade80");
-    theme.warning = color("#fbbf24");
+    theme.warning = color("#f5b14c");
     theme.danger = color("#f87171");
     theme.info = color("#60a5fa");
 }
@@ -849,11 +908,42 @@ fn close_behavior_copy(tray_hides: bool) -> &'static str {
     }
 }
 
+/// The kit's default icon bundle plus the handful of extra Lucide icons the
+/// shell uses. Selective embedding keeps the binary small; unlisted paths
+/// fall through to the default set.
+mod assets {
+    use gpui_kit::assets::{icon_assets, Assets};
+    use gpui_kit::gpui::{AssetSource, Result, SharedString};
+    use std::borrow::Cow;
+
+    icon_assets!(
+        ExtraIcons,
+        [Activity, Gamepad2, LayoutGrid, Save, ScrollText, Square]
+    );
+
+    pub struct RommfsAssets;
+
+    impl AssetSource for RommfsAssets {
+        fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+            match ExtraIcons.load(path)? {
+                Some(bytes) => Ok(Some(bytes)),
+                None => Assets.load(path),
+            }
+        }
+
+        fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+            let mut paths = ExtraIcons.list(path)?;
+            paths.extend(Assets.list(path)?);
+            Ok(paths)
+        }
+    }
+}
+
 /// Launch the GPUI app; blocks until the window closes. Closing stops the
 /// worker session and mount (PRD: no tray/background process).
 pub fn run() {
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(assets::RommfsAssets)
         .run(|cx: &mut App| {
             gpui_kit::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);

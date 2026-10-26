@@ -266,6 +266,7 @@ impl RommfsWindow {
             }
             FolderSummary::Stopped => configured.clone().map(|path| {
                 let start = Button::new("start-mount")
+                    .icon(Icon::new(IconName::Play))
                     .label("Make games available")
                     .primary()
                     .disabled(retro_setup_pending)
@@ -279,6 +280,7 @@ impl RommfsWindow {
             }),
             FolderSummary::Ready => configured.clone().map(|path| {
                 Button::new("open-mount")
+                    .icon(Icon::new(IconName::FolderOpen))
                     .label("Open games folder")
                     .primary()
                     .disabled(self.state.mount_stopping)
@@ -293,13 +295,34 @@ impl RommfsWindow {
             FolderSummary::Failed => configured.clone().map(|path| Button::new("start-mount").label("Make games available").primary().disabled(retro_setup_pending).on_click(cx.listener(move |view, _, _, cx| view.start_mount(path.clone(), cx)))),
         };
 
+        card(cx)
+            .p_4()
+            .child(
         v_flex()
-            .gap_2()
-            .child(status_row("Games folder", mount_kind, mount_text, None, cx))
-            .when_some(configured, |this, path| {
-                let text = window.use_keyed_state(SharedString::from(format!("games-folder-path-{path}")), cx, |window, cx| InputState::new(window, cx).default_value(path));
-                this.child(Input::new(&text).readonly(true).w_full())
-            })
+            .gap_3()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Games folder"))
+                    .child(status_pill(mount_kind, mount_text, cx)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .when_some(configured, |this, path| {
+                        let text = window.use_keyed_state(SharedString::from(format!("games-folder-path-{path}")), cx, |window, cx| InputState::new(window, cx).default_value(path));
+                        this.child(div().flex_1().min_w_0().child(Input::new(&text).readonly(true).w_full()))
+                            .child(
+                                Button::new("browse-games-folder")
+                                    .icon(Icon::new(IconName::FolderOpen))
+                                    .label("Browse")
+                                    .outline()
+                                    .on_click(cx.listener(|view, _, _, cx| view.browse_games_folder(cx))),
+                            )
+                    }),
+            )
             .child(muted("Your RomM games appear in this folder. Game data downloads when an emulator or another program reads a game file.", cx))
             .when_some(self.state.folder_open_error.clone(), |this, error| this.child(error_line(error, cx)))
             .child(
@@ -310,6 +333,7 @@ impl RommfsWindow {
                     .when(ready, |this| {
                         this.child(
                             Button::new("stop-mount")
+                                .icon(Icon::new(IconName::Square))
                                 .label(if self.state.mount_stopping { "Stopping…" } else { "Stop" })
                                 .accessibility_label("Stop games folder")
                                 .disabled(self.state.mount_stopping)
@@ -323,6 +347,7 @@ impl RommfsWindow {
                     .when(connected, |this| {
                         this.child(
                             Button::new("refresh-catalogue")
+                                .icon(Icon::new(IconName::RefreshCw))
                                 .label("Check for library changes")
                                 .disabled(self.state.catalogue_progress.is_some() || summary == FolderSummary::Starting || self.state.mount_stopping)
                                 .outline()
@@ -365,20 +390,37 @@ impl RommfsWindow {
             .when_some(
                 self.state.catalogue,
                 |this, (platforms, games, files, skipped)| {
-                    this.child(
-                        v_flex()
-                            .w_full()
-                            .gap_2()
-                            .child(muted(
-                                format!(
-                                    "{} · {} games",
-                                    plural(platforms, "platform"),
-                                    fmt_count(games),
-                                ),
-                                cx,
-                            ))
-                            .child(text_disclosure("library-details", "Library details", format!("{} original file entries are shown in the games folder. {} projection omissions combine whole-game and individual-file omissions. Causes include missing server data, unsupported platform/category destinations, or invalid names and paths. See catalogue warnings in Activity for each reason.", fmt_count(files), fmt_count(skipped)), window, cx)),
-                    )
+                    this.child(muted(
+                        format!(
+                            "{} · {} games · {} files",
+                            plural(platforms, "platform"),
+                            fmt_count(games),
+                            fmt_count(files),
+                        ),
+                        cx,
+                    ))
+                    .when(skipped > 0, |this| {
+                        this.child(banner(
+                            StatusKind::Warning,
+                            IconName::TriangleAlert,
+                            format!(
+                                "{} aren't shown in the games folder",
+                                plural(skipped, "item")
+                            ),
+                            Some(
+                                Button::new("library-skipped-activity")
+                                    .label("View in Activity")
+                                    .warning()
+                                    .small()
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.active_view = 2;
+                                        cx.notify();
+                                    })),
+                            ),
+                            cx,
+                        ))
+                    })
+                    .child(text_disclosure("library-details", "Library details", format!("{} original file entries are shown in the games folder. {} projection omissions combine whole-game and individual-file omissions. Causes include missing server data, unsupported platform/category destinations, or invalid names and paths. See catalogue warnings in Activity for each reason.", fmt_count(files), fmt_count(skipped)), window, cx))
                 },
             )
             .when_some(self.state.catalogue_refreshed_at, |this, timestamp| {
@@ -442,5 +484,6 @@ impl RommfsWindow {
                     None => this.child(Progress::new("mount-progress").loading(true).small()),
                 }
             })
+            )
     }
 }

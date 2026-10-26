@@ -1,6 +1,5 @@
 use super::super::*;
 use gpui_kit::component::pagination::Pagination;
-use std::cell::Cell;
 
 /// Bounded review-table page (UI-PLAN §5): every result stays reachable
 /// through search, filtering, and paging — never behind a truncated dump.
@@ -57,18 +56,45 @@ impl RowStatus {
         }
     }
 }
-const STATUS_FILTERS: &[Option<RowStatus>] = &[
-    None,
-    Some(RowStatus::NeedsAttention),
-    Some(RowStatus::ConflictingChanges),
-    Some(RowStatus::NotLinked),
-    Some(RowStatus::NotChecked),
-    Some(RowStatus::Checking),
-    Some(RowStatus::WaitingToUpload),
-    Some(RowStatus::Uploading),
-    Some(RowStatus::WaitingForRomm),
-    Some(RowStatus::UpToDate),
-];
+/// The design's filter pills: All, Needs review, Tracked, Not linked,
+/// Skipped — each with a live count beside its label.
+const SAVE_FILTERS: [&str; 5] = ["All", "Needs review", "Tracked", "Not linked", "Skipped"];
+
+fn filter_matches(filter_ix: usize, row: &ReviewRow) -> bool {
+    match filter_ix {
+        1 => matches!(
+            row.status,
+            RowStatus::NeedsAttention | RowStatus::ConflictingChanges
+        ),
+        // "Tracked" = rows the sync queue actually watches: linked games and
+        // memory-card conflicts, never unmatched or skipped files.
+        2 => !matches!(row.status, RowStatus::NotLinked | RowStatus::Excluded),
+        3 => row.status == RowStatus::NotLinked,
+        4 => row.status == RowStatus::Excluded,
+        _ => true,
+    }
+}
+
+/// One pill in the filter row; the active pill keeps the selected surface.
+fn filter_pill(
+    index: usize,
+    label: &str,
+    count: usize,
+    active: bool,
+    cx: &mut Context<RommfsWindow>,
+) -> Button {
+    Button::new(("save-filter", index))
+        .label(format!("{label} {}", fmt_count(count)))
+        .small()
+        .rounded(gpui_kit::component::button::ButtonRounded::Large)
+        .ghost()
+        .toggled(active)
+        .on_click(cx.listener(move |view, _, _, cx| {
+            view.save_review_filter = index;
+            view.save_review_page = 0;
+            cx.notify();
+        }))
+}
 
 /// Everything a row's expanded detail needs — keyed by domain identity
 /// (file path, rom/file id, incoming id), never by row position.
@@ -267,106 +293,74 @@ fn toggle_expanded(view: &mut RommfsWindow, key: &SharedString) {
 }
 
 impl RommfsWindow {
-    /// Compact live status: the shared derived marker, problem/failure
-    /// detail, and the page's only setup actions (enable + refresh).
-    /// Folder/install selection lives in Settings (UI-PLAN task 3).
-    fn save_review_status_strip(
+    /// A slim status card that only appears when sync state needs words:
+    /// the derived status pill, the off-state hint or paused problem, the
+    /// last failure, and the existing-file scan inventory (UI-PLAN §5).
+    fn save_review_status_card(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> Option<AnyElement> {
         let enabled = self.state.save_sync_enabled;
         let (status, status_kind) = self.save_sync_status();
-        let checked = self
-            .state
-            .save_scan_at
-            .map(|at| format!("Last successful scan: {}", relative_time(at)))
-            .unwrap_or_else(|| "Last scan time unavailable".into());
         let failure = self
             .state
             .save_sync_queue
             .as_ref()
             .and_then(|queue| queue.failure.clone())
-            .or_else(|| self.state.save_sync_failure.clone());
+            .or_else(|| self.state.save_sync_failure.clone())
+            .filter(|_| enabled);
+        let hint = self.state.save_sync_off_hint().map(str::to_owned);
+        let needs_folder = !enabled && !self.state.save_sync_available && hint.is_none();
+        let paused = enabled
+            .then(|| self.state.save_sync_problem.clone())
+            .flatten();
         let (inventory_chips, inventory_details) =
             existing_save_inventory(self.state.save_sync_existing_saves.as_ref());
-
-        let mut card = v_flex()
+        if failure.is_none()
+            && hint.is_none()
+            && !needs_folder
+            && paused.is_none()
+            && inventory_chips.is_empty()
+        {
+            return None;
+        }
+        let mut body = v_flex()
             .gap_2()
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .justify_between()
-                    .items_center()
-                    .child(status_marker(status_kind, status, cx))
-                    .child(
-                        h_flex()
-                            .flex_wrap()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                Button::new("save-sync-refresh")
-                                    .label("Check for changes")
-                                    .disabled(self.state.save_sync_checking)
-                                    .outline()
-                                    .small()
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        view.state.save_sync_checking = true;
-                                        view.controller.send(Command::RefreshSaveSync);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Switch::new("save-sync-toggle")
-                                    .label(if enabled {
-                                        "Automatic save sync: On"
-                                    } else {
-                                        "Automatic save sync: Off"
-                                    })
-                                    .checked(enabled)
-                                    .disabled(!enabled && !self.state.save_sync_available)
-                                    .on_change(cx.listener(|view, checked, _, cx| {
-                                        view.state.request_save_sync_enabled(*checked);
-                                        view.controller.send(Command::SetSaveSyncEnabled {
-                                            enabled: *checked,
-                                        });
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            )
-            .child(muted_xs(checked, cx))
+            .child(status_pill(status_kind, status, cx))
             .child(
                 h_flex()
                     .gap_2()
                     .flex_wrap()
-                    .child(chip(format!(
-                        "{} tracked",
-                        plural(self.state.save_sync_mapped_targets, "save")
-                    )))
-                    .child(chip(format!(
-                        "{} eligible unlinked saves",
-                        fmt_count(self.state.save_sync_catalogue_unmapped)
-                    )))
+                    .child(muted_xs(
+                        format!(
+                            "{} tracked · {} eligible unlinked saves",
+                            plural(self.state.save_sync_mapped_targets, "save"),
+                            fmt_count(self.state.save_sync_catalogue_unmapped)
+                        ),
+                        cx,
+                    ))
                     .when(self.state.save_files_ignored() > 0, |this| {
-                        this.child(chip(format!(
-                            "{} skipped files",
-                            fmt_count(self.state.save_files_ignored())
-                        )))
+                        this.child(muted_xs(
+                            format!(
+                                "· {} skipped files",
+                                fmt_count(self.state.save_files_ignored())
+                            ),
+                            cx,
+                        ))
                     })
                     .children(inventory_chips.into_iter().map(chip)),
             );
         if let Some(details) = inventory_details {
-            card = card.child(details_disclosure(
+            body = body.child(details_disclosure(
                 "save-inventory-details",
                 details,
                 window,
                 cx,
             ));
         }
-        if let Some(hint) = self.state.save_sync_off_hint() {
-            card = card
+        if let Some(hint) = hint {
+            body = body
                 .child(muted_xs(hint, cx))
                 .child(self.settings_nav_button(
                     "save-sync-open-settings",
@@ -375,29 +369,21 @@ impl RommfsWindow {
                     false,
                     cx,
                 ));
-        } else if !enabled && !self.state.save_sync_available {
-            card = card.child(muted_xs("Save sync needs a save folder.", cx));
+        } else if needs_folder {
+            body = body.child(muted_xs("Save sync needs a save folder.", cx));
         }
-        if enabled {
-            if let Some(problem) = self.state.save_sync_problem.clone() {
-                card = card.child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().warning)
-                        .child(format!("Paused: {problem}")),
-                );
-            }
+        if let Some(problem) = paused {
+            body = body.child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().warning)
+                    .child(format!("Paused: {problem}")),
+            );
         }
-        let failure = failure.filter(|_| enabled);
         if let Some(failure) = failure {
-            card = card.child(error_line(format!("Last failure: {failure}"), cx));
+            body = body.child(error_line(format!("Last failure: {failure}"), cx));
         }
-        div()
-            .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(cx.theme().border)
-            .p_3()
-            .child(card)
+        Some(card(cx).p_4().child(body).into_any_element())
     }
 
     /// Detail block under an expanded row: the row's full identity plus the
@@ -746,8 +732,9 @@ fn view_expanded(view: &RommfsWindow, key: &SharedString) -> bool {
     view.save_review_expanded.as_ref() == Some(key)
 }
 
-/// Save sync page: truthful status strip plus the searchable, paginated
-/// review table (UI-PLAN task 4 / §5).
+/// Save sync page per the redesign: header with the live toggle + check
+/// action, an attention banner, count filter pills + search, the table card,
+/// and pagination (UI-PLAN task 4 / §5).
 pub fn render(
     view: &mut RommfsWindow,
     window: &mut Window,
@@ -756,61 +743,28 @@ pub fn render(
     let has_games = !view.state.save_file_games.is_empty();
     let can_export = view.state.save_sync_effective_saves_root.is_some()
         && view.state.save_sync_account_id.is_some();
+    let enabled = view.state.save_sync_enabled;
 
-    // Status filter dropdown — page-local keyed state, index 0 = all rows.
-    let filter_state = window.use_keyed_state(
-        SharedString::from("save-review-status-filter"),
-        cx,
-        |window, cx| {
-            SelectState::new(
-                STATUS_FILTERS
-                    .iter()
-                    .map(|filter| {
-                        SharedString::from(filter.map(RowStatus::label).unwrap_or("All statuses"))
-                    })
-                    .collect::<Vec<_>>(),
-                None,
-                window,
-                cx,
-            )
-        },
-    );
-    let filter_prev = window.use_keyed_state(
-        SharedString::from("save-review-status-filter-prev"),
-        cx,
-        |_, _| Cell::new(0usize),
-    );
-    let filter_ix = filter_state
-        .read(cx)
-        .selected_index(cx)
-        .map(|index| index.row)
-        .unwrap_or(0);
-    if filter_ix != filter_prev.read(cx).get() {
-        filter_prev.update(cx, |prev, _| prev.set(filter_ix));
-        view.save_review_page = 0;
-    }
-    let status_filter = STATUS_FILTERS.get(filter_ix).copied().flatten();
-
+    let filter_ix = view.save_review_filter.min(SAVE_FILTERS.len() - 1);
     let query = view
         .save_review_search
         .read(cx)
         .value()
         .to_string()
         .to_lowercase();
-    let rows = collect_review_rows(&view.state, false);
-    let total_rows = rows.len();
+    // Skipped files are real table rows under their own pill, so the unfiltered
+    // set always includes them and the pill counts stay true.
+    let rows = collect_review_rows(&view.state, true);
+    let counts = [
+        rows.len(),
+        rows.iter().filter(|r| filter_matches(1, r)).count(),
+        rows.iter().filter(|r| filter_matches(2, r)).count(),
+        rows.iter().filter(|r| filter_matches(3, r)).count(),
+        rows.iter().filter(|r| filter_matches(4, r)).count(),
+    ];
     let filtered: Vec<&ReviewRow> = rows
         .iter()
-        .filter(|row| {
-            if view.save_review_attention_only {
-                matches!(
-                    row.status,
-                    RowStatus::NeedsAttention | RowStatus::ConflictingChanges
-                )
-            } else {
-                status_filter.is_none_or(|status| row.status == status)
-            }
-        })
+        .filter(|row| filter_matches(filter_ix, row))
         .filter(|row| row_matches_query(row, &query))
         .collect();
 
@@ -819,16 +773,6 @@ pub fn render(
     let start = page * REVIEW_PAGE_SIZE;
     let end = (start + REVIEW_PAGE_SIZE).min(filtered.len());
     let page_rows = &filtered[start..end];
-
-    let count_text = if filtered.len() == total_rows {
-        plural(total_rows, "item")
-    } else {
-        format!(
-            "{} of {} items",
-            fmt_count(filtered.len()),
-            fmt_count(total_rows)
-        )
-    };
 
     let mut table = v_flex();
     table = table.child(
@@ -840,13 +784,13 @@ pub fn render(
             .items_center()
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(div().flex_1().min_w_0().child(muted_xs("File", cx)))
-            .child(div().w_40().flex_shrink_0().child(muted_xs("Status", cx)))
-            .child(div().flex_1().min_w_0().child(muted_xs("Detail", cx)))
+            .child(div().flex_1().min_w_0().child(muted_xs("FILE", cx)))
+            .child(div().w_40().flex_shrink_0().child(muted_xs("STATUS", cx)))
+            .child(div().flex_1().min_w_0().child(muted_xs("DETAIL", cx)))
             .child(div().w_4().flex_shrink_0()),
     );
     if page_rows.is_empty() {
-        let empty = if !query.is_empty() || status_filter.is_some() {
+        let empty = if !query.is_empty() || filter_ix != 0 {
             "No results match this filter.".to_string()
         } else {
             match view.state.save_sync_summary() {
@@ -875,126 +819,31 @@ pub fn render(
             ));
         }
     }
+    // The manual linking form lives inside the table card's footer (design).
+    if has_games {
+        table = table.child(view.save_review_link_action(window, cx));
+    }
 
-    let ignored = view.state.save_files_ignored();
-    let ignored_row = (ignored > 0).then(|| {
-        let shown = view.save_review_show_ignored;
-        h_flex()
-            .gap_2()
-            .items_center()
-            .child(muted_xs(
-                format!(
-                    "{} skipped {}",
-                    fmt_count(ignored),
-                    if ignored == 1 { "file" } else { "files" }
-                ),
-                cx,
-            ))
-            .child(
-                Button::new("save-review-toggle-ignored")
-                    .label(if shown {
-                        "Hide skipped files"
-                    } else {
-                        "Show skipped files"
-                    })
-                    .outline()
-                    .small()
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.save_review_show_ignored = !view.save_review_show_ignored;
-                        view.save_review_page = 0;
-                        cx.notify();
-                    })),
-            )
-    });
-    let skipped = if view.save_review_show_ignored {
-        let rows = collect_review_rows(&view.state, true)
-            .into_iter()
-            .filter(|row| row.status == RowStatus::Excluded)
-            .collect::<Vec<_>>();
-        let mut details = v_flex().gap_2().child(section_heading("Skipped files"));
-        let pages = rows.len().div_ceil(REVIEW_PAGE_SIZE).max(1);
-        let page = view.save_review_skipped_page.min(pages - 1);
-        for row in rows
-            .iter()
-            .skip(page * REVIEW_PAGE_SIZE)
-            .take(REVIEW_PAGE_SIZE)
-        {
-            details = details.child(view.save_review_row(row, has_games, false, false, window, cx));
-        }
-        if pages > 1 {
-            let weak = cx.weak_entity();
-            details = details.child(
-                Pagination::new("skipped-files-pagination")
-                    .current_page(page + 1)
-                    .total_pages(pages)
-                    .small()
-                    .on_click(move |target, _, cx| {
-                        let _ = weak.update(cx, |view, cx| {
-                            view.save_review_skipped_page = target.saturating_sub(1);
-                            cx.notify();
-                        });
-                    }),
-            );
-        }
-        Some(details)
-    } else {
-        None
-    };
     let mut section = v_flex()
-        .gap_2()
+        .gap_3()
         .child(
             h_flex()
-                .justify_between()
-                .items_end()
-                .child(section_heading("Current saves"))
-                .child(muted_xs(count_text, cx)),
-        )
-        .child(
-            h_flex()
-                .gap_3()
-                .items_end()
-                .child(div().flex_1().min_w_0().child(field_column(
-                    "Search",
-                    Input::new(&view.save_review_search).w_full(),
-                    cx,
-                )))
+                .gap_2()
+                .items_center()
+                .flex_wrap()
+                .children(SAVE_FILTERS.iter().enumerate().map(|(index, label)| {
+                    filter_pill(index, label, counts[index], index == filter_ix, cx)
+                }))
+                .child(div().flex_1())
                 .child(
-                    div().w(px(176.)).flex_shrink_0().child(field_column(
-                        "Status",
-                        Select::new(&filter_state)
+                    div().w(px(220.)).flex_shrink_0().child(
+                        Input::new(&view.save_review_search)
                             .w_full()
-                            .accessibility_label("Filter by status")
-                            .placeholder("All statuses"),
-                        cx,
-                    )),
+                            .prefix(Icon::new(IconName::Search).small()),
+                    ),
                 ),
         )
-        .when(view.save_review_attention_only, |this| {
-            this.child(
-                h_flex()
-                    .gap_2()
-                    .child(muted("Showing saves needing review", cx))
-                    .child(
-                        Button::new("save-review-show-all")
-                            .label("Show all saves")
-                            .outline()
-                            .small()
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.save_review_attention_only = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-        })
-        .children(ignored_row)
-        .when_some(skipped, |this, details| this.child(details))
-        .child(
-            div()
-                .rounded(cx.theme().radius)
-                .border_1()
-                .border_color(cx.theme().border)
-                .child(table),
-        );
+        .child(card(cx).child(table));
 
     if total_pages > 1 {
         let weak = cx.weak_entity();
@@ -1021,14 +870,75 @@ pub fn render(
         );
     }
 
+    let last_scan = view
+        .state
+        .save_scan_at
+        .map(|at| format!("Last scan: {}", relative_time(at)))
+        .unwrap_or_else(|| "No scan yet — automatic sync and manual checks appear here.".into());
+    let sync_switch = Switch::new("save-sync-toggle")
+        .label("Automatic sync")
+        .checked(enabled)
+        .disabled(!enabled && !view.state.save_sync_available)
+        .on_change(cx.listener(|view, checked, _, cx| {
+            view.state.request_save_sync_enabled(*checked);
+            view.controller
+                .send(Command::SetSaveSyncEnabled { enabled: *checked });
+            cx.notify();
+        }));
+    let check_button = Button::new("save-sync-refresh")
+        .icon(Icon::new(IconName::RefreshCw))
+        .label("Check for changes")
+        .outline()
+        .disabled(view.state.save_sync_checking)
+        .on_click(cx.listener(|view, _, _, cx| {
+            view.state.save_sync_checking = true;
+            view.controller.send(Command::RefreshSaveSync);
+            cx.notify();
+        }));
+    let review_count = counts[1];
+
     v_flex()
         .gap_4()
-        .child(page_heading("Saves"))
-        .child(view.save_review_status_strip(window, cx))
-        .child(section)
-        .when(has_games, |this| {
-            this.child(view.save_review_link_action(window, cx))
+        .child(page_header(
+            "Saves",
+            last_scan,
+            Some(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(sync_switch)
+                    .child(check_button)
+                    .into_any_element(),
+            ),
+            cx,
+        ))
+        .when_some(view.save_review_status_card(window, cx), |this, card| {
+            this.child(card)
         })
+        .when(review_count > 0 && filter_ix != 1, |this| {
+            this.child(banner(
+                StatusKind::Warning,
+                IconName::TriangleAlert,
+                if review_count == 1 {
+                    "1 save needs review".to_string()
+                } else {
+                    format!("{} saves need review", fmt_count(review_count))
+                },
+                Some(
+                    Button::new("save-review-attention")
+                        .label("Review details")
+                        .warning()
+                        .small()
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.save_review_filter = 1;
+                            view.save_review_page = 0;
+                            cx.notify();
+                        })),
+                ),
+                cx,
+            ))
+        })
+        .child(section)
 }
 
 impl RommfsWindow {
