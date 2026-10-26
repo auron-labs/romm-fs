@@ -36,6 +36,7 @@ pub(super) fn status_marker(
     cx: &App,
 ) -> impl IntoElement {
     h_flex()
+        .min_w_0()
         .gap_2()
         .items_center()
         .child(status_dot(kind.color(cx)))
@@ -57,6 +58,8 @@ pub(super) fn status_pill(
 ) -> impl IntoElement {
     let color = kind.color(cx);
     h_flex()
+        .min_w_0()
+        .flex_shrink_0()
         .gap_2()
         .items_center()
         .px_2p5()
@@ -118,6 +121,7 @@ pub(super) fn banner(
     let color = kind.color(cx);
     h_flex()
         .w_full()
+        .flex_wrap()
         .gap_3()
         .items_center()
         .justify_between()
@@ -148,6 +152,7 @@ pub(super) fn page_header(
 ) -> impl IntoElement {
     h_flex()
         .w_full()
+        .flex_wrap()
         .items_end()
         .justify_between()
         .gap_4()
@@ -249,6 +254,7 @@ fn disclosure_toggle(id: SharedString, open: bool, label: impl Into<SharedString
     Button::new(id)
         .ghost()
         .small()
+        .toggled(open)
         .icon(Icon::new(if open {
             IconName::ChevronDown
         } else {
@@ -286,19 +292,21 @@ pub(super) fn text_disclosure(
     v_flex()
         .gap_1()
         .child(
-            disclosure_toggle(
-                id.clone(),
-                is_open,
-                if is_open {
-                    format!("Hide {}", label.to_lowercase())
-                } else {
-                    label.to_owned()
-                },
-            )
-            .on_click(cx.listener(move |_, _, _, cx| {
-                toggle.update(cx, |open, _| open.set(!open.get()));
-                cx.notify();
-            })),
+            h_flex().child(
+                disclosure_toggle(
+                    id.clone(),
+                    is_open,
+                    if is_open {
+                        format!("Hide {}", label.to_lowercase())
+                    } else {
+                        label.to_owned()
+                    },
+                )
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    toggle.update(cx, |open, _| open.set(!open.get()));
+                    cx.notify();
+                })),
+            ),
         )
         .when(is_open, |this| {
             use std::hash::{Hash, Hasher};
@@ -312,13 +320,15 @@ pub(super) fn text_disclosure(
                 },
             );
             this.child(
-                Button::new(SharedString::from(format!("{id}-copy")))
-                    .label("Copy details")
-                    .ghost()
-                    .small()
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))
-                    })),
+                h_flex().child(
+                    Button::new(SharedString::from(format!("{id}-copy")))
+                        .label("Copy details")
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))
+                        })),
+                ),
             )
             .child(
                 div()
@@ -397,15 +407,21 @@ pub(super) fn notes_disclosure(
     v_flex()
         .gap_1()
         .child(
-            disclosure_toggle(
-                id.into(),
-                is_open,
-                if is_open { "Hide".to_string() } else { label },
-            )
-            .on_click(cx.listener(move |_, _, _, cx| {
-                toggle.update(cx, |open, _| open.set(!open.get()));
-                cx.notify();
-            })),
+            h_flex().child(
+                disclosure_toggle(
+                    id.into(),
+                    is_open,
+                    if is_open {
+                        format!("Hide {}", label.to_lowercase())
+                    } else {
+                        label
+                    },
+                )
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    toggle.update(cx, |open, _| open.set(!open.get()));
+                    cx.notify();
+                })),
+            ),
         )
         .when(is_open, |this| {
             this.children(lines.into_iter().map(|line| muted_xs(line, cx)))
@@ -445,13 +461,38 @@ pub(super) fn failure_block(
         ))
 }
 
-/// "start filesystem backend for mount \"…\" failed: <cause>" — keep the
-/// cause as the explanation and the whole chain for the details lane.
+/// Use the same plain-language errors on setup and the everyday folder controls.
 pub(super) fn failure_explanation(error: &str) -> String {
-    error
-        .split_once(" failed: ")
-        .map(|(_, cause)| cause.to_string())
-        .unwrap_or_else(|| error.to_string())
+    UserProblem::from_text("Couldn't complete this action", error)
+        .cause
+        .unwrap_or_else(|| "Try again. Details are available below.".into())
+}
+
+/// Overview and Activity describe the same stage; waiting is never animated progress.
+pub(super) fn metadata_progress(id: &'static str, state: &UiState, cx: &App) -> impl IntoElement {
+    match state.frontend_metadata_summary() {
+        FrontendMetadataSummary::CheckingArtwork => {
+            let (completed, total) = state.frontend_metadata_progress.unwrap_or((0, 0));
+            operation_progress(
+                id,
+                "Checking artwork",
+                completed as u64,
+                (total > 0).then_some(total as u64),
+                0,
+                cx,
+            ).into_any_element()
+        }
+        FrontendMetadataSummary::Publishing => v_flex()
+            .gap_2()
+            .child(muted("Artwork is ready. Adding artwork and game information to RetroBat…", cx))
+            .child(Progress::new(id).accessibility_label("Updating RetroBat game information").loading(true).small())
+            .into_any_element(),
+        FrontendMetadataSummary::Waiting => muted(
+            "Game information is waiting for access to RetroBat files. RomMFS will retry automatically.",
+            cx,
+        ).into_any_element(),
+        _ => div().into_any_element(),
+    }
 }
 
 pub(super) fn section_heading(text: &'static str) -> impl IntoElement {
@@ -527,25 +568,27 @@ pub(super) fn operation_progress(
     stage: &str,
     completed: u64,
     total: Option<u64>,
-    elapsed_ms: u64,
+    _elapsed_ms: u64,
     cx: &App,
 ) -> impl IntoElement {
     // Indeterminate work has no honest count or time to show, so it shows only
     // its stage (WS6.2).
     let label = match total {
-        Some(total) => format!(
-            "{stage} · {completed} / {total} · {:.1}s",
-            elapsed_ms as f64 / 1000.0
+        Some(total) if total > 0 => format!(
+            "{stage} · {} of {}",
+            fmt_count(completed as usize),
+            fmt_count(total as usize)
         ),
-        None => stage.to_string(),
+        _ => stage.to_string(),
     };
     let percent = total
         .filter(|t| *t > 0)
         .map_or(0.0, |t| (100.0 * completed as f32 / t as f32).min(100.0));
     v_flex().gap_1().child(muted(label, cx)).child(
         Progress::new(id)
+            .accessibility_label(stage.to_owned())
             .value(percent)
-            .loading(total.is_none())
+            .loading(total.is_none_or(|total| total == 0))
             .small(),
     )
 }

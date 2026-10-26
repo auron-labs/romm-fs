@@ -17,10 +17,16 @@ impl RommfsWindow {
     fn render_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mounted = self.state.mount == MountState::Mounted;
         let mounting = self.state.mount == MountState::Mounting;
+        let connected = self.state.conn == ConnectionState::Connected;
         let (mount_text, mount_kind) = self.mount_status(cx);
         v_flex()
             .gap_6()
-            .child(page_heading("Set up RomMFS"))
+            .child(page_header(
+                "Welcome to RomMFS",
+                "Connect your RomM library and choose where games appear on this PC. Game files download only when opened.",
+                None,
+                cx,
+            ))
             .child(
                 v_flex()
                     .gap_3()
@@ -32,6 +38,8 @@ impl RommfsWindow {
                 v_flex()
                     .gap_3()
                     .child(section_heading("2. Choose the games folder"))
+                    .child(muted("Choose an empty folder. RomMFS will put your library here without moving your existing games.", cx))
+                    .when(!connected, |this| this.child(muted("Connect to RomM above to continue.", cx)))
                     .child(
                         h_flex()
                             .gap_2()
@@ -45,6 +53,7 @@ impl RommfsWindow {
                                 Button::new("setup-browse-folder")
                                     .label("Browse…")
                                     .outline()
+                                    .disabled(mounted || mounting)
                                     .on_click(
                                         cx.listener(|view, _, _, cx| view.browse_games_folder(cx)),
                                     ),
@@ -57,12 +66,14 @@ impl RommfsWindow {
                             .child(
                                 Button::new("setup-start-folder")
                                     .label(if mounted {
-                                        "Folder is running"
+                                        "Games are available"
+                                    } else if mounting {
+                                        "Preparing games…"
                                     } else {
                                         "Make games available"
                                     })
                                     .primary()
-                                    .disabled(mounted || mounting)
+                                    .disabled(!connected || mounted || mounting)
                                     .on_click(
                                         cx.listener(|view, _, _, cx| view.on_start_mount(cx)),
                                     ),
@@ -72,13 +83,13 @@ impl RommfsWindow {
                     .when(mounting, |this| match self.state.mount_progress.clone() {
                         Some((stage, completed, total, elapsed)) => this.child(operation_progress(
                             "setup-mount-progress",
-                            &stage,
+                            stage_label(&stage),
                             completed,
                             total,
                             elapsed,
                             cx,
                         )),
-                        None => this.child(Progress::new("setup-mount-progress").value(0.)),
+                        None => this.child(Progress::new("setup-mount-progress").loading(true).small()),
                     })
                     .when_some(self.state.mount_error.clone(), |this, error| {
                         // §6 failure presentation; the Start action above
@@ -109,7 +120,7 @@ impl RommfsWindow {
                 v_flex()
                     .gap_3()
                     .child(section_heading("3. RetroBat (optional)"))
-                    .child(div().child("Use RetroBat?"))
+                    .child(muted("Connect RetroBat to browse and play your library. You can set this up now or return to it in Settings.", cx))
                     .child(
                         h_flex()
                             .gap_2()
@@ -123,7 +134,7 @@ impl RommfsWindow {
                             )
                             .child(
                                 Button::new("setup-skip-retrobat")
-                                    .label("Skip")
+                                    .label("Go to overview")
                                     .ghost()
                                     .on_click(cx.listener(|view, _, _, cx| {
                                         view.active_view = 0;

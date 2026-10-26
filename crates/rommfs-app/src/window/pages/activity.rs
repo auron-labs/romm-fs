@@ -18,7 +18,7 @@ pub fn render(
         .gap_4()
         .child(page_header(
             "Activity",
-            "Downloads, sync, and diagnostics for this session.",
+            "See what is happening and what needs your attention.",
             Some(
                 Button::new("toggle-technical-log")
                     .icon(Icon::new(IconName::ScrollText))
@@ -66,7 +66,7 @@ fn attention_row(
             .gap_3()
             .items_start()
             .child(
-                div().pt(px(1.)).flex_shrink_0().child(
+                div().flex_shrink_0().child(
                     Icon::new(IconName::TriangleAlert)
                         .small()
                         .text_color(cx.theme().warning),
@@ -84,12 +84,14 @@ fn attention_row(
                             .child(headline.into()),
                     )
                     .when_some(detail, |this, detail| {
-                        this.child(details_disclosure(
-                            SharedString::from(format!("{id}-details")),
-                            detail,
-                            window,
-                            cx,
-                        ))
+                        this.child(muted(failure_explanation(&detail), cx)).child(
+                            details_disclosure(
+                                SharedString::from(format!("{id}-details")),
+                                detail,
+                                window,
+                                cx,
+                            ),
+                        )
                     }),
             )
             .when_some(action, |this, button| this.child(button)),
@@ -668,39 +670,7 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
 
     // Frontend metadata fetch
     if state.frontend_metadata_pending {
-        let detail = match state.frontend_metadata_progress {
-            Some((completed, total)) if completed < total => v_flex()
-                .gap_1()
-                .when_some(state.frontend_metadata_detail.clone(), |this, stage| {
-                    this.child(muted_xs(stage, cx))
-                })
-                .child(muted_xs(
-                    format!("{} / {} artwork files checked", completed, total),
-                    cx,
-                ))
-                .child(
-                    Progress::new("metadata-progress")
-                        .value(if total > 0 {
-                            (100.0 * completed as f32 / total as f32).min(100.0)
-                        } else {
-                            0.0
-                        })
-                        .small(),
-                )
-                .into_any_element(),
-            progress => {
-                let mut block = v_flex()
-                    .gap_1()
-                    .child(Progress::new("metadata-progress").loading(true).small());
-                if progress.is_some() {
-                    block = block.child(muted_xs("Artwork checks complete", cx));
-                }
-                if let Some(detail) = state.frontend_metadata_detail.clone() {
-                    block = block.child(muted_xs(detail, cx));
-                }
-                block.into_any_element()
-            }
-        };
+        let detail = metadata_progress("metadata-progress", state, cx).into_any_element();
         running.push(
             op_row(
                 cx.theme().accent,

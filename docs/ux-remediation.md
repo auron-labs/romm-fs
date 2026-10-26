@@ -1,5 +1,42 @@
 # UI and UX remediation
 
+## Product polish — 26 October 2026
+
+This pass improves the existing working application without requiring another
+human test round before making UX changes.
+
+- Overview now uses readable, full-width sections for games, RetroBat, saves,
+  and artwork. Primary actions wrap at smaller window sizes; library counts
+  and optional details no longer compete with the main task.
+- Artwork checking, publication, waiting for file access, failure, and success
+  share one event-derived summary across Overview and Activity. Completing
+  image checks no longer looks like completing the whole update. Waiting has
+  an explanation and no animated progress bar.
+- Errors use the shared plain-language explanations with full diagnostics
+  behind Technical details. Folder settings opens the actual settings page;
+  setup and locked settings explain the next available action.
+- The window restores focus to the visible tab order when a page change
+  removes the focused control. Native Tab and Enter navigation now survives
+  transitions from setup to Overview and Settings.
+- The README explains the roles of RomM, RomMFS, and RetroBat. The user guide
+  starts with everyday tasks; the architecture guide explains how to follow a
+  user action through the code.
+
+Verification: **385 portable tests passed**, including new coverage for
+artwork publication/waiting/failure transitions and the unverified-save
+explanation. Formatting, host UI compilation, portable Clippy, and UI-enabled
+Clippy passed. Rendered the native GPUI screens in an isolated Linux/Xvfb
+source copy with seeded state at 1160×920 and 720×480. Checked disclosures,
+folder-settings navigation, and keyboard activation with assertions, and
+inspected setup, Overview, Saves, Activity, Settings, and artwork progress,
+waiting, and failure states.
+
+The preview used isolated settings and an inert event drain. These checks
+cover presentation and navigation; they are not a new Windows runtime run.
+They do not establish the cause of file locks, deleted RetroBat links, or the
+reported Windows latency. Mount ownership, lazy ROM reads, save consent, and
+worker behavior retain their existing contracts.
+
 ## Implementation progress — 17 October 2026
 
 Current step: implementation complete; native Windows acceptance remains outstanding. This record describes the working tree

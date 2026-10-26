@@ -1,9 +1,42 @@
 # RomMFS
 
-Windows-first proof of concept that mounts a [RomM](https://romm.app)
-library as ordinary filesystem paths (e.g. `C:\RomM\nes\Example Game.nes`)
-with **Generic folders** and **RetroBat** layouts — while ROM
-bytes only download the first time something actually reads them.
+RomMFS connects your RomM library to a folder on your Windows PC. RetroBat or
+another emulator reads games from that folder. The first read downloads the
+file; subsequent reads use cached data. Your library stays on your RomM server.
+
+## Everyday use
+
+Open **Overview** to see whether your games are available and what needs your
+attention. Choose **Make games available**, then open RetroBat or your emulator
+to play. Keep RomMFS running for the games folder to remain available.
+
+| Screen | Use it to |
+|---|---|
+| **Overview** | Start or stop the games folder, open it, and check library, RetroBat, save, and artwork status. |
+| **Saves** | Turn on automatic save sync, see your saves, and review changes that need a decision. |
+| **Activity** | See current work and recent results. Expand **Technical log** when troubleshooting. |
+| **Settings** | Change your connection, folder, RetroBat installation, and application preferences. |
+
+- **Available** means the games folder is ready to use. It does not mean every
+  game has been downloaded or is ready for offline play.
+- **Library changes are ready** means RomMFS found a library update. Finish
+  playing before choosing **Apply library changes**, which restarts the folder.
+- **Artwork: Updating…** includes checking images and writing game information
+  into RetroBat. Finished image checks do not mean the whole update is finished.
+- **Artwork: Waiting for access** means RetroBat files are unavailable for the
+  update. Close RetroBat or its emulators if they are open. RomMFS retries
+  automatically; the games folder can remain available while it waits.
+- **Saves: Off** means automatic save sync is disabled. Enable it in **Saves**
+  after selecting the save folder or RetroBat installation you want to use.
+
+**Folder settings** on Overview opens the place to change your games folder.
+Some settings require stopping the folder first; the page explains this and
+provides **Stop games folder**. Finish playing before stopping it.
+
+If an action fails, read its explanation and use the nearby action to recover.
+**Technical details** keeps the full diagnostic message available to copy.
+
+## Build and compatibility
 
 Built as a Rust workspace; uses Windows' built-in **Cloud Files API (CFAPI)**
 through a custom `windows-sys` adapter and shows one small **GPUI** window.
@@ -38,13 +71,13 @@ This checkout is under development. The [dated validation record](validation/202
 ## Run
 
 ```bash
-cargo run -p rommfs-app
+cargo run --locked -p rommfs-app
 ```
 
 Enter the server URL and choose **Sign in with browser**. Approve the pairing
 in RomM. Windows remembers the paired secret in Credential Manager; password
 sign-in remains available but is not remembered. Choose a mount root
-(an empty directory, or one RomMFS previously claimed), press **Start games folder**.
+(an empty directory, or one RomMFS previously claimed), press **Make games available**.
 The ownership marker is stored beside the mount directory as
 `<folder>.rommfs-root`; keep it for subsequent mounts.
 Read-only ROM files appear per platform; reading a file downloads it once
@@ -64,7 +97,7 @@ the login-startup entry, and cancels its active work.
 
 Authentication precedes cached-catalogue restoration. A warm connection uses the
 last complete account-scoped snapshot and schedules one background refresh.
-**Refresh library** also requests fresh metadata. Starting/remounting reuses the
+**Check for library changes** also requests fresh metadata. Starting/remounting reuses the
 loaded catalogue rather than fetching it twice. Structural changes take effect
 on the next mount; a failed refresh retains the previous complete snapshot.
 
@@ -422,13 +455,9 @@ live RomM server.
 
 ## Development notes
 
-- Custom CFAPI adapter via `windows-sys`; implementation and outstanding native
-  checks are recorded in [validation record](validation/2026-10-12.md); the original
-  decision is preserved in [the archive](../.scratch/archived/planning/BACKEND-DECISION.md).
-- The [approved scope](../.scratch/archived/planning/PLAN.md) and original
-  [source spec](../.scratch/archived/planning/PRD.md) are archived; current behavior and
-  remaining validation are recorded in the dated validation record above.
-- Format all crates with `cargo fmt --all`. On Windows, lint the full workspace
-  with `cargo clippy --workspace --all-targets`; on other platforms, lint the
-  portable crates and headless app with
-  `cargo clippy -p rommfs-core -p rommfs-fixture -p rommfs-cfapi -p rommfs-app --no-default-features --all-targets`.
+- [Architecture](architecture.md) explains the crate boundaries, the CFAPI
+  adapter, and how a user action reaches the controller and workers.
+- [Development](development.md) contains the build, formatting, test, and lint
+  commands for contributors.
+- The [dated validation record](validation/2026-10-12.md) records executed
+  checks and their platform limits.

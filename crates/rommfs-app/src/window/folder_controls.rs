@@ -11,7 +11,7 @@ impl RommfsWindow {
     /// falls back to a raw database id (UI-PLAN §Settings > Connection).
     pub(super) fn render_connection(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let conn = self.state.conn;
@@ -65,7 +65,10 @@ impl RommfsWindow {
                         .child(Button::new("connect").label("Connect with password")
                             .on_click(cx.listener(|view,_,_,cx| view.on_connect(cx)))))))
             .when_some(self.state.pairing_code.clone(), |this, code| this.child(muted(format!("Approve RomMFS in your browser · code {code}"), cx)))
-            .when_some(self.state.conn_error.clone(), |this,error| this.child(error_line(error,cx)))
+            .when_some(self.state.conn_error.clone(), |this, error| this.child(failure_block(
+                "connection-failure", "Couldn't connect to RomM", failure_explanation(&error),
+                None, error, window, cx,
+            )))
     }
     /// Generic-folders vs RetroBat — the same choice in Settings > Folders
     /// and the first-run folder step.
@@ -237,118 +240,85 @@ impl RommfsWindow {
             .clone()
             .or_else(|| self.state.configured_mount_root.clone())
             .or_else(|| {
-                // A loaded library with no reported path: use the folder
-                // Settings shows rather than asking for setup again.
                 let typed = self.mount_input.read(cx).value().trim().to_string();
                 (summary != FolderSummary::SetupNeeded && !typed.is_empty()).then_some(typed)
             });
         let ready = summary == FolderSummary::Ready;
         let connected = self.state.conn == ConnectionState::Connected;
-        // With the RetroBat layout, a start that the setup check would refuse is
-        // not offered: run the update (migration) or finish setup first.
-        let start_blocked_reason = if !connected {
-            Some("Connect to RomM first.")
-        } else if self.state.retrobat_setup_migration && !self.state.retrobat_setup_ok {
-            Some("Run the RetroBat update first.")
-        } else if self.state.integration == IntegrationMode::RetroBat
-            && !self.state.retrobat_setup_ok
+        let needs_retrobat = (self.state.retrobat_setup_migration
+            || self.state.integration == IntegrationMode::RetroBat)
+            && !self.state.retrobat_setup_ok;
+        let primary = if matches!(summary, FolderSummary::Stopped | FolderSummary::Failed)
+            && !connected
         {
-            Some("Finish setting up RetroBat first.")
+            Some(self.settings_nav_button("overview-connect", "Connect to RomM", 0, true, cx))
+        } else if matches!(summary, FolderSummary::Stopped | FolderSummary::Failed)
+            && needs_retrobat
+        {
+            Some(self.settings_nav_button(
+                "overview-finish-retrobat",
+                "Finish RetroBat setup",
+                2,
+                true,
+                cx,
+            ))
         } else {
-            None
-        };
-        let retro_setup_pending = start_blocked_reason.is_some();
-
-        // The primary action this state offers (UI-PLAN §3 truth table).
-        let primary: Option<Button> = match summary {
-            FolderSummary::SetupNeeded => {
-                Some(self.settings_nav_button("overview-setup-folder", "Finish setup", 1, true, cx))
+            match summary {
+                FolderSummary::SetupNeeded => Some(self.settings_nav_button("overview-setup-folder", "Choose games folder", 1, true, cx)),
+                FolderSummary::Stopped | FolderSummary::Failed => configured.clone().map(|path| {
+                    Button::new("start-mount")
+                        .icon(Icon::new(IconName::Play))
+                        .label(if summary == FolderSummary::Failed { "Try again" } else { "Make games available" })
+                        .primary()
+                        .on_click(cx.listener(move |view, _, _, cx| view.start_mount(path.clone(), cx)))
+                }),
+                FolderSummary::Ready => configured.clone().map(|path| {
+                    Button::new("open-mount")
+                        .icon(Icon::new(IconName::FolderOpen))
+                        .label("Open games folder")
+                        .outline()
+                        .disabled(self.state.mount_stopping)
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.state.folder_open_error = crate::desktop::open_games_folder(std::path::Path::new(&path))
+                                .err().map(|error| format!("Couldn't open the games folder. Check the configured folder in Settings. {error}"));
+                            cx.notify();
+                        }))
+                }),
+                FolderSummary::Starting => Some(Button::new("start-mount").label("Preparing games…").primary().disabled(true)),
             }
-            FolderSummary::Stopped => configured.clone().map(|path| {
-                let start = Button::new("start-mount")
-                    .icon(Icon::new(IconName::Play))
-                    .label("Make games available")
-                    .primary()
-                    .disabled(retro_setup_pending)
-                    .on_click(
-                        cx.listener(move |view, _, _, cx| view.start_mount(path.clone(), cx)),
-                    );
-                match start_blocked_reason {
-                    Some(reason) => start.tooltip(reason),
-                    None => start,
-                }
-            }),
-            FolderSummary::Ready => configured.clone().map(|path| {
-                Button::new("open-mount")
-                    .icon(Icon::new(IconName::FolderOpen))
-                    .label("Open games folder")
-                    .primary()
-                    .disabled(self.state.mount_stopping)
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.state.folder_open_error = crate::desktop::open_games_folder(std::path::Path::new(&path)).err().map(|error| format!("Couldn't open the games folder. Check the configured folder in Settings. {error}"));
-                        cx.notify();
-                    }))
-            }),
-            // Failed renders no row action — the Retry lives inside the
-            // failure block next to its reason (UI-PLAN §6).
-            FolderSummary::Starting => Some(Button::new("start-mount").label("Preparing games…").primary().disabled(true)),
-            FolderSummary::Failed => configured.clone().map(|path| Button::new("start-mount").label("Make games available").primary().disabled(retro_setup_pending).on_click(cx.listener(move |view, _, _, cx| view.start_mount(path.clone(), cx)))),
         };
-
-        card(cx)
-            .p_4()
-            .child(
-        v_flex()
-            .gap_3()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Games folder"))
-                    .child(status_pill(mount_kind, mount_text, cx)),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .when_some(configured, |this, path| {
-                        let text = window.use_keyed_state(SharedString::from(format!("games-folder-path-{path}")), cx, |window, cx| InputState::new(window, cx).default_value(path));
-                        this.child(div().flex_1().min_w_0().child(Input::new(&text).readonly(true).w_full()))
-                            .child(
-                                Button::new("browse-games-folder")
-                                    .icon(Icon::new(IconName::FolderOpen))
-                                    .label("Browse")
-                                    .outline()
-                                    .on_click(cx.listener(|view, _, _, cx| view.browse_games_folder(cx))),
-                            )
-                    }),
-            )
-            .child(muted("Your RomM games appear in this folder. Game data downloads when an emulator or another program reads a game file.", cx))
-            .when_some(self.state.folder_open_error.clone(), |this, error| this.child(error_line(error, cx)))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .when_some(primary, |this, button| this.child(button))
-                    .when(ready, |this| {
-                        this.child(
+        let description = if ready {
+            "Your games are available to emulators and frontends. Keep RomMFS running while you play."
+        } else if needs_retrobat {
+            "Finish connecting RetroBat to your library, then make your games available."
+        } else {
+            "Your RomM library appears as a folder on this PC. Game files download when opened."
+        };
+        card(cx).p_4().child(
+            v_flex().gap_3()
+                .child(status_row("Games", mount_kind, mount_text, None, cx))
+                .when_some(self.state.catalogue, |this, (platforms, games, _, _)| {
+                    this.child(div().text_lg().font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("{} games · {}", fmt_count(games), plural(platforms, "platform"))))
+                })
+                .child(muted(description, cx))
+                .child(
+                    h_flex().gap_2().flex_wrap().items_center()
+                        .when_some(primary, |this, button| this.child(button))
+                        .when(ready, |this| this.child(
                             Button::new("stop-mount")
                                 .icon(Icon::new(IconName::Square))
                                 .label(if self.state.mount_stopping { "Stopping…" } else { "Stop" })
                                 .accessibility_label("Stop games folder")
                                 .disabled(self.state.mount_stopping)
                                 .outline()
-                                .tooltip(
-                                    "Stopping interrupts game file access and removes owned game entries. Private cached game data is retained.",
-                                )
+                                .tooltip("Finish playing first. Stopping makes the games folder unavailable; downloaded game data stays cached.")
                                 .on_click(cx.listener(|view, _, _, cx| view.on_stop_mount(cx))),
-                        )
-                    })
-                    .when(connected, |this| {
-                        this.child(
+                        ))
+                        .when(connected, |this| this.child(
                             Button::new("refresh-catalogue")
                                 .icon(Icon::new(IconName::RefreshCw))
-                                .label("Check for library changes")
+                                .label(if self.state.catalogue_progress.is_some() { "Checking library…" } else { "Check for library changes" })
                                 .disabled(self.state.catalogue_progress.is_some() || summary == FolderSummary::Starting || self.state.mount_stopping)
                                 .outline()
                                 .on_click(cx.listener(|view, _, _, cx| {
@@ -356,134 +326,69 @@ impl RommfsWindow {
                                     view.controller.send(Command::RefreshCatalogue);
                                     cx.notify();
                                 })),
-                        )
-                    }),
-            )
-            .when_some(self.state.mount_error.clone(), |this, error| {
-                let retry =
-                    self.state
-                        .mount_path
-                        .clone()
-                        .or_else(|| self.state.configured_mount_root.clone())
-                        .map(|path| {
-                            Button::new("retry-mount")
-                                .label("Retry")
-                                .primary()
-                                .small()
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.start_mount(path.clone(), cx)
-                                }))
-                        });
-                this.child(failure_block(
-                    "mount-failure",
-                    "Couldn't start the games folder",
-                    failure_explanation(&error),
-                    retry,
-                    error,
-                    window,
-                    cx,
-                ))
-            })
-            .when_some(self.render_foreign_remediation(cx), |this, block| {
-                this.child(block)
-            })
-            .when_some(
-                self.state.catalogue,
-                |this, (platforms, games, files, skipped)| {
-                    this.child(muted(
-                        format!(
-                            "{} · {} games · {} files",
-                            plural(platforms, "platform"),
-                            fmt_count(games),
-                            fmt_count(files),
-                        ),
-                        cx,
-                    ))
-                    .when(skipped > 0, |this| {
-                        this.child(banner(
-                            StatusKind::Warning,
-                            IconName::TriangleAlert,
-                            format!(
-                                "{} aren't shown in the games folder",
-                                plural(skipped, "item")
-                            ),
-                            Some(
-                                Button::new("library-skipped-activity")
-                                    .label("View in Activity")
-                                    .warning()
-                                    .small()
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        view.active_view = 2;
-                                        cx.notify();
-                                    })),
-                            ),
-                            cx,
-                        ))
-                    })
-                    .child(text_disclosure("library-details", "Library details", format!("{} original file entries are shown in the games folder. {} projection omissions combine whole-game and individual-file omissions. Causes include missing server data, unsupported platform/category destinations, or invalid names and paths. See catalogue warnings in Activity for each reason.", fmt_count(files), fmt_count(skipped)), window, cx))
-                },
-            )
-            .when_some(self.state.catalogue_refreshed_at, |this, timestamp| {
-                this.child(muted(
-                    format!("Last library check: {}", relative_time(timestamp)),
-                    cx,
-                ))
-            })
-            .when(self.state.catalogue_pending_remount, |this| {
-                let restart = self
-                    .state
-                    .mount_path
-                    .clone()
-                    .or_else(|| self.state.configured_mount_root.clone());
-                this.child(muted("Applying changes restarts the games folder and temporarily interrupts file access. Finish playing first.", cx)).child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(status_marker(StatusKind::Warning, "Library changes are ready to apply", cx))
-                        .when_some(restart, |this, path| {
-                            this.child(
-                                Button::new("restart-mount")
-                                    .label("Apply library changes")
-                                    .disabled(self.state.mount_stopping || summary == FolderSummary::Starting)
-                                    .outline()
-                                    .small()
-                                    .on_click(cx.listener(move |view, _, _, cx| {
-                                        view.state.request_mount(path.clone());
-                                        view.controller.send(Command::RestartMount { path: path.clone() });
-                                        cx.notify();
-                                    })),
-                            )
-                        }),
+                        )),
                 )
-            })
-            .when_some(
-                self.state.catalogue_progress.clone(),
-                |this, (_stage, completed, total, elapsed)| {
-                    // §3 copy: the refresh is "Checking for library changes…" — the
-                    // internal stage name stays in the technical log.
-                    this.child(operation_progress(
-                        "catalogue-progress",
-                        "Checking for library changes…",
-                        completed,
-                        total,
-                        elapsed,
+                .when_some(self.state.mount_error.clone(), |this, error| {
+                    this.child(failure_block("mount-failure", "Couldn't make games available", failure_explanation(&error), None, error, window, cx))
+                })
+                .when_some(self.state.folder_open_error.clone(), |this, error| {
+                    this.child(failure_block("folder-open-failure", "Couldn't open the games folder", failure_explanation(&error), None, error, window, cx))
+                })
+                .when_some(self.render_foreign_remediation(cx), |this, block| this.child(block))
+                .when_some(self.state.catalogue_progress.clone(), |this, (_, completed, total, elapsed)| {
+                    this.child(operation_progress("catalogue-progress", "Checking for library changes…", completed, total, elapsed, cx))
+                })
+                .when(summary == FolderSummary::Starting, |this| {
+                    match self.state.mount_progress.clone() {
+                        Some((stage, completed, total, elapsed)) => this.child(operation_progress("mount-progress", stage_label(&stage), completed, total, elapsed, cx)),
+                        None => this.child(Progress::new("mount-progress").loading(true).small()),
+                    }
+                })
+                .when(self.state.catalogue_pending_remount, |this| {
+                    let restart = self.state.mount_path.clone().or_else(|| self.state.configured_mount_root.clone());
+                    this.child(banner(
+                        StatusKind::Warning,
+                        IconName::RefreshCw,
+                        "Library changes are ready. Finish playing before applying them; the games folder will restart.",
+                        restart.map(|path| Button::new("restart-mount")
+                            .label("Apply library changes")
+                            .disabled(self.state.mount_stopping || summary == FolderSummary::Starting)
+                            .outline().small()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.state.request_mount(path.clone());
+                                view.controller.send(Command::RestartMount { path: path.clone() });
+                                cx.notify();
+                            }))),
                         cx,
                     ))
-                },
-            )
-            .when(summary == FolderSummary::Starting, |this| {
-                match self.state.mount_progress.clone() {
-                    Some((stage, completed, total, elapsed)) => this.child(operation_progress(
-                        "mount-progress",
-                        stage_label(&stage),
-                        completed,
-                        total,
-                        elapsed,
-                        cx,
-                    )),
-                    None => this.child(Progress::new("mount-progress").loading(true).small()),
-                }
-            })
-            )
+                })
+                .when_some(self.state.catalogue, |this, (_, _, files, skipped)| {
+                    this.when(skipped > 0, |this| {
+                        this.child(
+                            h_flex().gap_2().flex_wrap()
+                                .child(muted(format!("{} couldn't be included in this folder.", plural(skipped, "library item")), cx))
+                                .child(Button::new("library-skipped-activity").label("View reasons").outline().small()
+                                    .on_click(cx.listener(|view, _, _, cx| { view.active_view = 2; cx.notify(); }))),
+                        )
+                    })
+                    .child(notes_disclosure(
+                        "library-details", "Library details".into(),
+                        vec![
+                            format!("{} game files are listed. Listing a file doesn't download it.", fmt_count(files)),
+                            format!("{} couldn't be included. This counts both whole games and individual files; it isn't a count of missing games.", plural(skipped, "library item")),
+                            "Items may be unavailable because of missing information in RomM, unsupported systems or file types, or names Windows can't use. Activity has the individual reasons.".into(),
+                        ], window, cx,
+                    ))
+                })
+                .when_some(configured, |this, path| {
+                    let text = window.use_keyed_state(SharedString::from(format!("games-folder-path-{path}")), cx, |window, cx| InputState::new(window, cx).default_value(path));
+                    this.child(h_flex().gap_2().items_center()
+                        .child(div().flex_1().min_w_0().child(Input::new(&text).readonly(true).w_full()))
+                        .child(self.settings_nav_button("overview-folder-settings", "Folder settings", 1, false, cx)))
+                })
+                .when_some(self.state.catalogue_refreshed_at, |this, timestamp| {
+                    this.child(muted_xs(format!("Library checked {}", relative_time(timestamp)), cx))
+                }),
+        )
     }
 }

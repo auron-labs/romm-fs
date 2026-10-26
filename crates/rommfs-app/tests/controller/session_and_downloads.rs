@@ -455,3 +455,86 @@ fn metadata_progress_tracks_the_active_pass_only() {
     ui.apply_event(&progress(3, 1));
     assert_eq!(ui.frontend_metadata_progress, Some((1, 10)));
 }
+
+#[test]
+fn artwork_completion_waits_for_publication_and_reports_blocked_updates() {
+    use rommfs_app::controller::FrontendMetadataSummary;
+
+    let mut ui = UiState::new(64);
+    assert_eq!(
+        ui.frontend_metadata_summary(),
+        FrontendMetadataSummary::NotStarted
+    );
+    ui.apply_event(&AppEvent::FrontendMetadata {
+        job_id: 1,
+        pending: true,
+        detail: "Fetching artwork".into(),
+        error: None,
+    });
+    assert_eq!(
+        ui.frontend_metadata_summary(),
+        FrontendMetadataSummary::CheckingArtwork
+    );
+    ui.apply_event(&AppEvent::FrontendMetadataProgress {
+        job_id: 1,
+        completed: 10,
+        total: 10,
+    });
+    assert_eq!(
+        ui.frontend_metadata_summary(),
+        FrontendMetadataSummary::Publishing
+    );
+    assert!(ui.frontend_metadata_updated_at.is_none());
+
+    ui.apply_event(&AppEvent::FrontendMetadata {
+        job_id: 1,
+        pending: true,
+        detail: "Waiting for exclusive access to RetroBat files".into(),
+        error: Some("File in use (os error 32)".into()),
+    });
+    assert_eq!(
+        ui.frontend_metadata_summary(),
+        FrontendMetadataSummary::Waiting
+    );
+    ui.apply_event(&AppEvent::FrontendMetadata {
+        job_id: 1,
+        pending: true,
+        detail: "Preparing game information".into(),
+        error: None,
+    });
+    assert_eq!(
+        ui.frontend_metadata_summary(),
+        FrontendMetadataSummary::Publishing
+    );
+    ui.apply_event(&AppEvent::FrontendMetadata {
+        job_id: 1,
+        pending: false,
+        detail: "Published".into(),
+        error: None,
+    });
+    assert_eq!(
+        ui.frontend_metadata_summary(),
+        FrontendMetadataSummary::UpToDate
+    );
+
+    ui.apply_event(&AppEvent::FrontendMetadata {
+        job_id: 2,
+        pending: true,
+        detail: "Fetching artwork".into(),
+        error: None,
+    });
+    assert_eq!(
+        ui.frontend_metadata_summary(),
+        FrontendMetadataSummary::CheckingArtwork
+    );
+    ui.apply_event(&AppEvent::FrontendMetadata {
+        job_id: 2,
+        pending: false,
+        detail: "Update failed".into(),
+        error: Some("Couldn't reach RomM".into()),
+    });
+    assert_eq!(
+        ui.frontend_metadata_summary(),
+        FrontendMetadataSummary::Failed
+    );
+}

@@ -26,7 +26,7 @@ const NEEDS_ADMIN: &str = "Windows needs permission to finish this operation. Re
 const LINK_PRIVILEGE: &str = "Windows didn't allow RomMFS to create folder links. Retry Set up RetroBat and approve the Windows permission prompt.";
 const ACCESS_DENIED: &str = "Windows denied access to a file or folder. Close RetroBat and its emulators, make sure you can change that folder, then retry.";
 const FILE_IN_USE: &str =
-    "A file is in use by another program. Close RetroBat and its emulators, then retry.";
+    "Another program is using a file RomMFS needs. Close RetroBat or its emulators if they are open. If they are already closed, wait a moment and try again.";
 const SIGN_IN: &str = "RomM rejected the sign-in or it has expired. Sign in again.";
 const FORBIDDEN: &str =
     "RomM didn't allow this account to do that. Check the account's permissions on the server.";
@@ -167,6 +167,9 @@ fn explain_text(raw: &str) -> String {
         return text.into();
     }
     let lower = raw.to_ascii_lowercase();
+    if lower.contains("outside the verified owned revision format") {
+        return "A save on RomM couldn't be verified for automatic sync. It hasn't replaced your local save. Review it in Saves.".into();
+    }
     if lower.contains("authentication failed:") {
         return SIGN_IN.into();
     }
@@ -313,6 +316,17 @@ mod tests {
             unsupported.cause.as_deref(),
             Some("Select a RetroBat installation.")
         );
+    }
+
+    #[test]
+    fn unverified_save_explains_protection_and_keeps_diagnostics() {
+        let raw = "RomM returned 1 save record(s) outside the verified owned revision format; no remote file was adopted";
+        let problem = UserProblem::from_text("Save needs review", raw);
+        let explanation = problem.cause.unwrap();
+        assert!(explanation.contains("hasn't replaced your local save"));
+        assert!(explanation.contains("Review it in Saves"));
+        assert!(!explanation.contains("revision format"));
+        assert_eq!(problem.technical.as_deref(), Some(raw));
     }
 
     #[test]

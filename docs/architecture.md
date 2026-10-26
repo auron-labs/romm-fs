@@ -3,6 +3,24 @@
 This page describes the current workspace as implemented. It is a navigation
 map, not a target design; use the code as the authority when behavior changes.
 
+## Follow a user action
+
+For a UI change, start in `crates/rommfs-app/src/window/pages/`. Each page reads
+`UiState` and sends a `Command`; the window does not download games or sync saves.
+
+For a behavior change, follow that command into the relevant module under
+`crates/rommfs-app/src/controller/`. Workers report events, and
+`controller/state.rs` turns them into the state the pages display. Shared
+folder, save, and artwork summaries live there so different screens agree.
+`problem.rs` translates technical failures into explanations; the original
+message remains available in the UI's technical details.
+
+For example, **Make games available** sends `Command::StartMount`. The mount
+controller prepares the filesystem through core and the platform adapter, then
+reports progress and completion. **Available** comes from the completion event.
+Opening a game later triggers its download through the filesystem; displaying
+the Overview does not read game contents.
+
 ## Crate boundaries
 
 `rommfs-core` contains portable domain and I/O code: RomM HTTP access in

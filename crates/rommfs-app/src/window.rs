@@ -7,7 +7,8 @@
 //! library; the view composes sections and forwards `Command`s.
 
 use crate::controller::{
-    Command, ConnectionState, Controller, FolderSummary, MountState, SaveSyncSummary, UiState,
+    Command, ConnectionState, Controller, FolderSummary, FrontendMetadataSummary, MountState,
+    SaveSyncSummary, UiState,
 };
 use crate::problem::{auxiliary_headline, describe_auxiliary, Severity, UserProblem};
 use gpui_kit::component::scroll::ScrollableElement as _;
@@ -31,9 +32,9 @@ use gpui_kit::component::{
 // The full Lucide catalog (the component IconName is a retained subset).
 use gpui_kit::assets::IconName;
 use gpui_kit::{
-    actions, div, prelude::*, px, size, AnyElement, App, Bounds, ClipboardItem, Context, Entity,
-    Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollHandle, SharedString,
-    Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
+    actions, div, prelude::*, px, rems, size, AnyElement, App, Bounds, ClipboardItem, Context,
+    Entity, Focusable as _, FontWeight, Hsla, KeyBinding, PathPromptOptions, ScrollHandle,
+    SharedString, Subscription, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use rommfs_core::connection_settings::IntegrationMode;
 use rommfs_core::events::{
@@ -258,6 +259,10 @@ impl RommfsWindow {
             cx.new(|cx| InputState::new(window, cx).placeholder("Search saves"));
         let activity_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search log"));
         let mut subscriptions = Vec::new();
+        // A page change can remove the focused control; resume in the visible tab order.
+        subscriptions.push(cx.on_focus_lost(window, |_, window, cx| {
+            window.focus_next(cx);
+        }));
 
         // Enter in a connection field is the section's default commit.
         for input in [&url_input, &user_input, &password_input] {
@@ -677,7 +682,7 @@ impl RommfsWindow {
             SaveSyncSummary::NeedsSetup => "Not set up",
             SaveSyncSummary::Paused => "Paused",
             SaveSyncSummary::Checking => "Checking",
-            SaveSyncSummary::Reconciling => "Reconciling",
+            SaveSyncSummary::Reconciling => "Checking saves",
             SaveSyncSummary::Syncing => "Syncing",
             SaveSyncSummary::NoLinkedFiles => "Nothing to sync",
             SaveSyncSummary::Off => "Off",
@@ -729,7 +734,7 @@ impl RommfsWindow {
             menu = menu.child(item);
         }
         Sidebar::new("app-nav")
-            .w(px(208.))
+            .w_48()
             .collapsible(SidebarCollapsible::None)
             .header(
                 h_flex()
@@ -794,19 +799,19 @@ impl Render for RommfsWindow {
                     v_flex()
                         .p_6()
                         .w_full()
-                        .max_w(px(max_width))
+                        .max_w(rems(max_width))
                         .mx_auto()
                         .child(body),
                 )
         };
         // Log and table views need the extra room; the reading measure stays
         // narrow for prose-heavy pages.
-        let wide = 1440.;
+        let wide = 90.;
         let content = match self.active_view {
             0 => page(
                 0,
                 "overview-view",
-                960.,
+                60.,
                 pages::overview::render(self, window, cx).into_any_element(),
             ),
             1 => page(
@@ -824,7 +829,7 @@ impl Render for RommfsWindow {
             4 => page(
                 4,
                 "setup-view",
-                960.,
+                60.,
                 pages::setup::render(self, window, cx).into_any_element(),
             ),
             // Settings owns its tab bar and per-tab scrolling, so it is not

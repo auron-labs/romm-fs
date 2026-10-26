@@ -1,9 +1,15 @@
 # RomMFS
 
-RomMFS mounts a RomM library as ordinary filesystem paths on Windows. ROM files
-appear as Cloud Files placeholders and download their original bytes when read.
-It supports Generic folders and a RetroBat layout. The project is under
-active development; see [current validation and remaining acceptance](docs/validation/2026-10-12.md).
+RomMFS makes your RomM games available as a Windows folder. Connect your
+server, choose a folder, and use your games in RetroBat or another emulator.
+Game files download when opened and are cached for later use.
+
+- **RomM** stores your library on the server.
+- **RomMFS** connects that library to this PC and keeps the games folder available.
+- **RetroBat or your emulator** browses and plays the games.
+
+Artwork updates and optional save sync run alongside the games folder. Save
+sync is off until you enable it. The project is under active development.
 
 ## Quick start
 
@@ -12,27 +18,21 @@ For a local Windows build, install Rust 1.89 or later with the MSVC toolchain
 and Windows SDK, then run:
 
 ```powershell
-cargo run -p rommfs-app
+cargo run --locked -p rommfs-app
 ```
 
-Connect to a reachable RomM server, choose an empty local NTFS mount root, and
-start the games folder. The first read downloads a file; later reads use cached
-bytes. The mount is read-only.
+1. Enter your RomM server address and choose **Sign in with browser…**.
+   Approve the connection in RomM.
+2. Choose an empty folder on a local NTFS drive for your games.
+3. For RetroBat, follow **Settings → RetroBat** to connect your installation.
+   See the [RetroBat setup guide](docs/user-guide.md#set-up-retrobat).
+4. On **Overview**, choose **Make games available**. When the status becomes
+   **Available**, open RetroBat or point your emulator at the games folder.
 
-## Testing wizard
-
-On a Windows 10/11 desktop, clone this repository and double-click
-`test-wizard.cmd` in its root. The wizard guides the remaining human checks;
-Rust is not required unless you choose its optional automated checks/build.
-It does not automate or prove the full Windows acceptance procedure.
-
-At each prompt, `S` skips and `Q` saves a partial ZIP and quits; run the launcher
-again to resume. `C` asks permission to capture the full desktop, then waits four
-seconds so you can switch to the app. Evidence stays local under
-`%LOCALAPPDATA%\rommfs\test-wizard`; send the resulting ZIP only after reviewing
-its logs and screenshots for private information. Nothing is uploaded, and a
-missing or skipped check is never a pass. For help, use `test-wizard.cmd -Help` or
-`powershell -NoProfile -File .\scripts\windows-test-wizard.ps1 -Help`.
+Keep RomMFS running while you play. The first read downloads a game file;
+later reads use cached bytes. Game files in this folder are read-only.
+See [everyday use](docs/user-guide.md#everyday-use) for saves, updates, and
+what the status messages mean.
 
 ## Workspace
 
@@ -52,4 +52,8 @@ missing or skipped check is never a pass. For help, use `test-wizard.cmd -Help` 
 - [Windows testing](docs/testing/windows.md): native acceptance procedure and report format.
 - [Dated validation record](docs/validation/2026-10-12.md): implementation status and recorded Linux/Windows evidence.
 
-Planning proposals and superseded decisions are retained under `.scratch/archived/`.
+## Testing wizard
+
+Contributors can run `test-wizard.cmd` on Windows for guided checks and local
+evidence collection. See [Windows testing](docs/testing/windows.md) for the
+procedure, resume/skip controls, and screenshot privacy information.

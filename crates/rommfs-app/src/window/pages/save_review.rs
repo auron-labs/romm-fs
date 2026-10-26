@@ -334,7 +334,7 @@ impl RommfsWindow {
                     .flex_wrap()
                     .child(muted_xs(
                         format!(
-                            "{} tracked · {} eligible unlinked saves",
+                            "{} tracked · {} not linked to a game",
                             plural(self.state.save_sync_mapped_targets, "save"),
                             fmt_count(self.state.save_sync_catalogue_unmapped)
                         ),
@@ -373,15 +373,20 @@ impl RommfsWindow {
             body = body.child(muted_xs("Save sync needs a save folder.", cx));
         }
         if let Some(problem) = paused {
-            body = body.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().warning)
-                    .child(format!("Paused: {problem}")),
-            );
+            body = body
+                .child(muted(failure_explanation(&problem), cx))
+                .child(details_disclosure("save-sync-paused", problem, window, cx));
         }
         if let Some(failure) = failure {
-            body = body.child(error_line(format!("Last failure: {failure}"), cx));
+            body = body.child(failure_block(
+                "save-sync-failure",
+                "Save sync needs attention",
+                failure_explanation(&failure),
+                None,
+                failure,
+                window,
+                cx,
+            ));
         }
         Some(card(cx).p_4().child(body).into_any_element())
     }

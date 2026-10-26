@@ -47,6 +47,17 @@ impl FolderSummary {
     }
 }
 
+/// Artwork checking is only the first stage; RetroBat must also receive the update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrontendMetadataSummary {
+    NotStarted,
+    CheckingArtwork,
+    Publishing,
+    Waiting,
+    Failed,
+    UpToDate,
+}
+
 /// Where one step of the RetroBat flow stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepStatus {
@@ -1162,6 +1173,27 @@ impl UiState {
             .iter()
             .filter(|file| !file.mappable)
             .count()
+    }
+
+    pub fn frontend_metadata_summary(&self) -> FrontendMetadataSummary {
+        if self.frontend_metadata_pending {
+            if self.frontend_metadata_error.is_some() {
+                FrontendMetadataSummary::Waiting
+            } else if self
+                .frontend_metadata_progress
+                .is_some_and(|(completed, total)| completed >= total)
+            {
+                FrontendMetadataSummary::Publishing
+            } else {
+                FrontendMetadataSummary::CheckingArtwork
+            }
+        } else if self.frontend_metadata_error.is_some() {
+            FrontendMetadataSummary::Failed
+        } else if self.frontend_metadata_updated_at.is_some() {
+            FrontendMetadataSummary::UpToDate
+        } else {
+            FrontendMetadataSummary::NotStarted
+        }
     }
 
     /// The save-sync problem worth interrupting the user for. Save sync is

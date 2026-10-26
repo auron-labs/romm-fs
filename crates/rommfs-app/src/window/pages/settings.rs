@@ -4,7 +4,7 @@ use rommfs_core::retrobat::SkippedSystem;
 
 /// The Settings tabs (phase 2c). The selected index lives in view state.
 const SETTINGS_TABS: [&str; 5] = [
-    "RomM connection",
+    "Connection",
     "Games folder",
     "RetroBat",
     "Saves",
@@ -40,12 +40,12 @@ impl RommfsWindow {
                 div().w_full().px_6().pt_6().pb_3().child(
                     v_flex()
                         .w_full()
-                        .max_w(px(960.))
+                        .max_w(rems(60.))
                         .mx_auto()
                         .gap_4()
                         .child(page_header(
                             "Settings",
-                            "Connection, games folder, RetroBat, and save options.",
+                            "Choose how RomMFS works on this PC.",
                             None,
                             cx,
                         ))
@@ -77,7 +77,7 @@ impl RommfsWindow {
                     .child(
                         div()
                             .w_full()
-                            .max_w(px(960.))
+                            .max_w(rems(60.))
                             .mx_auto()
                             .px_6()
                             .pb_6()
@@ -102,19 +102,32 @@ impl RommfsWindow {
         if !running && !busy {
             return None;
         }
-        let mut row = h_flex().gap_2().items_center().child(status_marker(
-            StatusKind::Warning,
-            if running {
-                "Games folder running"
-            } else {
-                "Setup in progress"
-            },
-            cx,
-        ));
+        let mut row = h_flex()
+            .gap_2()
+            .flex_wrap()
+            .items_center()
+            .child(status_marker(
+                StatusKind::Warning,
+                if self.state.mount_stopping {
+                    "Stopping the games folder…"
+                } else if self.state.mount == MountState::Mounting {
+                    "Wait for games to finish preparing before changing these settings."
+                } else if running {
+                    "Finish playing, then stop the games folder to change these settings."
+                } else {
+                    "Settings are available after setup finishes."
+                },
+                cx,
+            ));
         if running {
             row = row.child(
                 Button::new("settings-lock-stop")
-                    .label("Stop")
+                    .label(if self.state.mount_stopping {
+                        "Stopping…"
+                    } else {
+                        "Stop games folder"
+                    })
+                    .disabled(self.state.mount_stopping || self.state.mount == MountState::Mounting)
                     .outline()
                     .small()
                     .on_click(cx.listener(|view, _, _, cx| view.on_stop_mount(cx))),
@@ -369,7 +382,7 @@ impl RommfsWindow {
             )
     }
 
-    /// One step card. Done steps collapse to a row with a Redo action until
+    /// One step card. Done steps collapse to a row with a Details action until
     /// the user expands them again.
     fn retrobat_step(
         &mut self,
@@ -396,6 +409,7 @@ impl RommfsWindow {
                 None => (StatusKind::Success, "Done".into()),
             };
             return h_flex()
+                .flex_wrap()
                 .justify_between()
                 .gap_3()
                 .p_3()
@@ -414,7 +428,7 @@ impl RommfsWindow {
                         .child(status_marker(kind, text, cx))
                         .child(
                             Button::new(format!("retrobat-redo-{index}"))
-                                .label("Redo")
+                                .label("Details")
                                 .ghost()
                                 .small()
                                 .on_click(cx.listener(move |_, _, _, cx| {
@@ -972,7 +986,7 @@ impl RommfsWindow {
                     .when_some(restored, |this, (note, lines)| {
                         this.child(muted(note, cx)).child(notes_disclosure(
                             "setup-notes",
-                            "Show details".into(),
+                            "Setup details".into(),
                             lines,
                             window,
                             cx,
@@ -1078,7 +1092,7 @@ impl RommfsWindow {
                             .when_some(note, |this, _| {
                                 this.child(notes_disclosure(
                                     "auxiliary-notes",
-                                    "What needs attention".into(),
+                                    "Items needing attention".into(),
                                     lines,
                                     window,
                                     cx,
