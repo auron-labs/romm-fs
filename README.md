@@ -52,4 +52,4 @@ missing or skipped check is never a pass. For help, use `test-wizard.cmd -Help` 
 - [Windows testing](docs/testing/windows.md): native acceptance procedure and report format.
 - [Dated validation record](docs/validation/2026-10-12.md): implementation status and recorded Linux/Windows evidence.
 
-Planning proposals and superseded decisions are retained under `.planning/archived/`.
+Planning proposals and superseded decisions are retained under `.scratch/archived/`.

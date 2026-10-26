@@ -138,3 +138,4 @@ $RECYCLE.BIN/
 
 # Generated local RomM development library.
 /romm/
+!.scratch

@@ -777,7 +777,7 @@ not a complete zero-file result. Legacy GB-profile tests cover migration only.
 
 Run these after the basic mount checks. Use either the generated demo server or
 the committed harness, and record which URL/account/root each case uses. These
-cases cover [UI-PLAN tasks 1–6](../../.planning/archived/UI-PLAN.md#7-implementation-order)
+cases cover [UI-PLAN tasks 1–6](../../.scratch/archived/planning/UI-PLAN.md#7-implementation-order)
 and the final folder/session fixes in the merged branch. They are acceptance
 targets, not a claim that the current checkout passes them.
 
@@ -1004,6 +1004,6 @@ backing up valid saves/configuration. Stop at deadlines, report residual
 blockers, and do not give an overall `PASS` while a required runtime case is
 blocked or not run.
 
-Use [the approved save-sync scope](../../.planning/archived/PLAN.md#step-6--generalize-save-synchronization) for acceptance contracts
+Use [the approved save-sync scope](../../.scratch/archived/planning/PLAN.md#step-6--generalize-save-synchronization) for acceptance contracts
 and [user guide](../user-guide.md) for supported behavior. Preserve historical
 verification statements unless this run supplies evidence to update them.

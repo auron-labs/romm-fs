@@ -3,7 +3,7 @@
 Start with this file, then read only the task-specific code and tests below.
 The root README is the entry point for people; current implementation facts
 belong in `docs/architecture.md`, `docs/development.md`, and the linked
-contracts/validation records. `.planning/archived/` contains historical plans,
+contracts/validation records. `.scratch/archived/` contains historical plans,
 not current behavior.
 
 ## Workspace map
@@ -109,7 +109,7 @@ they are repository-relative.
   supported to reduce pressure on native filesystem watchers. These commands
   are starting points, not proof of native Windows behavior. Record platform
   limitations in the task handoff.
-- Do not edit `.planning/archived/` to make historical plans appear current.
+- Do not edit `.scratch/archived/` to make historical plans appear current.
   Update canonical docs when current behavior changes.
 - For GPUI work, read `.agents/skills/gpui-kit/SKILL.md` and
   `.agents/skills/gpui-kit-design-guides/SKILL.md` as relevant. For Rust

@@ -79,7 +79,7 @@ Live consent and live server data have not been changed.
   preparing/stopping/off/closing states, and one affected save with six remote
   review versions. Inspected 1162×952 and 720×480 logical windows and simulated
   X11 scaling at 125%/150%. Pointer expansion followed by Enter collapse kept
-  visible row focus. Local captures are in `.scratch/ux-remediation-preview/`.
+  visible row focus. Local captures are in `.scratch/archived/ux-remediation-preview/`.
   The preview's event drain was inert, so these screenshots do not validate
   real worker completion, native shell behavior, or Windows accessibility.
 - Source inspection confirmed that legacy `save_sync_profile_version` comes

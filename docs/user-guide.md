@@ -424,9 +424,9 @@ live RomM server.
 
 - Custom CFAPI adapter via `windows-sys`; implementation and outstanding native
   checks are recorded in [validation record](validation/2026-10-12.md); the original
-  decision is preserved in [the archive](../.planning/archived/BACKEND-DECISION.md).
-- The [approved scope](../.planning/archived/PLAN.md) and original
-  [source spec](../.planning/archived/PRD.md) are archived; current behavior and
+  decision is preserved in [the archive](../.scratch/archived/planning/BACKEND-DECISION.md).
+- The [approved scope](../.scratch/archived/planning/PLAN.md) and original
+  [source spec](../.scratch/archived/planning/PRD.md) are archived; current behavior and
   remaining validation are recorded in the dated validation record above.
 - Format all crates with `cargo fmt --all`. On Windows, lint the full workspace
   with `cargo clippy --workspace --all-targets`; on other platforms, lint the

@@ -1,5 +1,11 @@
 # RomMFS improvement implementation plan
 
+Status review, 2026-10-24: retain this as the improvement backlog. The immediate
+follow-up is the [Windows report fixes](../.scratch/windows-report-fixes-2026-10-24/spec.md).
+See [planning and evidence status](IMPLEMENTATION-STATUS.md) for completed work,
+test results and remaining native acceptance; the roadmap below is not a
+completion record.
+
 Implement the recommendations as small, independently useful changes to the
 existing download, cache, controller, save actor, and RetroBat integration.
 Start with ROM integrity, save-history traffic, and conflict resolution. Add
@@ -8,12 +14,15 @@ emulator coverage after those fixes, then the larger convenience features.
 This is an implementation plan, not a record of completed changes. It is based
 on the current working tree at `4b95a63`, reviewed on 2026-10-17, and these inputs:
 
-- [Project improvement review](../codex-session-01a13e24-09d8-7313-8c04-4759cbb365c7.md),
+- Project improvement review (`codex-session-01a13e24-09d8-7313-8c04-4759cbb365c7.md`),
   numbered recommendations 1–10 below referenced as A1–A10.
-- [RomMBat investigation session](../codex-session-01a14486-f8c7-7180-9aec-606b5809a0fb.md).
+- RomMBat investigation session (`codex-session-01a14486-f8c7-7180-9aec-606b5809a0fb.md`).
 - [RomMBat assessment](../docs/research/rommbat-assessment-2026-10-16.md),
   numbered recommendations 1–8 below referenced as B1–B8. The investigation
   session and assessment describe the same work.
+
+The two session transcripts are not present in this checkout as of 2026-10-24;
+their filenames are retained as provenance, not working document links.
 
 ## Scope and delivery order
 
