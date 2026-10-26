@@ -131,7 +131,7 @@ fn first_gamelists_publish_while_artwork_is_still_pending() {
     assert!(worker.metadata_job.is_some());
     assert!(worker.metadata_ready.is_none());
     assert!(events.try_iter().any(|event| matches!(event,
-        AppEvent::Log(line) if line.message == "Gamelists published; caching frontend artwork")));
+        AppEvent::Log(line) if line.message == "Game information published; checking artwork")));
 
     tx.send(Ok(ArtworkBatch::default())).unwrap();
     poll_metadata_until(&mut worker, |worker| worker.metadata_source.is_none());

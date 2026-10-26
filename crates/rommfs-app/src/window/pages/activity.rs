@@ -16,26 +16,32 @@ pub fn render(
     v_flex()
         .w_full()
         .gap_4()
-        .child(page_heading("Activity"))
-        .when_some(attention_section(view, window, cx), |this, section| {
-            this.child(section)
-        })
-        .child(operations_section(view, cx))
-        .child(
-            h_flex().child(
+        .child(page_header(
+            "Activity",
+            "Downloads, sync, and diagnostics for this session.",
+            Some(
                 Button::new("toggle-technical-log")
+                    .icon(Icon::new(IconName::ScrollText))
                     .label(if view.activity_log_open {
                         "Hide technical log"
                     } else {
                         "Technical log"
                     })
                     .outline()
+                    .small()
+                    .toggled(view.activity_log_open)
                     .on_click(cx.listener(|view, _, _, cx| {
                         view.activity_log_open = !view.activity_log_open;
                         cx.notify();
-                    })),
+                    }))
+                    .into_any_element(),
             ),
-        )
+            cx,
+        ))
+        .when_some(attention_section(view, window, cx), |this, section| {
+            this.child(section)
+        })
+        .child(operations_section(view, cx))
         .when(view.activity_log_open, |this| {
             this.child(log_section(view, window, log_scroll, cx))
         })
@@ -53,31 +59,41 @@ fn attention_row(
     cx: &mut Context<RommfsWindow>,
 ) -> impl IntoElement {
     let id = id.into();
-    v_flex()
-        .gap_1()
-        .child(
-            h_flex()
-                .gap_3()
-                .items_center()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(cx.theme().danger)
-                        .child(headline.into()),
-                )
-                .when_some(action, |this, button| this.child(button)),
-        )
-        .when_some(detail, |this, detail| {
-            this.child(details_disclosure(
-                SharedString::from(format!("{id}-details")),
-                detail,
-                window,
-                cx,
-            ))
-        })
+    // The design's needs-attention card: warning icon, headline, the real
+    // reason behind "Technical details", and its fix action on the right.
+    card(cx).p_3().child(
+        h_flex()
+            .gap_3()
+            .items_start()
+            .child(
+                div().pt(px(1.)).flex_shrink_0().child(
+                    Icon::new(IconName::TriangleAlert)
+                        .small()
+                        .text_color(cx.theme().warning),
+                ),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(headline.into()),
+                    )
+                    .when_some(detail, |this, detail| {
+                        this.child(details_disclosure(
+                            SharedString::from(format!("{id}-details")),
+                            detail,
+                            window,
+                            cx,
+                        ))
+                    }),
+            )
+            .when_some(action, |this, button| this.child(button)),
+    )
 }
 
 fn retry_button(
@@ -214,7 +230,7 @@ fn attention_section(
                         .small()
                         .on_click(cx.listener(move |view, _, window, cx| {
                             view.active_view = 1;
-                            view.save_review_attention_only = true;
+                            view.save_review_filter = 1;
                             view.save_review_expanded = Some(key.clone());
                             view.save_review_page = 0;
                             view.save_review_search
@@ -244,7 +260,7 @@ fn attention_section(
                         .small()
                         .on_click(cx.listener(|view, _, window, cx| {
                             view.active_view = 1;
-                            view.save_review_attention_only = true;
+                            view.save_review_filter = 1;
                             view.save_review_page = 0;
                             view.save_review_search
                                 .update(cx, |input, cx| input.set_value("", window, cx));
@@ -404,7 +420,13 @@ fn attention_section(
         Some(
             v_flex()
                 .gap_2()
-                .child(section_heading("Needs attention"))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(section_heading("Needs attention"))
+                        .child(count_badge(rows.len(), StatusKind::Warning, cx)),
+                )
                 .children(rows),
         )
     }
@@ -691,15 +713,30 @@ fn operations_section(view: &RommfsWindow, cx: &mut Context<RommfsWindow>) -> im
 
     let idle = running.is_empty();
     v_flex()
-        .gap_2()
+        .gap_4()
         .child(section_heading("In progress"))
-        .when(idle, |this| {
-            this.child(muted("No operations in progress", cx))
-        })
-        .children(running)
+        .child(
+            card(cx).p_3().child(
+                v_flex()
+                    .gap_2()
+                    .when(idle, |this| {
+                        this.child(muted("No operations in progress", cx))
+                    })
+                    .children(running),
+            ),
+        )
         .child(section_heading("Recent activity"))
-        .children(failed)
-        .children(recent)
+        .child(
+            card(cx).p_3().child(
+                v_flex()
+                    .gap_2()
+                    .when(failed.is_empty() && recent.is_empty(), |this| {
+                        this.child(muted("Nothing yet", cx))
+                    })
+                    .children(failed)
+                    .children(recent),
+            ),
+        )
         .when(!completed.is_empty(), |this| {
             this.child(
                 h_flex()

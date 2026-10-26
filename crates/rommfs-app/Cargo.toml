@@ -39,8 +39,14 @@ raw-window-handle = "0.6"
 tray-icon = { version = "0.26.1", default-features = false }
 windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18.0", optional = true }
+
 [features]
-default = ["ui"]
+default = ["ui", "linux-fuse"]
 ui = ["dep:gpui-kit"]
 # Local automation is opt-in and the bridge is installed only in debug builds.
 mcp = ["ui", "dep:gpui-mcp"]
+# Read-only FUSE adapter so the app can run its full mount flow on Linux
+# (testing support; the Windows Cloud Files driver stays the product mount).
+linux-fuse = ["dep:fuser"]

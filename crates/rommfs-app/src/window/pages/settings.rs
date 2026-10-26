@@ -43,9 +43,15 @@ impl RommfsWindow {
                         .max_w(px(960.))
                         .mx_auto()
                         .gap_4()
-                        .child(page_heading("Settings"))
+                        .child(page_header(
+                            "Settings",
+                            "Connection, games folder, RetroBat, and save options.",
+                            None,
+                            cx,
+                        ))
                         .child(
                             TabBar::new("settings-tabs")
+                                .underline()
                                 .selected_index(tab)
                                 .children(
                                     SETTINGS_TABS
@@ -127,29 +133,25 @@ impl RommfsWindow {
         let missing_permission =
             !self.state.play_data_available && self.state.conn == ConnectionState::Connected;
         v_flex()
-            .gap_3()
-            .child(self.render_connection(window, cx))
+            .gap_4()
+            .child(card(cx).p_4().child(self.render_connection(window, cx)))
             .when(missing_permission, |this| {
-                this.child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(status_marker(
-                            StatusKind::Warning,
-                            "Favourites & play history · Needs permission",
-                            cx,
-                        ))
-                        .child(
-                            Button::new("reconnect-play-data")
-                                .label("Reconnect")
-                                .outline()
-                                .small()
-                                .on_click(cx.listener(|view, _, _, cx| {
-                                    view.on_connect(cx);
-                                    cx.notify();
-                                })),
-                        ),
-                )
+                this.child(banner(
+                    StatusKind::Warning,
+                    IconName::TriangleAlert,
+                    "Favourites & play history · Needs permission",
+                    Some(
+                        Button::new("reconnect-play-data")
+                            .label("Reconnect")
+                            .warning()
+                            .small()
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.on_connect(cx);
+                                cx.notify();
+                            })),
+                    ),
+                    cx,
+                ))
             })
     }
 
@@ -200,21 +202,19 @@ impl RommfsWindow {
             apply.tooltip(apply_reason)
         };
         v_flex()
-            .gap_6()
+            .gap_4()
             .when_some(self.lock_chip(cx), |this, chip| this.child(chip))
             .child(
-                v_flex()
-                    .gap_3()
-                    .child(section_heading("Location"))
-                    .child(field_column(
-                        "Games folder",
-                        Input::new(&self.mount_input).w_full(),
-                        cx,
-                    ))
-                    .child(
+                card(cx).p_4().child(
+                    v_flex().gap_3().child(section_heading("Location")).child(
                         h_flex()
                             .gap_2()
-                            .items_center()
+                            .items_end()
+                            .child(div().flex_1().min_w_0().child(field_column(
+                                "Games folder",
+                                Input::new(&self.mount_input).w_full(),
+                                cx,
+                            )))
                             .child(browse.on_click(
                                 cx.listener(|view, _, _, cx| view.browse_games_folder(cx)),
                             ))
@@ -224,9 +224,10 @@ impl RommfsWindow {
                                 cx.notify();
                             }))),
                     ),
+                ),
             )
-            .child(self.layout_radio(locked, cx))
-            .child(self.render_start_at_login(cx))
+            .child(card(cx).p_4().child(self.layout_radio(locked, cx)))
+            .child(card(cx).p_4().child(self.render_start_at_login(cx)))
     }
 
     /// Start-at-login plus its disabled reason as a tooltip (phase 2a rule 3).
@@ -242,7 +243,6 @@ impl RommfsWindow {
         };
         let switch = Switch::new("start-at-login")
             .checked(self.state.start_at_login)
-            .label("Start at login")
             .disabled(login_disabled);
         let switch = if login_disabled {
             switch.tooltip(login_reason)
@@ -252,14 +252,19 @@ impl RommfsWindow {
         v_flex()
             .gap_3()
             .child(section_heading("Startup"))
-            .child(switch.on_change(cx.listener(move |view, checked, _, cx| {
-                if login_disabled {
-                    return;
-                }
-                view.controller
-                    .send(Command::SetStartAtLogin { enabled: *checked });
-                cx.notify();
-            })))
+            .child(setting_row(
+                "Start at login",
+                "Connect to your RomM server automatically when you sign in.",
+                switch.on_change(cx.listener(move |view, checked, _, cx| {
+                    if login_disabled {
+                        return;
+                    }
+                    view.controller
+                        .send(Command::SetStartAtLogin { enabled: *checked });
+                    cx.notify();
+                })),
+                cx,
+            ))
             .when_some(self.state.startup_error.clone(), |this, error| {
                 this.child(error_line(error, cx))
             })
@@ -458,8 +463,9 @@ impl RommfsWindow {
             use_save_folder.tooltip("Connect to RomM first.")
         };
         v_flex()
-            .gap_6()
+            .gap_4()
             .child(
+                card(cx).p_4().child(
                 v_flex()
                     .gap_3()
                     .child(section_heading("Save folder"))
@@ -494,8 +500,9 @@ impl RommfsWindow {
                                 "Select saves only, not an emulator's entire portable folder. All file formats and companions are supported. Shared saves stay out of ordinary save mapping; memory cards sync separately below.",
                             )),
                     ),
-            )
+            ))
             .child(
+                card(cx).p_4().child(
                 v_flex()
                     .gap_3()
                     .child(section_heading("Syncing"))
@@ -516,9 +523,9 @@ impl RommfsWindow {
                             )),
                     )
                     .child(self.render_save_delay(cx)),
-            )
-            .child(self.render_memory_cards(cx))
-            .child(self.render_play_history(cx))
+            ))
+            .child(card(cx).p_4().child(self.render_memory_cards(cx)))
+            .child(card(cx).p_4().child(self.render_play_history(cx)))
     }
 
     /// One switch per discovered PS1/PS2 memory-card folder. Off by default and
@@ -630,34 +637,47 @@ impl RommfsWindow {
         section
     }
 
-    /// App: what closing the window does, plus the logs folder.
+    /// App: what closing the window does, plus the logs folder — the
+    /// design's two settings rows in one card.
     fn render_app_tab(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .gap_6()
-            .child(
+        v_flex().gap_4().child(
+            card(cx).child(
                 v_flex()
-                    .gap_3()
-                    .child(section_heading("Closing the window"))
-                    .child(muted(close_behavior_copy(self.tray_hides), cx)),
-            )
-            .child(
-                v_flex().gap_3().child(section_heading("Logs")).child(
-                    Button::new("settings-open-log-folder")
-                        .label("Open logs folder")
-                        .outline()
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            if let Some(path) = crate::controller::diagnostic_log_directory() {
-                                cx.reveal_path(&path);
-                            } else {
-                                view.controller.sink().emit(AppEvent::log(
-                                    Level::Error,
-                                    "diagnostics",
-                                    "No application log directory is available",
-                                ));
-                            }
-                        })),
-                ),
-            )
+                    .child(setting_row(
+                        "Window",
+                        close_behavior_copy(self.tray_hides),
+                        muted_xs(format!("RomMFS {}", env!("CARGO_PKG_VERSION")), cx),
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .child(setting_row(
+                                "Logs",
+                                "Diagnostic output for support and troubleshooting.",
+                                Button::new("settings-open-log-folder")
+                                    .icon(Icon::new(IconName::FolderOpen))
+                                    .label("Open logs folder")
+                                    .outline()
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        if let Some(path) =
+                                            crate::controller::diagnostic_log_directory()
+                                        {
+                                            cx.reveal_path(&path);
+                                        } else {
+                                            view.controller.sink().emit(AppEvent::log(
+                                                Level::Error,
+                                                "diagnostics",
+                                                "No application log directory is available",
+                                            ));
+                                        }
+                                    })),
+                                cx,
+                            )),
+                    ),
+            ),
+        )
     }
 }
 

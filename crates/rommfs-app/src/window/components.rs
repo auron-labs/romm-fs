@@ -28,7 +28,8 @@ pub(super) fn status_dot(color: Hsla) -> impl IntoElement {
     div().size_2().flex_shrink_0().rounded_full().bg(color)
 }
 
-/// Leading dot + state text used in the header and section status lanes.
+/// Leading dot + state text used in the header and section status lanes;
+/// the text takes the status color as in the design's status labels.
 pub(super) fn status_marker(
     kind: StatusKind,
     text: impl Into<SharedString>,
@@ -36,8 +37,167 @@ pub(super) fn status_marker(
 ) -> impl IntoElement {
     h_flex()
         .gap_2()
+        .items_center()
         .child(status_dot(kind.color(cx)))
-        .child(div().min_w_0().child(text.into()))
+        .child(
+            div()
+                .min_w_0()
+                .text_color(kind.color(cx))
+                .child(text.into()),
+        )
+}
+
+/// Rounded status pill — dot + label on a role-tinted surface, as in the
+/// design's "Stopped" / "Connected" / "Needs review" chips. The tint derives
+/// from the same semantic color, so no raw values appear at call sites.
+pub(super) fn status_pill(
+    kind: StatusKind,
+    text: impl Into<SharedString>,
+    cx: &App,
+) -> impl IntoElement {
+    let color = kind.color(cx);
+    h_flex()
+        .gap_2()
+        .items_center()
+        .px_2p5()
+        .py_0p5()
+        .rounded_full()
+        .bg(color.opacity(0.12))
+        .child(status_dot(color))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(color)
+                .child(text.into()),
+        )
+}
+
+/// The small round counter used beside nav items and section headings
+/// (the amber "1" on Saves in the designs).
+pub(super) fn count_badge(count: usize, kind: StatusKind, cx: &App) -> impl IntoElement {
+    let color = kind.color(cx);
+    div()
+        .min_w_5()
+        .h_5()
+        .px_1()
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(color.opacity(0.16))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color)
+                .child(fmt_count(count)),
+        )
+}
+
+/// A surface card: hairline border, theme radius, slightly raised surface.
+/// Replaces the flat sections joined by separators in the redesign.
+pub(super) fn card(cx: &App) -> gpui_kit::Div {
+    div()
+        .w_full()
+        .bg(cx.theme().group_box)
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(cx.theme().radius)
+}
+
+/// An attention banner inside a page or card: tinted surface, status icon,
+/// one line of explanation, and an optional trailing action.
+pub(super) fn banner(
+    kind: StatusKind,
+    icon: IconName,
+    text: impl Into<SharedString>,
+    action: Option<Button>,
+    cx: &App,
+) -> impl IntoElement {
+    let color = kind.color(cx);
+    h_flex()
+        .w_full()
+        .gap_3()
+        .items_center()
+        .justify_between()
+        .px_3()
+        .py_2()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(color.opacity(0.4))
+        .bg(color.opacity(0.08))
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .min_w_0()
+                .child(Icon::new(icon).small().text_color(color))
+                .child(div().min_w_0().text_sm().child(text.into())),
+        )
+        .when_some(action, |this, button| this.child(button))
+}
+
+/// Page title row: heading + muted purpose line on the leading spine,
+/// trailing controls pinned to the same baseline band.
+pub(super) fn page_header(
+    title: &'static str,
+    subtitle: impl Into<SharedString>,
+    trailing: Option<AnyElement>,
+    cx: &App,
+) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .items_end()
+        .justify_between()
+        .gap_4()
+        .child(
+            v_flex().gap_1().min_w_0().child(page_heading(title)).child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(subtitle.into()),
+            ),
+        )
+        .when_some(trailing, |this, el| {
+            this.child(h_flex().gap_2().items_center().flex_shrink_0().child(el))
+        })
+}
+
+/// One Settings row: label + muted description on the leading lane, the
+/// control pinned to the trailing lane (design's settings-row sheet).
+pub(super) fn setting_row(
+    label: impl Into<SharedString>,
+    description: impl Into<String>,
+    control: impl IntoElement,
+    cx: &App,
+) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .gap_4()
+        .items_center()
+        .justify_between()
+        .px_4()
+        .py_3()
+        .child(
+            v_flex()
+                .gap_0p5()
+                .min_w_0()
+                .flex_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(label.into()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(description.into()),
+                ),
+        )
+        .child(control)
 }
 
 pub(super) fn muted(text: impl Into<String>, cx: &App) -> impl IntoElement {
@@ -181,7 +341,8 @@ pub(super) fn text_disclosure(
 }
 
 /// A problem in the shared shape (UI-PLAN §4): bold title, one-line cause,
-/// optional action, and the raw text behind "Technical details".
+/// optional action, and the raw text behind "Technical details" — rendered
+/// inside the design's attention card.
 pub(super) fn problem_block(
     id: &'static str,
     problem: &UserProblem,
@@ -193,29 +354,31 @@ pub(super) fn problem_block(
         Severity::Error => cx.theme().danger,
         Severity::Warning => cx.theme().warning,
     };
-    v_flex()
-        .gap_1()
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(color)
-                .child(problem.title.clone()),
-        )
-        .when_some(problem.cause.clone(), |this, cause| {
-            this.child(muted(cause, cx))
-        })
-        .when_some(action, |this, button| {
-            this.child(div().pt_1().child(button))
-        })
-        .when_some(problem.technical.clone(), |this, technical| {
-            this.child(details_disclosure(
-                SharedString::from(format!("{id}-details")),
-                technical,
-                window,
-                cx,
-            ))
-        })
+    card(cx).p_3().child(
+        v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(color)
+                    .child(problem.title.clone()),
+            )
+            .when_some(problem.cause.clone(), |this, cause| {
+                this.child(muted(cause, cx))
+            })
+            .when_some(action, |this, button| {
+                this.child(div().pt_1().child(button))
+            })
+            .when_some(problem.technical.clone(), |this, technical| {
+                this.child(details_disclosure(
+                    SharedString::from(format!("{id}-details")),
+                    technical,
+                    window,
+                    cx,
+                ))
+            }),
+    )
 }
 
 /// A quiet chevron toggle that expands to a plain list of lines.
