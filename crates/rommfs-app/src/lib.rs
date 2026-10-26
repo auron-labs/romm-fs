@@ -3,6 +3,8 @@
 
 pub mod controller;
 mod desktop;
+#[cfg(all(target_os = "linux", feature = "linux-fuse"))]
+mod fuse_mount;
 #[cfg(windows)]
 mod icon;
 pub mod problem;

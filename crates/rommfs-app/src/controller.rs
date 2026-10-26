@@ -1409,7 +1409,19 @@ fn start_mount_backend(fs: Arc<RommFs>, root: &Path) -> Result<ActiveMount> {
     })
 }
 
-#[cfg(not(windows))]
+/// Connect the Linux FUSE adapter over the portable core. This is desktop
+/// test support: enumeration stays metadata-only and the first data read
+/// hydrates through the shared download path, same as the Windows driver.
+#[cfg(all(target_os = "linux", feature = "linux-fuse"))]
+fn start_mount_backend(fs: Arc<RommFs>, root: &Path) -> Result<ActiveMount> {
+    let mount = crate::fuse_mount::mount(fs, root).map_err(mount_root_error)?;
+    Ok(ActiveMount {
+        root: root.to_path_buf(),
+        stop_fn: Box::new(move || mount.stop()),
+    })
+}
+
+#[cfg(not(any(windows, all(target_os = "linux", feature = "linux-fuse"))))]
 fn start_mount_backend(_fs: Arc<RommFs>, _root: &Path) -> Result<ActiveMount> {
     Err(Error::Unsupported(
         "mounting requires Windows 10 1709+ with Cloud Files and a local NTFS directory".into(),
