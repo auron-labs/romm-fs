@@ -88,6 +88,11 @@ fn catalogue_pages_are_fetched_once_and_warm_remounts_make_no_http_requests() {
     worker.rom_cache_directory = Some(tmp.path().join("rom-cache"));
     worker.catalogue_store = Some(CatalogueStore::open(&tmp.path().join("catalogue.db")).unwrap());
     worker.connect(fx.url(), "user", "password");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while worker.refresh_result.is_some() && Instant::now() < deadline {
+        worker.poll_catalogue_refresh();
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert_eq!(worker.catalogue.as_ref().unwrap().entries.len(), 2448);
     assert_eq!(fx.route_hit_count("GET", "/api/platforms"), 1);
     for offset in (0..2448).step_by(500) {
@@ -100,6 +105,7 @@ fn catalogue_pages_are_fetched_once_and_warm_remounts_make_no_http_requests() {
     for _ in 0..2 {
         worker.start_mount(root.to_str().unwrap());
         worker.stop_mount();
+        worker.drain_cancelled_mount_preparations();
     }
     assert_eq!(fx.route_hit_count("GET", "/api/platforms"), 1);
     assert_eq!(fx.route_hit_count("GET", "/api/roms/"), 0);
@@ -182,6 +188,56 @@ fn invalid_layout_selection_keeps_the_previous_projection_and_preferences() {
 }
 
 #[test]
+fn remount_notice_tracks_file_content_and_size_but_not_artwork() {
+    use rommfs_fixture::contract;
+
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    let snapshot = CatalogueSnapshot {
+        platforms: serde_json::from_str(&contract::platforms(&[(1, "gb", "gb", "Game Boy")]))
+            .unwrap(),
+        roms: vec![
+            serde_json::from_value(contract::rom(7, "gb", "Game.gb", 3, "original")).unwrap(),
+        ],
+        refreshed_at: 0,
+        full_refreshed_at: 0,
+    };
+    let (sink, events) = rommfs_core::events::channel();
+    let mut worker = Worker::new(sink);
+    worker.server_id = Some("s".into());
+    worker.rom_cache_directory = Some(directory.path().join("cache"));
+    worker.store_catalogue(worker.project_snapshot(&snapshot).unwrap());
+    let client = Arc::new(RommClient::new(fixture.url()).unwrap());
+    worker.fs = Some(
+        worker
+            .build_fs(&client, directory.path(), Arc::new(NoopHydratedRemover))
+            .unwrap(),
+    );
+    let mut state = UiState::new(32);
+
+    let mut artwork = snapshot.clone();
+    artwork.roms[0].metadata.path_cover_large = Some("/assets/new-cover.png".into());
+    artwork.roms[0].updated_at = "artwork-only-update".into();
+    let mut version = snapshot.clone();
+    version.roms[0].files[0].sha1_hash = Some("changed".into());
+    let mut size = snapshot.clone();
+    size.roms[0].files[0].file_size_bytes += 1;
+    for (next, pending) in [
+        (snapshot, false),
+        (artwork, false),
+        (version, true),
+        (size, true),
+    ] {
+        worker.publish_snapshot(next, false).unwrap();
+        for event in events.try_iter() {
+            state.apply_event(&event);
+        }
+        assert_eq!(state.catalogue_pending_remount, pending);
+    }
+    assert!(fixture.requests().is_empty());
+}
+
+#[test]
 fn cancelled_refresh_cannot_emit_late_events_or_replace_the_new_session() {
     let (sink, events) = rommfs_core::events::channel();
     let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -197,6 +253,55 @@ fn cancelled_refresh_cannot_emit_late_events_or_replace_the_new_session() {
         elapsed_ms: 100,
     });
     assert!(events.try_recv().is_err());
+}
+
+#[test]
+fn layout_changes_wait_for_cold_loading_and_mount_preparation() {
+    for preparing in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let (sink, events) = rommfs_core::events::channel();
+        let mut worker = Worker::new(sink);
+        worker.preferences = Some(ConnectionPreferences {
+            server: "server".into(),
+            account_id: 42,
+            device_identifier: "device".into(),
+            mount_root: None,
+            integration: IntegrationMode::RetroBat,
+            retrobat_root: Some(directory.path().into()),
+            start_at_login: false,
+            save_root: None,
+            hide_owned_copies: true,
+        });
+        if preparing {
+            let (send, result) = mpsc::channel();
+            worker.mount_preparation = Some(MountPreparation {
+                root: directory.path().join("games"),
+                path: "games".into(),
+                server_id: "server".into(),
+                started: Instant::now(),
+                active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                result,
+                handle: std::thread::spawn(move || {
+                    let _ = send.send(Err(Error::Cancelled));
+                }),
+            });
+        } else {
+            worker.pending_mount_start = Some("games".into());
+        }
+
+        worker.set_integration(IntegrationMode::Generic, None);
+        assert_eq!(
+            worker.preferences.as_ref().unwrap().integration,
+            IntegrationMode::RetroBat
+        );
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            AppEvent::IntegrationUpdated { error: Some(reason), .. }
+                if reason.contains("stop the games folder")
+        )));
+        worker.stop_mount();
+        worker.drain_cancelled_mount_preparations();
+    }
 }
 
 fn authed_client(fx: &FixtureServer) -> RommClient {

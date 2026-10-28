@@ -34,6 +34,7 @@ impl Worker {
         };
         self.play_data_available = available;
         self.play_data_enabled = enabled;
+        self.play_data_permission_denied = false;
         if problem.is_some() {
             self.play_data_problem = problem.clone();
         }
@@ -43,6 +44,7 @@ impl Worker {
 
     pub(super) fn set_play_data_enabled(&mut self, enabled: bool) {
         if enabled && !self.play_data_available {
+            self.play_data_permission_denied = false;
             self.play_data_problem =
                 Some("Reconnect to grant the favourites and play-history permissions.".into());
             self.play_data_enabled = false;
@@ -84,6 +86,7 @@ impl Worker {
         self.sink.emit(AppEvent::PlayDataUpdated {
             available: self.play_data_available,
             enabled: self.play_data_enabled,
+            permission_denied: self.play_data_permission_denied,
             problem,
         });
     }

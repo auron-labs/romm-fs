@@ -68,6 +68,8 @@ pub enum Command {
     /// Re-run the frontend metadata pass (artwork + gamelists) for a mounted
     /// library, e.g. after a failed pass (Overview Retry).
     RefreshMetadata,
+    RefreshIntegration,
+    RepairRetroBat,
     SelectSaveSyncInstallation {
         path: PathBuf,
     },
@@ -91,6 +93,13 @@ pub enum Command {
         session_id: u64,
         incoming_id: String,
         destination: PathBuf,
+    },
+    ResolveSaveConflict {
+        session_id: u64,
+        rom_id: i64,
+        file_id: i64,
+        local_hash: Option<String>,
+        incoming_id: Option<String>,
     },
     /// Turn one discovered memory-card folder on or off. Explicit and off by
     /// default; scoped to the server, account, installation, and save root.

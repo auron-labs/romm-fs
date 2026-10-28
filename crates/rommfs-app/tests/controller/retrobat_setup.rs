@@ -16,6 +16,7 @@ fn retrobat_steps_unlock_in_order_with_one_primary() {
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
         setup_migration: false,
+        setup_issues: Vec::new(),
         error: None,
     });
     let steps = ui.retrobat_steps();
@@ -50,20 +51,22 @@ fn retrobat_steps_unlock_in_order_with_one_primary() {
     assert_eq!(steps.primary(), Some(RetroBatStep::Support));
     assert!(ui.integration_notice.is_none());
 
-    // Re-applying the same selection keeps the result; a new root drops it.
+    // A failed inspection clears the result even for the same installation.
     ui.apply_event(&AppEvent::IntegrationUpdated {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
         setup_migration: false,
+        setup_issues: Vec::new(),
         error: None,
     });
-    assert_eq!(ui.retrobat_steps().link, StepStatus::Done);
+    assert_eq!(ui.retrobat_steps().link, StepStatus::Ready);
     ui.apply_event(&AppEvent::IntegrationUpdated {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("D:\\RetroBat".into()),
         setup_complete: false,
         setup_migration: false,
+        setup_issues: Vec::new(),
         error: None,
     });
     assert_eq!(ui.retrobat_steps().link, StepStatus::Ready);
@@ -74,6 +77,7 @@ fn retrobat_steps_unlock_in_order_with_one_primary() {
         retrobat_root: Some("E:\\RetroBat".into()),
         setup_complete: true,
         setup_migration: false,
+        setup_issues: Vec::new(),
         error: None,
     });
     assert_eq!(ui.retrobat_steps().link, StepStatus::Done);
@@ -98,6 +102,7 @@ fn support_files_do_not_wait_for_the_games_folder_link() {
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
         setup_migration: false,
+        setup_issues: Vec::new(),
         error: None,
     });
     ui.apply_event(&AppEvent::RetroBatSetup {
@@ -122,6 +127,7 @@ fn retrobat_setup_failure_is_a_retry_not_done() {
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
         setup_migration: false,
+        setup_issues: Vec::new(),
         error: None,
     });
     ui.apply_event(&AppEvent::RetroBatSetup {
@@ -144,6 +150,7 @@ fn an_outdated_setup_record_is_a_migration_prompt_not_a_blocked_start() {
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
         setup_migration: true,
+        setup_issues: Vec::new(),
         error: None,
     });
     assert!(ui.retrobat_setup_migration);
@@ -163,6 +170,7 @@ fn an_outdated_setup_record_is_a_migration_prompt_not_a_blocked_start() {
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: true,
         setup_migration: false,
+        setup_issues: Vec::new(),
         error: None,
     });
     assert!(!ui.retrobat_setup_migration);

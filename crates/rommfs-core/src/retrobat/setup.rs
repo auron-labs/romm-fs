@@ -134,24 +134,27 @@ fn save_record(installation: &Path, record: &SetupRecord) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn expected_record(
-    installation: &Path,
-    managed: &Path,
-    server: &str,
-) -> anyhow::Result<SetupRecord> {
-    expected_record_with_root_check(installation, managed, server, |root| {
-        ensure_no_reparse_components(root).map_err(anyhow::Error::from)
-    })
-}
-
 fn expected_record_with_root_check(
     installation: &Path,
     managed: &Path,
     server: &str,
     check_root: impl FnOnce(&Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<SetupRecord> {
+    expected_record_with_root_guard(installation, managed, server, |root| {
+        check_root(root)?;
+        Ok(())
+    })
+    .map(|(record, ())| record)
+}
+
+fn expected_record_with_root_guard<G>(
+    installation: &Path,
+    managed: &Path,
+    server: &str,
+    hold_root: impl FnOnce(&Path) -> anyhow::Result<G>,
+) -> anyhow::Result<(SetupRecord, G)> {
     inspect_installation(installation)?;
-    check_root(managed)?;
+    let root_guard = hold_root(managed)?;
     anyhow::ensure!(
         managed.is_absolute() && managed.is_dir(),
         "managed ROM root must be an existing absolute directory"
@@ -169,16 +172,19 @@ fn expected_record_with_root_check(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    Ok(SetupRecord {
-        schema: SCHEMA,
-        server_id: server.into(),
-        managed_root: managed,
-        version,
-        links: Vec::new(),
-        created_dirs: Vec::new(),
-        skipped: Vec::new(),
-        restored: Vec::new(),
-    })
+    Ok((
+        SetupRecord {
+            schema: SCHEMA,
+            server_id: server.into(),
+            managed_root: managed,
+            version,
+            links: Vec::new(),
+            created_dirs: Vec::new(),
+            skipped: Vec::new(),
+            restored: Vec::new(),
+        },
+        root_guard,
+    ))
 }
 
 /// Compare link targets tolerating Windows verbatim (`\\?\`) prefixes.
@@ -272,7 +278,9 @@ pub fn inspect_setup(
     })
 }
 
-fn inspect_setup_with_root_check(
+/// Inspect recorded links after the owning backend validates the managed root.
+/// Installation paths and setup identity retain their ordinary checks.
+pub fn inspect_setup_with_root_check(
     installation: &Path,
     managed: &Path,
     server: &str,
@@ -348,9 +356,22 @@ pub fn setup_roms_link(
     managed: &Path,
     server: &str,
 ) -> anyhow::Result<SetupOutcome> {
-    let mut expected = expected_record(installation, managed, server)?;
+    setup_roms_link_with_root_guard(installation, managed, server, |root| {
+        ensure_no_reparse_components(root).map_err(anyhow::Error::from)?;
+        hold_save_directory_chain(root).map_err(anyhow::Error::from)
+    })
+}
+
+/// Set up RetroBat links while holding the owning backend's managed-root guard.
+pub fn setup_roms_link_with_root_guard<G>(
+    installation: &Path,
+    managed: &Path,
+    server: &str,
+    hold_root: impl FnOnce(&Path) -> anyhow::Result<G>,
+) -> anyhow::Result<SetupOutcome> {
     let _installation_guard = hold_save_directory_chain(installation)?;
-    let _managed_guard = hold_save_directory_chain(&expected.managed_root)?;
+    let (mut expected, _managed_guard) =
+        expected_record_with_root_guard(installation, managed, server, hold_root)?;
     let previous = load_record(installation)?;
     probe_link_permission(installation, &expected.managed_root)?;
 

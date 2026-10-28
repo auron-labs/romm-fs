@@ -8,7 +8,7 @@ use rommfs_core::save_sync::{
     validate_relative_save_path, SaveMapping, SaveSyncScope, SnapshotRecord, SnapshotState,
     MAX_SAVE_BYTES, RETROBAT_GB_SRM_PROFILE,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,6 +61,9 @@ pub(super) struct TransferJob {
     pub(super) baseline_id: Option<String>,
     pub(super) baseline_hash: Option<String>,
     pub(super) accepted_remote_ids: Vec<String>,
+    pub(super) conflict_resolution: Option<String>,
+    pub(super) conflict_local_hash: Option<String>,
+    pub(super) conflict_history_fingerprint: String,
 }
 
 pub(super) enum WorkerJob {
@@ -589,6 +592,24 @@ fn verify_existing_baseline(
     enabled: &SaveSyncEnablement,
     active: &AtomicBool,
 ) -> Option<UploadAttempt> {
+    if matches!(
+        job.conflict_resolution.as_deref(),
+        Some("keep_local" | "keep_local_ack" | "use_remote_ack")
+    ) {
+        if job.conflict_resolution.as_deref() == Some("keep_local")
+            && job.conflict_local_hash.as_deref() != Some(job.snapshot.content_hash.as_str())
+        {
+            return Some(UploadAttempt::Attention(format!(
+                "local snapshot changed after review for {}; review required",
+                job.mapping.visible_rom_name
+            )));
+        }
+        if let Some(problem) =
+            verify_reviewed_history(client, inventory, job, None, enabled, active)
+        {
+            return Some(problem);
+        }
+    }
     let mut known_ids = HashSet::new();
     for record in &job.history {
         if let Some(id) = &record.remote_slot_id {
@@ -687,6 +708,7 @@ fn verify_existing_baseline(
             }
         }
         (None, None) if inventory.is_empty() => None,
+        (None, None) if job.conflict_resolution.as_deref() == Some("keep_local") => None,
         (None, None) => Some(UploadAttempt::Attention(format!(
             "a remote save already exists for {}; initial sync requires review",
             job.mapping.visible_rom_name
@@ -711,10 +733,16 @@ fn post_upload_inventory(
         Ok(slot) => slot,
         Err(e) => return UploadAttempt::Paused(e.to_string()),
     };
-    let inventory = match client.save_inventory(job.snapshot.rom_key.rom_id, &slot_name) {
+    let mut inventory = match client.save_inventory(job.snapshot.rom_key.rom_id, &slot_name) {
         Ok(inventory) => inventory,
         Err(failure) => return api_failure(failure, true, false),
     };
+    if let Some(legacy) = job.mapping.legacy_slot() {
+        match client.save_inventory(job.snapshot.rom_key.rom_id, legacy) {
+            Ok(legacy_inventory) => inventory.extend(legacy_inventory),
+            Err(failure) => return api_failure(failure, true, false),
+        }
+    }
     if let Some(problem) = validate_inventory(&inventory, job) {
         return UploadAttempt::Paused(problem);
     }
@@ -734,6 +762,24 @@ fn post_upload_inventory(
         }
     }
     allowed.insert(uploaded.id);
+    if matches!(
+        job.conflict_resolution.as_deref(),
+        Some("keep_local" | "keep_local_ack" | "use_remote_ack")
+    ) {
+        if job.conflict_resolution.as_deref() == Some("keep_local")
+            && job.conflict_local_hash.as_deref() != Some(job.snapshot.content_hash.as_str())
+        {
+            return UploadAttempt::Attention(format!(
+                "local snapshot changed after review for {}; review required",
+                job.mapping.visible_rom_name
+            ));
+        }
+        if let Some(problem) =
+            verify_reviewed_history(client, &inventory, job, Some(uploaded.id), enabled, active)
+        {
+            return problem;
+        }
+    }
     if inventory.iter().any(|save| !allowed.contains(&save.id)) {
         return UploadAttempt::Attention(format!(
             "a competing remote save appeared while uploading {}; local snapshot was preserved",
@@ -751,6 +797,102 @@ fn post_upload_inventory(
     UploadAttempt::Verified {
         remote_id: uploaded.id.to_string(),
     }
+}
+
+fn verify_reviewed_history(
+    client: &RommClient,
+    inventory: &[RemoteSave],
+    job: &TransferJob,
+    ignored_id: Option<i64>,
+    enabled: &SaveSyncEnablement,
+    active: &AtomicBool,
+) -> Option<UploadAttempt> {
+    let mut reviewed = HashMap::new();
+    for fingerprint in job.conflict_history_fingerprint.split(',') {
+        let Some((metadata_fingerprint, content_hash)) = fingerprint.split_once('\t') else {
+            return Some(UploadAttempt::Attention(
+                "stored save review history is invalid; review required".into(),
+            ));
+        };
+        let Some((id, _)) = metadata_fingerprint.split_once(':') else {
+            return Some(UploadAttempt::Attention(
+                "stored save review history is invalid; review required".into(),
+            ));
+        };
+        let Ok(id) = id.parse::<i64>() else {
+            return Some(UploadAttempt::Attention(
+                "stored save review history is invalid; review required".into(),
+            ));
+        };
+        if reviewed
+            .insert(id, (metadata_fingerprint, content_hash))
+            .is_some()
+        {
+            return Some(UploadAttempt::Attention(
+                "stored save review history is invalid; review required".into(),
+            ));
+        }
+    }
+    let current = inventory
+        .iter()
+        .filter(|save| Some(save.id) != ignored_id)
+        .map(|save| (save.id, save))
+        .collect::<HashMap<_, _>>();
+    for (id, remote) in &current {
+        let expected = reviewed.get(id);
+        let expected_hash = if let Some((fingerprint, content_hash)) = expected {
+            if incoming_transfer::remote_save_fingerprint(remote) != *fingerprint {
+                return Some(UploadAttempt::Attention(format!(
+                    "remote save history changed after review for {}; review required",
+                    job.mapping.visible_rom_name
+                )));
+            }
+            Some(*content_hash)
+        } else {
+            let Some(revision) = incoming_transfer::owned_revision_from_filename(&remote.file_name)
+            else {
+                return Some(UploadAttempt::Attention(format!(
+                    "remote save history changed after review for {}; review required",
+                    job.mapping.visible_rom_name
+                )));
+            };
+            let remote_id = id.to_string();
+            let snapshot = job.history.iter().find(|snapshot| {
+                snapshot.state == SnapshotState::RemoteComplete
+                    && snapshot.remote_slot_id.as_deref() == Some(remote_id.as_str())
+                    && snapshot.revision == revision
+                    && fs::metadata(&snapshot.path)
+                        .is_ok_and(|metadata| metadata.len() == remote.file_size_bytes)
+            });
+            let Some(snapshot) = snapshot else {
+                return Some(UploadAttempt::Attention(format!(
+                    "remote save history changed after review for {}; review required",
+                    job.mapping.visible_rom_name
+                )));
+            };
+            Some(snapshot.content_hash.as_str())
+        };
+        let Some(expected_hash) = expected_hash.filter(|hash| *hash != "-") else {
+            continue;
+        };
+        match verify_remote_bytes(client, remote, expected_hash, enabled, active) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Some(UploadAttempt::Attention(format!(
+                    "remote save contents changed after review for {}; review required",
+                    job.mapping.visible_rom_name
+                )))
+            }
+            Err(failure) => return Some(api_failure(failure, false, false)),
+        }
+    }
+    if reviewed.keys().any(|id| !current.contains_key(id)) {
+        return Some(UploadAttempt::Attention(format!(
+            "remote save history changed after review for {}; review required",
+            job.mapping.visible_rom_name
+        )));
+    }
+    None
 }
 
 fn verify_remote_bytes(

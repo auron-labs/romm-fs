@@ -269,6 +269,39 @@ fn stopping_the_actor_drains_its_blocked_transfer_worker_before_returning() {
 }
 
 #[test]
+fn cancel_returns_while_inventory_request_is_blocked_and_drain_finishes_after_release() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    fixture.use_romm_save_store(ACCOUNT_ID, 201);
+    let barrier = FixtureBodyBarrier::new();
+    fixture.on(
+        "GET",
+        INVENTORY_PATH,
+        ResponseSpec::HeldJson {
+            status: 200,
+            body: "[]".into(),
+            barrier: barrier.clone(),
+        },
+    );
+    let case = case(directory.path(), &fixture, false);
+    fs::remove_file(&case.mapping.target_path).unwrap();
+    let (sink, _events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(barrier.wait_until_blocked(Duration::from_secs(5)));
+
+    let started = Instant::now();
+    agent.cancel();
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "cancel waited for the in-flight inventory response"
+    );
+
+    barrier.release();
+    agent.stop();
+    assert!(!case.mapping.target_path.exists());
+}
+
+#[test]
 fn interrupted_incoming_publication_is_durable_but_never_retried_as_first_install() {
     const REMOTE_BYTES: &[u8] = b"survives staging interruption";
     let directory = tempfile::tempdir().unwrap();

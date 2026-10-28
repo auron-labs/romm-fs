@@ -17,7 +17,7 @@ use rommfs_cfapi::{
 };
 use rommfs_core::cache::clock::{Clock, DEFAULT_EVICTION_THRESHOLD_SECS};
 use rommfs_core::cache::{CacheIndex, Evictor, FakeClock, LiveState};
-use rommfs_core::catalogue::{build_catalogue, server_id_of, RomKey};
+use rommfs_core::catalogue::{build_catalogue, server_id_of, RomKey, VersionKey};
 use rommfs_core::download::DownloadManager;
 use rommfs_core::filesystem::RommFs;
 use rommfs_core::retrobat::{
@@ -28,6 +28,7 @@ use rommfs_core::tree::RommTree;
 use rommfs_fixture::{contract, FixtureServer, ResponseSpec};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -171,6 +172,8 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
         RootCheck::EmptyReady
     ));
     claim_mount_root(&root, &server_id).unwrap();
+    WindowsMount::cleanup_root(&root, &server_id)
+        .expect("a claimed folder can be replaced before its first mount");
     let mount = WindowsMount::mount(Arc::clone(&fs), &root).expect("CFAPI mount");
 
     let nes_dir: PathBuf = root.join("nes");
@@ -392,10 +395,18 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     assert_eq!(std::fs::read(&rom_path).unwrap(), bytes);
     assert_eq!(server.route_hit_count("GET", "/api/roms/"), 4);
 
+    let original_file_id = std::fs::metadata(&rom_path)
+        .unwrap()
+        .file_index()
+        .expect("NTFS file identity");
     mount.stop();
-    assert!(
-        !rom_path.exists(),
-        "unmount leaves no ROM copies at the mount root"
+    assert!(rom_path.exists(), "stop retains the projected ROM");
+    assert_eq!(
+        std::fs::metadata(&rom_path)
+            .unwrap()
+            .file_index()
+            .expect("NTFS file identity"),
+        original_file_id
     );
     assert!(gamelist.is_file(), "stop preserves frontend state");
     assert!(matches!(
@@ -408,20 +419,20 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     let downloads2 = Arc::new(DownloadManager::new(
         CacheIndex::open(cache.path()).unwrap(),
         live.clone(),
-        client,
+        client.clone(),
         sink,
-        expected,
-        versions,
+        expected.clone(),
+        versions.clone(),
     ));
     let fs = Arc::new(RommFs::new(
         RommTree::new(fs.catalogue().clone()),
         downloads2,
         Evictor::new(
             DEFAULT_EVICTION_THRESHOLD_SECS,
-            live,
+            live.clone(),
             Arc::new(WindowsHydratedRemover::new(&root)),
         ),
-        clock,
+        clock.clone(),
     ));
     let mount2 = WindowsMount::mount(Arc::clone(&fs), &root).expect("remount");
     assert!(std::fs::read_to_string(&gamelist)
@@ -429,11 +440,111 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
         .contains("<playcount>7</playcount>"));
     assert_eq!(std::fs::read(&rom_path).unwrap(), bytes);
     assert_eq!(
+        std::fs::metadata(&rom_path)
+            .unwrap()
+            .file_index()
+            .expect("NTFS file identity"),
+        original_file_id
+    );
+    assert_eq!(
         server.route_hit_count("GET", "/api/roms/"),
         4,
         "remount uses the private cache"
     );
     mount2.stop();
+
+    let installation = workspace.path().join("retrobat-repair");
+    std::fs::create_dir_all(installation.join("emulationstation/.emulationstation")).unwrap();
+    std::fs::create_dir_all(installation.join("roms/nes")).unwrap();
+    std::fs::write(installation.join("retrobat.exe"), b"fixture").unwrap();
+    std::fs::write(
+        installation.join("emulationstation/.emulationstation/es_systems.cfg"),
+        "<systemList><system><name>nes</name><path>~/../roms/nes</path><extension>.nes</extension></system></systemList>",
+    )
+    .unwrap();
+    let setup_links = || {
+        rommfs_core::retrobat::setup_roms_link_with_root_guard(
+            &installation,
+            &root,
+            &server_id,
+            |managed| rommfs_cfapi::hold_mount_root(managed, &server_id),
+        )
+    };
+    assert_eq!(setup_links().unwrap().linked, ["nes"]);
+    let link = installation.join("roms/nes/RomM");
+    std::fs::remove_dir(&link).unwrap();
+    assert_eq!(setup_links().unwrap().linked, ["nes"]);
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        root.join("nes").canonicalize().unwrap()
+    );
+    let repaired_mount =
+        WindowsMount::mount(Arc::clone(&fs), &root).expect("mount after link repair");
+    assert_eq!(
+        std::fs::metadata(&rom_path)
+            .unwrap()
+            .file_index()
+            .expect("NTFS file identity"),
+        original_file_id,
+        "link repair preserves the retained ROM placeholder"
+    );
+    repaired_mount.stop();
+
+    let unchanged_path = root.join("nes/Enumeration 0100.nes");
+    let unchanged_file_id = std::fs::metadata(&unchanged_path)
+        .unwrap()
+        .file_index()
+        .expect("NTFS file identity");
+    let mut changed_catalogue = fs.catalogue().clone();
+    let changed = changed_catalogue
+        .entries
+        .iter_mut()
+        .find(|entry| entry.file_name == "Example Game.nes")
+        .expect("test ROM entry");
+    changed.size += 1;
+    changed.version = Some(VersionKey("sha1:changed-by-test".into()));
+    let (sink3, _events3) = rommfs_core::events::channel();
+    let downloads3 = Arc::new(DownloadManager::new(
+        CacheIndex::open(cache.path()).unwrap(),
+        live.clone(),
+        client.clone(),
+        sink3,
+        expected.clone(),
+        versions.clone(),
+    ));
+    let changed_fs = Arc::new(RommFs::new(
+        RommTree::new(changed_catalogue),
+        downloads3,
+        Evictor::new(
+            DEFAULT_EVICTION_THRESHOLD_SECS,
+            live.clone(),
+            Arc::new(WindowsHydratedRemover::new(&root)),
+        ),
+        clock.clone(),
+    ));
+    let mount3 = WindowsMount::mount(changed_fs, &root).expect("mount changed catalogue");
+    assert_eq!(
+        std::fs::metadata(&unchanged_path)
+            .unwrap()
+            .file_index()
+            .expect("NTFS file identity"),
+        unchanged_file_id,
+        "unchanged ROM keeps its file identity"
+    );
+    assert_ne!(
+        std::fs::metadata(&rom_path)
+            .unwrap()
+            .file_index()
+            .expect("NTFS file identity"),
+        original_file_id,
+        "changed ROM receives a new placeholder"
+    );
+    assert_eq!(
+        server.route_hit_count("GET", "/api/roms/"),
+        4,
+        "catalogue listing and reconciliation do not download ROM data"
+    );
+    mount3.stop();
 
     // Local files introduced while stopped must remain untouched.
     let local = root.join("local-notes.txt");

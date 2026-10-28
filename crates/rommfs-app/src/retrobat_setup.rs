@@ -15,10 +15,19 @@ pub(crate) fn setup(
         installation.is_absolute() && managed_root.is_absolute(),
         "choose absolute RetroBat and managed ROM folder paths"
     );
-    let _stopped = crate::controller::stopped_retrobat_guard(installation)?;
-    crate::controller::check_mount_root(managed_root, server)?;
-    crate::controller::claim_mount_root(managed_root, server)?;
-    let outcome = rommfs_core::retrobat::setup_roms_link(installation, managed_root, server)?;
+    crate::controller::ensure_frontend_stopped(installation)?;
+    if managed_root.exists() {
+        rommfs_cfapi::claim_mount_root(managed_root, server)?;
+    } else {
+        crate::controller::check_mount_root(managed_root, server)?;
+        crate::controller::claim_mount_root(managed_root, server)?;
+    }
+    let outcome = rommfs_core::retrobat::setup_roms_link_with_root_guard(
+        installation,
+        managed_root,
+        server,
+        |root| rommfs_cfapi::hold_mount_root(root, server),
+    )?;
     let mut messages = vec![outcome.summary()];
     messages.push(configure_switch(installation));
     Ok(SetupReport {

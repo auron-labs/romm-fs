@@ -75,6 +75,7 @@ impl RommfsWindow {
     pub(super) fn layout_radio(
         &mut self,
         locked: bool,
+        show_setup_link: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         v_flex()
@@ -133,7 +134,7 @@ impl RommfsWindow {
                             },
                             cx,
                         ))
-                        .when(!active, |this| {
+                        .when(!active && show_setup_link, |this| {
                             this.child(
                                 Button::new("layout-open-retrobat")
                                     .label("Set up RetroBat")

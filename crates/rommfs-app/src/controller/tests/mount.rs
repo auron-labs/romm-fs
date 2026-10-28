@@ -1,5 +1,63 @@
 use super::*;
 
+fn empty_filesystem(cache_directory: &Path) -> Arc<RommFs> {
+    let index = CacheIndex::open(cache_directory).unwrap();
+    let live = Arc::new(LiveState::default());
+    let downloads = Arc::new(DownloadManager::new(
+        index,
+        Arc::clone(&live),
+        Arc::new(UnusedSource),
+        rommfs_core::events::channel().0,
+        HashMap::new(),
+        HashMap::new(),
+    ));
+    let catalogue = build_catalogue("server", &[], &[], |_| {}).unwrap();
+    Arc::new(RommFs::new(
+        RommTree::new(catalogue),
+        downloads,
+        Evictor::new(1, live, Arc::new(NoopHydratedRemover)),
+        Arc::new(FakeClock::new(100)),
+    ))
+}
+
+#[test]
+fn cancelled_preparation_stops_a_mount_that_arrives_late() {
+    let temp = tempfile::tempdir().unwrap();
+    let (sink, _) = rommfs_core::events::channel();
+    let mut worker = Worker::new(sink);
+    let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (result_tx, result_rx) = mpsc::channel();
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped_by_mount = Arc::clone(&stopped);
+    result_tx
+        .send(Ok((
+            empty_filesystem(&temp.path().join("cache")),
+            ActiveMount {
+                root: temp.path().join("old-root"),
+                stop_fn: Box::new(move || {
+                    stopped_by_mount.store(true, std::sync::atomic::Ordering::Release);
+                }),
+            },
+        )))
+        .unwrap();
+    worker.mount_preparation = Some(MountPreparation {
+        root: temp.path().join("old-root"),
+        server_id: "server".into(),
+        path: temp.path().join("old-root").display().to_string(),
+        started: Instant::now(),
+        active,
+        result: result_rx,
+        handle: std::thread::spawn(|| {}),
+    });
+
+    worker.cancel_mount_preparation();
+    worker.poll_cancelled_mount_preparations();
+
+    assert!(stopped.load(std::sync::atomic::Ordering::Acquire));
+    assert!(worker.mount.is_none());
+    assert!(worker.cancelled_mount_preparations.is_empty());
+}
+
 #[test]
 fn mount_root_errors_preserve_io_kind_context_and_permission_guidance() {
     for kind in [
@@ -106,7 +164,7 @@ fn remove_foreign_links_reports_and_preserves_real_files() {
 }
 
 #[test]
-fn failed_mount_logs_its_stage_and_path_before_and_after_validation() {
+fn cold_mount_preserves_the_selected_folder_until_catalogue_load_finishes() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("roms");
     std::fs::create_dir(&root).unwrap();
@@ -117,27 +175,9 @@ fn failed_mount_logs_its_stage_and_path_before_and_after_validation() {
     worker.server_id = Some("server".into());
     worker.start_mount(root.to_str().unwrap());
     let events: Vec<_> = events.try_iter().collect();
-    let checking = events
+    assert!(events
         .iter()
-        .position(|event| {
-            matches!(event,
-        AppEvent::Log(line) if line.message.contains("checking and preparing")
-            && line.message.contains("roms"))
-        })
-        .unwrap();
-    let failed = events
-        .iter()
-        .position(|event| {
-            matches!(event,
-        AppEvent::MountFailed { reason } if reason.contains("prepare and validate directory")
-            && reason.contains("roms") && reason.contains("not empty"))
-        })
-        .unwrap();
-    assert!(checking < failed);
-    assert!(events.iter().any(|event| matches!(event,
-        AppEvent::Log(line) if line.level == Level::Error
-            && line.message.contains("prepare and validate directory")
-            && line.message.contains("not empty"))));
+        .any(|event| matches!(event, AppEvent::MountStarting { .. })));
     assert_eq!(std::fs::read(root.join("save.srm")).unwrap(), b"user data");
 }
 
@@ -273,9 +313,13 @@ fn worker_loop_sweeps_again_after_the_mount_start_sweep() {
             metadata_source: None,
             metadata_ready: None,
             metadata_wait_reported: false,
+            metadata_retry_at: None,
             metadata_publish: None,
             metadata_publish_handle: None,
             draining: Vec::new(),
+            cancelled_mount_preparations: Vec::new(),
+            pending_root_cleanup: Vec::new(),
+            signed_out_root: None,
             rom_cache_directory: None,
             sink,
             client: None,
@@ -312,11 +356,15 @@ fn worker_loop_sweeps_again_after_the_mount_start_sweep() {
             save_sync_gate: SaveSyncCommandGate::new(),
             connection_gate: SaveSyncCommandGate::new(),
             current_connection_epoch: 0,
+            pending_save_sync_disable: None,
             current_save_sync_epoch: 0,
             save_sync_runtime_problem: None,
             save_sync_session_id: 0,
             play_data_enabled: false,
             play_data_available: false,
+            play_data_permission_denied: false,
+            mount_preparation: None,
+            pending_mount_start: None,
             play_data_problem: None,
             hide_copies_count: 0,
             play_watch: None,

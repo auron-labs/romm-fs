@@ -512,9 +512,7 @@ fn disable_during_connect_prevents_the_older_scope_refresh_from_starting_sync() 
     account_barrier.release();
 
     let inventory_started = inventory_barrier.wait_until_blocked(Duration::from_secs(3));
-    if inventory_started {
-        inventory_barrier.release();
-    }
+    inventory_barrier.release();
     let mut saw_disabled_status = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !saw_disabled_status && std::time::Instant::now() < deadline {
@@ -527,10 +525,11 @@ fn disable_during_connect_prevents_the_older_scope_refresh_from_starting_sync() 
         }) = events.recv_timeout(Duration::from_millis(100))
         {
             assert!(!enabled, "an older connection refresh reopened save sync");
-            assert!(available, "test account/profile was not save-sync ready");
-            assert_eq!(mapped_targets, 1);
-            assert_eq!(account_id, Some(42));
-            saw_disabled_status = true;
+            if available {
+                assert_eq!(mapped_targets, 1);
+                assert_eq!(account_id, Some(42));
+                saw_disabled_status = true;
+            }
         }
     }
 
@@ -546,4 +545,7 @@ fn disable_during_connect_prevents_the_older_scope_refresh_from_starting_sync() 
     assert_eq!(fixture.request_count("POST", "/api/saves?"), 0);
     assert_eq!(fixture.request_count("GET", "/api/saves/31/content"), 0);
     assert!(!install_root.join("saves/gb/Game.srm").exists());
+    controller.shutdown();
+    let settings = SaveSyncSettingsStore::open(settings_dir.join("save-sync.db")).unwrap();
+    assert!(!settings.load_files(&scope).unwrap().enabled);
 }

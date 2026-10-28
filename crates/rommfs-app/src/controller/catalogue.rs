@@ -42,7 +42,10 @@ impl Worker {
         self.sink.emit(AppEvent::CatalogueSnapshot {
             refreshed_at: snapshot.refreshed_at,
             cached,
-            pending_remount: self.mount.is_some(),
+            pending_remount: self
+                .fs
+                .as_ref()
+                .is_some_and(|mounted| !same_projected_tree(mounted.catalogue(), &cat)),
         });
         self.source_snapshot = Some(snapshot);
         Ok(cat)
@@ -90,20 +93,6 @@ impl Worker {
             }
             Ok(None) => false,
         }
-    }
-
-    pub(super) fn load_catalogue(&mut self, client: &RommClient) -> Result<Catalogue> {
-        self.sink.emit(AppEvent::CatalogueLoading);
-        self.catalogue_operation_id += 1;
-        let snapshot = fetch_catalogue(
-            client,
-            &self.sink,
-            self.catalogue_operation_id,
-            self.source_snapshot.clone(),
-        )?;
-        let cat = self.publish_snapshot(snapshot.clone(), false)?;
-        self.persist_snapshot(&snapshot);
-        Ok(cat)
     }
 
     /// At most one refresh in flight. The mounted tree remains immutable; the
@@ -164,6 +153,7 @@ impl Worker {
     }
 
     pub(super) fn cancel_catalogue_refresh(&mut self) {
+        self.pending_mount_start = None;
         if let Some(active) = self.refresh_active.take() {
             active.store(false, std::sync::atomic::Ordering::Release);
         }
@@ -225,6 +215,9 @@ impl Worker {
             },
             Err(error) => self.catalogue_refresh_failed(error),
         }
+        if let Some(path) = self.pending_mount_start.take() {
+            self.start_mount(&path);
+        }
     }
 
     pub(super) fn catalogue_refresh_failed(&mut self, error: Error) {
@@ -244,6 +237,9 @@ impl Worker {
             "catalogue",
             format!("Refresh failed; retaining last complete snapshot: {error}"),
         );
+        if let Some(path) = self.pending_mount_start.take() {
+            self.fail_mount("load catalogue", &path, &error);
+        }
     }
 
     pub(super) fn store_catalogue(&mut self, cat: Catalogue) {
@@ -255,4 +251,17 @@ impl Worker {
             .collect();
         self.catalogue = Some(cat);
     }
+}
+
+fn same_projected_tree(a: &Catalogue, b: &Catalogue) -> bool {
+    a.platforms == b.platforms
+        && a.entries.len() == b.entries.len()
+        && a.entries.iter().zip(&b.entries).all(|(a, b)| {
+            a.key == b.key
+                && a.platform_dir == b.platform_dir
+                && a.file_name == b.file_name
+                && a.size == b.size
+                && a.version == b.version
+                && a.content_name == b.content_name
+        })
 }

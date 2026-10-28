@@ -63,11 +63,15 @@ impl MemoryCardAgent {
     }
 
     pub(crate) fn stop(&mut self) {
-        self.active.store(false, Ordering::SeqCst);
-        let _ = self.stop.send(());
+        self.cancel();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.active.store(false, Ordering::SeqCst);
+        let _ = self.stop.send(());
     }
 }
 

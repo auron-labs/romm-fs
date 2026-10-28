@@ -249,6 +249,13 @@ pub fn check_mount_root(root: &Path, server_id: &str) -> anyhow::Result<RootChec
     Ok(RootCheck::RecognizedOwned)
 }
 
+/// Validate ownership and hold the backend-managed root for RetroBat setup.
+pub fn hold_mount_root(root: &Path, server_id: &str) -> anyhow::Result<Vec<fs::File>> {
+    let guards = hold_metadata_directories(root, root)?;
+    check_mount_root(root, server_id)?;
+    Ok(guards)
+}
+
 /// Writable ordinary files are owned by path/role, not by a content digest:
 /// frontend edits are expected. Links and object-type substitution are not.
 pub(crate) fn verify_local(path: &Path, entry: &OwnedEntry) -> anyhow::Result<()> {
@@ -288,32 +295,108 @@ pub fn read_frontend_metadata(
     rommfs_core::retrobat::MetadataIndex,
     std::collections::BTreeMap<String, String>,
 )> {
-    check_mount_root(root, server)?;
-    let manifest = read_manifest(root)?;
-    let mut index = rommfs_core::retrobat::MetadataIndex::default();
-    let mut gamelists = std::collections::BTreeMap::new();
-    for entry in manifest
-        .entries
-        .iter()
-        .filter(|e| matches!(e.kind, OwnedKind::Gamelist | OwnedKind::FrontendState))
-    {
-        let path = root.join(&entry.path);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
-        };
-        if entry.kind == OwnedKind::Gamelist {
-            let platform = entry
-                .path
-                .strip_suffix("/gamelist.xml")
-                .context("invalid gamelist ownership path")?;
-            gamelists.insert(platform.into(), String::from_utf8(bytes)?);
-        } else if entry.path == ".rommfs-metadata/index.json" {
-            index = serde_json::from_slice(&bytes).context("invalid frontend identity index")?;
-        }
+    FrontendMetadata::begin(root, server)?.read()
+}
+
+/// One metadata pass over a backend-validated mount root. Its manifest is
+/// scoped to the pass; each target is still checked immediately before access.
+pub struct FrontendMetadata {
+    root: PathBuf,
+    server: String,
+    manifest: Manifest,
+}
+
+impl FrontendMetadata {
+    pub fn begin(root: &Path, server: &str) -> anyhow::Result<Self> {
+        let started = std::time::Instant::now();
+        check_mount_root(root, server)?;
+        let manifest = read_manifest(root)?;
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            entries = manifest.entries.len(),
+            "frontend metadata root validated"
+        );
+        Ok(Self {
+            root: root.to_path_buf(),
+            server: server.to_string(),
+            manifest,
+        })
     }
-    Ok((index, gamelists))
+
+    pub fn validate_linked_root(&self, root: &Path) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.manifest.server_id == self.server,
+            "metadata root ownership changed"
+        );
+        anyhow::ensure!(
+            fs::canonicalize(root)? == fs::canonicalize(&self.root)?,
+            "frontend link targets a different managed root"
+        );
+        Ok(())
+    }
+
+    pub fn read(
+        &self,
+    ) -> anyhow::Result<(
+        rommfs_core::retrobat::MetadataIndex,
+        std::collections::BTreeMap<String, String>,
+    )> {
+        let mut index = rommfs_core::retrobat::MetadataIndex::default();
+        let mut gamelists = std::collections::BTreeMap::new();
+        for entry in self
+            .manifest
+            .entries
+            .iter()
+            .filter(|e| matches!(e.kind, OwnedKind::Gamelist | OwnedKind::FrontendState))
+        {
+            let path = self.root.join(&entry.path);
+            if path.exists() {
+                verify_local(&path, entry)?;
+            }
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if entry.kind == OwnedKind::Gamelist {
+                let platform = entry
+                    .path
+                    .strip_suffix("/gamelist.xml")
+                    .context("invalid gamelist ownership path")?;
+                gamelists.insert(platform.into(), String::from_utf8(bytes)?);
+            } else if entry.path == ".rommfs-metadata/index.json" {
+                index =
+                    serde_json::from_slice(&bytes).context("invalid frontend identity index")?;
+            }
+        }
+        Ok((index, gamelists))
+    }
+
+    pub fn publish(
+        &mut self,
+        index: &rommfs_core::retrobat::MetadataIndex,
+        artwork: &std::collections::BTreeMap<String, PathBuf>,
+        publish_gamelists: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.publish_with(index, artwork, || false, publish_gamelists)
+    }
+
+    pub fn publish_with(
+        &mut self,
+        index: &rommfs_core::retrobat::MetadataIndex,
+        artwork: &std::collections::BTreeMap<String, PathBuf>,
+        mut cancelled: impl FnMut() -> bool,
+        publish_gamelists: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        publish_frontend_metadata_validated(
+            &self.root,
+            &mut self.manifest,
+            index,
+            artwork,
+            &mut cancelled,
+            publish_gamelists,
+        )
+    }
 }
 
 /// Publish artwork and the identity index while the caller holds the stopped
@@ -329,45 +412,88 @@ pub fn publish_frontend_metadata(
 ) -> anyhow::Result<()> {
     check_mount_root(root, server)?;
     let mut manifest = read_manifest(root)?;
-    let index_path = ".rommfs-metadata/index.json";
-    publish_local(
+    publish_frontend_metadata_validated(
         root,
         &mut manifest,
+        index,
+        artwork,
+        &mut || false,
+        publish_gamelists,
+    )
+}
+
+fn publish_frontend_metadata_validated(
+    root: &Path,
+    manifest: &mut Manifest,
+    index: &rommfs_core::retrobat::MetadataIndex,
+    artwork: &std::collections::BTreeMap<String, PathBuf>,
+    cancelled: &mut impl FnMut() -> bool,
+    publish_gamelists: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    let index_path = ".rommfs-metadata/index.json";
+    anyhow::ensure!(!cancelled(), "frontend metadata publication cancelled");
+    publish_local(
+        root,
+        manifest,
         index_path,
         OwnedKind::FrontendState,
         &serde_json::to_vec(&index.staged())?,
         false,
+        cancelled,
     )?;
     // Claim the whole artwork batch before writing bytes, not one manifest rewrite per image.
     for path in artwork.keys() {
-        publish_local(root, &mut manifest, path, OwnedKind::Artwork, &[], true)?;
+        anyhow::ensure!(!cancelled(), "frontend metadata publication cancelled");
+        publish_local(
+            root,
+            manifest,
+            path,
+            OwnedKind::Artwork,
+            &[],
+            true,
+            cancelled,
+        )?;
     }
     if !artwork.is_empty() {
-        write_manifest(root, &manifest)?;
+        anyhow::ensure!(!cancelled(), "frontend metadata publication cancelled");
+        write_manifest(root, manifest)?;
     }
+    let mut updated = 0;
     for (path, source) in artwork {
+        anyhow::ensure!(!cancelled(), "frontend metadata publication cancelled");
         rommfs_core::save_sync::ensure_no_reparse_components(source)?;
         anyhow::ensure!(
             fs::metadata(source)?.len() <= 32 * 1024 * 1024,
             "oversized cached artwork"
         );
-        publish_local(
+        updated += publish_local(
             root,
-            &mut manifest,
+            manifest,
             path,
             OwnedKind::Artwork,
             &fs::read(source)?,
             false,
-        )?;
+            cancelled,
+        )? as usize;
     }
+    tracing::info!(
+        reused = artwork.len() - updated,
+        updated,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "frontend artwork publication complete"
+    );
+    anyhow::ensure!(!cancelled(), "frontend metadata publication cancelled");
     publish_gamelists()?;
+    anyhow::ensure!(!cancelled(), "frontend metadata publication cancelled");
     publish_local(
         root,
-        &mut manifest,
+        manifest,
         index_path,
         OwnedKind::FrontendState,
         &serde_json::to_vec(index)?,
         false,
+        cancelled,
     )?;
     Ok(())
 }
@@ -379,7 +505,8 @@ fn publish_local(
     kind: OwnedKind,
     bytes: &[u8],
     claim_only: bool,
-) -> anyhow::Result<()> {
+    cancelled: &mut impl FnMut() -> bool,
+) -> anyhow::Result<bool> {
     let _guard = rommfs_core::save_sync::hold_save_directory_chain(
         root.parent().context("missing mount parent")?,
     )?;
@@ -391,6 +518,25 @@ fn publish_local(
     );
     for part in &parts {
         validate_windows_path_component(part).map_err(anyhow::Error::msg)?;
+    }
+    if kind == OwnedKind::Artwork {
+        if let Some(entry) = manifest.entries.iter().find(|entry| {
+            entry.path.eq_ignore_ascii_case(relative)
+                && entry.kind == OwnedKind::Artwork
+                && !entry.directory
+        }) {
+            let target = root.join(relative);
+            if target.try_exists()? {
+                let _target_guard = hold_metadata_directories(
+                    root,
+                    target.parent().context("missing artwork parent")?,
+                )?;
+                verify_local(&target, entry)?;
+                if claim_only || fs::read(&target)? == bytes {
+                    return Ok(false);
+                }
+            }
+        }
     }
     let mut directory = String::new();
     for part in &parts[..parts.len() - 1] {
@@ -414,6 +560,7 @@ fn publish_local(
             manifest
                 .entries
                 .push(local_entry(&directory, OwnedKind::ManagedDirectory, true));
+            anyhow::ensure!(!cancelled(), "frontend metadata publication cancelled");
             write_manifest(root, manifest)?;
         }
         if !target.try_exists()? {
@@ -469,11 +616,12 @@ fn publish_local(
         }
         manifest.entries.push(local_entry(relative, kind, false));
         if !claim_only {
+            anyhow::ensure!(!cancelled(), "frontend metadata publication cancelled");
             write_manifest(root, manifest)?;
         }
     }
     if claim_only {
-        return Ok(());
+        return Ok(false);
     }
     // A named, claimed staging file makes interruption recoverable even when
     // the volume root refuses sibling files (e.g. a standard user's C:\ROMs).
@@ -498,6 +646,7 @@ fn publish_local(
             OwnedKind::FrontendState,
             false,
         ));
+        anyhow::ensure!(!cancelled(), "frontend metadata publication cancelled");
         write_manifest(root, manifest)?;
     }
     let _staging_guard = hold_metadata_directories(
@@ -518,6 +667,7 @@ fn publish_local(
         options.share_mode(0);
     }
     let mut staged = options.open(&staging)?;
+    anyhow::ensure!(!cancelled(), "frontend metadata publication cancelled");
     staged.write_all(bytes)?;
     staged.sync_all()?;
     drop(staged);
@@ -529,10 +679,11 @@ fn publish_local(
             "redirected metadata file was preserved"
         );
     }
+    anyhow::ensure!(!cancelled(), "frontend metadata publication cancelled");
     fs::rename(staging, &target)?;
     #[cfg(windows)]
     crate::windows::make_local_writable(&target)?;
-    Ok(())
+    Ok(true)
 }
 
 fn hold_metadata_directories(root: &Path, directory: &Path) -> anyhow::Result<Vec<fs::File>> {

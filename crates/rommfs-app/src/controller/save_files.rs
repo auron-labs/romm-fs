@@ -295,7 +295,12 @@ impl Worker {
                 rommfs_core::save_sync::ensure_distinct(&plan.report.mappings)?;
             }
             unmatched = plan.unmatched;
-            let consent = settings.load_files(&scope)?;
+            let mut consent = settings.load_files(&scope)?;
+            if self.pending_save_sync_disable == Some(self.current_connection_epoch) {
+                consent.enabled = false;
+                settings.save_files(&scope, consent)?;
+                self.pending_save_sync_disable = None;
+            }
             self.save_sync_enabled = consent.enabled;
             self.save_sync_debounce_secs = consent.debounce_secs;
             self.save_sync_profile = Some(RetroBatGbProfile {

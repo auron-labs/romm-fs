@@ -143,8 +143,7 @@ impl RommfsWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let missing_permission =
-            !self.state.play_data_available && self.state.conn == ConnectionState::Connected;
+        let missing_permission = self.state.play_data_permission_denied;
         v_flex()
             .gap_4()
             .child(card(cx).p_4().child(self.render_connection(window, cx)))
@@ -239,7 +238,7 @@ impl RommfsWindow {
                     ),
                 ),
             )
-            .child(card(cx).p_4().child(self.layout_radio(locked, cx)))
+            .child(card(cx).p_4().child(self.layout_radio(locked, true, cx)))
             .child(card(cx).p_4().child(self.render_start_at_login(cx)))
     }
 
@@ -323,7 +322,23 @@ impl RommfsWindow {
         if let Some(chip) = self.lock_chip(cx) {
             tab = tab.child(chip);
         }
-        tab.child(self.retrobat_step(
+        tab.child(
+            h_flex()
+                .justify_between()
+                .items_center()
+                .child(section_heading("Check RetroBat links"))
+                .child(
+                    Button::new("refresh-retrobat-links")
+                        .label("Check now")
+                        .outline()
+                        .small()
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.controller.send(Command::RefreshIntegration);
+                            cx.notify();
+                        })),
+                ),
+        )
+        .child(self.retrobat_step(
             0,
             "Install RetroBat",
             (steps.install, None),
@@ -920,17 +935,28 @@ impl RommfsWindow {
             StepStatus::Blocked(reason) => Some(reason),
             _ => None,
         };
-        let enabled = matches!(
-            status,
-            StepStatus::Ready | StepStatus::Failed | StepStatus::Done
-        );
-        let running = status == StepStatus::Running;
-        let label = match status {
-            StepStatus::Failed => "Retry setup",
-            StepStatus::Done => "Set up again",
-            _ => "Set up RetroBat",
-        };
+        let issues = self.state.retrobat_setup_issues.clone();
+        let needs_repair = !issues.is_empty();
         let done = status == StepStatus::Done;
+        let enabled = needs_repair
+            || matches!(
+                status,
+                StepStatus::Ready | StepStatus::Failed | StepStatus::Done
+            );
+        let running = status == StepStatus::Running;
+        let label = if needs_repair {
+            if self.state.mount == MountState::Mounted {
+                "Stop and repair"
+            } else {
+                "Repair links"
+            }
+        } else {
+            match status {
+                StepStatus::Failed => "Retry setup",
+                StepStatus::Done => "Set up again",
+                _ => "Set up RetroBat",
+            }
+        };
         let skipped = if done {
             self.state.retrobat_setup_skipped.clone()
         } else {
@@ -946,8 +972,10 @@ impl RommfsWindow {
         };
         let mut action = Button::new("setup-retrobat")
             .label(label)
-            .disabled(!enabled)
-            .tooltip("Close RetroBat and its emulators first.");
+            .disabled(!enabled || self.state.retrobat_setup_running || self.state.mount_stopping);
+        if !needs_repair {
+            action = action.tooltip("Gamelist updates wait until RetroBat closes.");
+        }
         action = if primary && status != StepStatus::Done {
             action.primary()
         } else {
@@ -959,8 +987,13 @@ impl RommfsWindow {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(action.on_click(cx.listener(|view, _, _, cx| {
-                        view.run_retrobat_setup(cx);
+                    .child(action.on_click(cx.listener(move |view, _, _, cx| {
+                        if needs_repair {
+                            view.controller.send(Command::RepairRetroBat);
+                        } else {
+                            view.run_retrobat_setup(cx);
+                        }
+                        cx.notify();
                     })))
                     .when_some(blocked, |this, reason| this.child(muted_xs(reason, cx))),
             )
@@ -974,24 +1007,65 @@ impl RommfsWindow {
                         cx,
                     ))
             })
+            .when(needs_repair && !done, |this| {
+                this.child(status_marker(StatusKind::Warning, "Links need repair", cx))
+                    .child(muted(
+                        format!(
+                            "Missing links: {}",
+                            issues
+                                .iter()
+                                .map(|issue| issue.system.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        cx,
+                    ))
+                    .child(skipped_systems_chips(issues.clone()))
+            })
             .when(done, |this| {
-                this.child(status_marker(StatusKind::Success, "Connected", cx))
-                    .when(!skipped.is_empty(), |this| {
-                        this.child(muted(
-                            format!("{} couldn't be linked", plural(skipped.len(), "system")),
-                            cx,
-                        ))
-                        .child(skipped_systems_chips(skipped.clone()))
-                    })
-                    .when_some(restored, |this, (note, lines)| {
-                        this.child(muted(note, cx)).child(notes_disclosure(
-                            "setup-notes",
-                            "Setup details".into(),
-                            lines,
-                            window,
-                            cx,
-                        ))
-                    })
+                this.child(status_marker(
+                    if needs_repair {
+                        StatusKind::Warning
+                    } else {
+                        StatusKind::Success
+                    },
+                    if needs_repair {
+                        "Links need repair"
+                    } else {
+                        "Connected"
+                    },
+                    cx,
+                ))
+                .when(!issues.is_empty(), |this| {
+                    this.child(muted(
+                        format!(
+                            "Missing links: {}",
+                            issues
+                                .iter()
+                                .map(|issue| issue.system.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        cx,
+                    ))
+                    .child(skipped_systems_chips(issues.clone()))
+                })
+                .when(!skipped.is_empty(), |this| {
+                    this.child(muted(
+                        format!("{} couldn't be linked", plural(skipped.len(), "system")),
+                        cx,
+                    ))
+                    .child(skipped_systems_chips(skipped.clone()))
+                })
+                .when_some(restored, |this, (note, lines)| {
+                    this.child(muted(note, cx)).child(notes_disclosure(
+                        "setup-notes",
+                        "Setup details".into(),
+                        lines,
+                        window,
+                        cx,
+                    ))
+                })
             })
             .when_some(self.render_foreign_remediation(cx), |this, block| {
                 this.child(block)

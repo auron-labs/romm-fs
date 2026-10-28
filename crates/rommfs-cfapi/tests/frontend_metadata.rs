@@ -1,5 +1,6 @@
 use rommfs_cfapi::{
-    check_mount_root, claim_mount_root, publish_frontend_metadata, read_frontend_metadata,
+    check_mount_root, claim_mount_root, hold_mount_root, publish_frontend_metadata,
+    read_frontend_metadata, FrontendMetadata,
 };
 use rommfs_core::catalogue::build_catalogue;
 use rommfs_core::retrobat::{
@@ -52,6 +53,14 @@ fn claimed_root() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 #[test]
+fn backend_mount_guard_checks_root_ownership() {
+    let (_tmp, root) = claimed_root();
+    let guard = hold_mount_root(&root, "s").unwrap();
+    drop(guard);
+    assert!(hold_mount_root(&root, "other-server").is_err());
+}
+
+#[test]
 fn artwork_batch_is_owned_before_publication_and_reusable() {
     let (tmp, root) = claimed_root();
     let output = publication(&BTreeMap::new(), &MetadataIndex::default());
@@ -63,10 +72,28 @@ fn artwork_batch_is_owned_before_publication_and_reusable() {
     ]);
     publish_frontend_metadata(&root, "s", output.index(), &artwork, || Ok(())).unwrap();
     check_mount_root(&root, "s").unwrap();
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(unix)]
+    let original_inode = fs::metadata(root.join("gb/.rommfs-artwork/cover.png"))
+        .unwrap()
+        .ino();
     publish_frontend_metadata(&root, "s", output.index(), &artwork, || Ok(())).unwrap();
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(root.join("gb/.rommfs-artwork/cover.png"))
+            .unwrap()
+            .ino(),
+        original_inode,
+        "unchanged versioned artwork keeps its existing file"
+    );
     for path in artwork.keys() {
         assert_eq!(fs::read(root.join(path)).unwrap(), b"cached artwork");
     }
+    let removed = "gb/.rommfs-artwork/screenshot.png";
+    fs::remove_file(root.join(removed)).unwrap();
+    publish_frontend_metadata(&root, "s", output.index(), &artwork, || Ok(())).unwrap();
+    assert_eq!(fs::read(root.join(removed)).unwrap(), b"cached artwork");
 
     let foreign = "gb/.rommfs-artwork/user.png";
     fs::write(root.join(foreign), b"user artwork").unwrap();
@@ -106,6 +133,50 @@ fn gamelists_are_written_between_the_staged_and_final_index() {
     assert!(fs::read_to_string(&index_path)
         .unwrap()
         .contains("\"pending_publication\":true"));
+}
+
+#[test]
+fn cancelled_publication_does_not_write_or_commit_stale_metadata() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (_tmp, root) = claimed_root();
+    let index = MetadataIndex::default();
+    let artwork = BTreeMap::new();
+    let index_path = root.join(".rommfs-metadata/index.json");
+
+    let mut metadata = FrontendMetadata::begin(&root, "s").unwrap();
+    assert!(metadata
+        .publish_with(
+            &index,
+            &artwork,
+            || true,
+            || panic!("cancelled before publication")
+        )
+        .is_err());
+    assert!(
+        !index_path.exists(),
+        "cancellation before publication writes nothing"
+    );
+
+    let mut metadata = FrontendMetadata::begin(&root, "s").unwrap();
+    let active = AtomicBool::new(true);
+    assert!(metadata
+        .publish_with(
+            &index,
+            &artwork,
+            || !active.load(Ordering::Acquire),
+            || {
+                active.store(false, Ordering::Release);
+                Ok(())
+            },
+        )
+        .is_err());
+    let staged = fs::read_to_string(index_path).unwrap();
+    assert!(staged.contains("\"pending_publication\":true"), "{staged}");
+    assert!(
+        !staged.contains("\"pending_publication\":false"),
+        "{staged}"
+    );
 }
 
 #[test]

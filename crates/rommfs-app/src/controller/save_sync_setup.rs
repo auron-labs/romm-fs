@@ -127,7 +127,14 @@ impl Worker {
             _ => None,
         };
         let consent = match (self.save_sync_settings.as_ref(), scope.as_ref()) {
-            (Some(settings), Some(scope)) => match settings.load(scope) {
+            (Some(settings), Some(scope)) => match settings.load(scope).and_then(|mut consent| {
+                if self.pending_save_sync_disable == Some(self.current_connection_epoch) {
+                    consent.enabled = false;
+                    settings.save(scope, consent)?;
+                    self.pending_save_sync_disable = None;
+                }
+                Ok(consent)
+            }) {
                 Ok(consent) => Some(consent),
                 Err(error) => {
                     selected_problem = Some(format!("Consent settings could not be read: {error}"));
@@ -324,6 +331,9 @@ impl Worker {
     }
 
     pub(super) fn set_save_sync_enabled(&mut self, enabled: bool) {
+        if !enabled {
+            self.pending_save_sync_disable = Some(self.current_connection_epoch);
+        }
         if enabled {
             let ready = self.save_sync_scope.is_some()
                 && self.save_sync_profile.is_some()
@@ -374,6 +384,7 @@ impl Worker {
                 self.refresh_save_sync();
                 return;
             }
+            self.pending_save_sync_disable = None;
         } else if enabled {
             self.save_sync_runtime_problem = Some("Consent scope is unavailable.".into());
             self.refresh_save_sync();
@@ -468,6 +479,49 @@ impl Worker {
             destination,
             error,
         });
+    }
+
+    pub(super) fn resolve_save_conflict(
+        &mut self,
+        session_id: u64,
+        rom_id: i64,
+        file_id: i64,
+        local_hash: Option<&str>,
+        incoming_id: Option<&str>,
+    ) {
+        if session_id != self.save_sync_session_id {
+            return;
+        }
+        let result = (|| {
+            let scope = self.save_sync_scope.as_ref().ok_or_else(|| {
+                Error::Unsupported("save-sync scope is unavailable for conflict recovery".into())
+            })?;
+            let agent = self.save_sync_agent.as_ref().ok_or_else(|| {
+                Error::Unsupported("save-sync agent is unavailable for conflict recovery".into())
+            })?;
+            agent.resolve_conflict(
+                session_id,
+                rommfs_core::catalogue::RomKey {
+                    server_id: scope.server_id.clone(),
+                    rom_id,
+                    file_id,
+                },
+                local_hash.map(ToOwned::to_owned),
+                incoming_id.map(ToOwned::to_owned),
+            )
+        })();
+        match result {
+            Ok(()) => self.save_sync_runtime_problem = None,
+            Err(error) => {
+                self.save_sync_runtime_problem = Some(error.to_string());
+                self.log(
+                    Level::Warn,
+                    "save-sync",
+                    format!("save conflict recovery failed: {error}"),
+                );
+            }
+        }
+        self.refresh_save_sync();
     }
 
     pub(super) fn advance_save_sync_session(&mut self) {
@@ -587,7 +641,8 @@ impl Worker {
     pub(super) fn stop_save_sync_agent(&mut self) {
         self.save_sync_gate.close();
         if let Some(mut agent) = self.save_sync_agent.take() {
-            agent.stop();
+            agent.cancel();
+            self.draining.push(std::thread::spawn(move || agent.stop()));
         }
     }
 }

@@ -231,7 +231,9 @@ impl SaveSyncJournal {
                     current_local_hash, local_generation, local_ever_existed, local_removed,
                     remote_baseline_hash, remote_slot_id, snapshot_revision, snapshot_path,
                     snapshot_hash, snapshot_generation, remote_outcome, last_failure,
-                    local_baseline_hash, remote_history_ids
+                    local_baseline_hash, remote_history_ids, conflict_resolution,
+                    conflict_local_hash, conflict_history_ids, remote_history_fingerprint,
+                    conflict_history_fingerprint
                  FROM save_sync_slots
                  WHERE server_id = ?1 AND account_id = ?2 AND installation_root = ?3
                    AND effective_saves_root = ?4 AND rom_server_id = ?5
@@ -619,5 +621,15 @@ fn read_journal_slot(
             .filter(|id| !id.is_empty())
             .map(ToOwned::to_owned)
             .collect(),
+        conflict_resolution: row.get(23)?,
+        conflict_local_hash: row.get(24)?,
+        conflict_history_ids: row
+            .get::<_, String>(25)?
+            .split(',')
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        remote_history_fingerprint: row.get(26)?,
+        conflict_history_fingerprint: row.get(27)?,
     })
 }

@@ -86,6 +86,27 @@ fn relative_time(unix_secs: u64) -> String {
     }
 }
 
+fn save_game_options(games: &[(i64, String)]) -> Vec<(i64, String)> {
+    let mut totals = std::collections::HashMap::new();
+    for (_, name) in games {
+        *totals.entry(name.as_str()).or_insert(0usize) += 1;
+    }
+    let mut seen = std::collections::HashMap::new();
+    games
+        .iter()
+        .map(|(id, name)| {
+            let occurrence = seen.entry(name.as_str()).or_insert(0usize);
+            *occurrence += 1;
+            let label = if totals[name.as_str()] > 1 {
+                format!("{name} ({occurrence})")
+            } else {
+                name.clone()
+            };
+            (*id, label)
+        })
+        .collect()
+}
+
 fn fmt_count(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -300,6 +321,11 @@ impl RommfsWindow {
                 }
             },
         ));
+        subscriptions.push(cx.observe_window_activation(window, |view, window, _cx| {
+            if window.is_window_active() {
+                view.controller.send(Command::RefreshIntegration);
+            }
+        }));
 
         subscriptions.push(cx.subscribe_in(
             &install_select,
@@ -413,7 +439,7 @@ impl RommfsWindow {
             save_review_search,
             save_review_page: 0,
             save_review_expanded: None,
-            save_review_filter: 0,
+            save_review_filter: 2,
             activity_min_level: 0,
             activity_follow_log: true,
             activity_log_open: false,
@@ -441,9 +467,9 @@ impl RommfsWindow {
                 AppEvent::SaveFileMappings {
                     session_id, games, ..
                 } if *session_id == self.state.save_sync_session_id => {
-                    let items = games
-                        .iter()
-                        .map(|(id, name)| SharedString::from(format!("{id} · {name}")))
+                    let items = save_game_options(games)
+                        .into_iter()
+                        .map(|(_, label)| SharedString::from(label))
                         .collect::<Vec<_>>();
                     self.save_game_select.update(cx, |state, cx| {
                         state.set_items(SearchableVec::from(items), window, cx)
@@ -460,21 +486,13 @@ impl RommfsWindow {
                     save_sync_updated = true;
                 }
                 AppEvent::PairingReady { url, .. } => cx.open_url(url),
-                AppEvent::Connected => self.active_view = 0,
                 // SignedOut with no remembered account is the unconfigured
                 // state — guided setup, not the full settings page.
                 AppEvent::SignedOut => self.active_view = 4,
-                // A remembered account that needs re-auth IS configured —
-                // send it to Overview where the sign-in action lives
-                // (existing config must never replay onboarding).
-                AppEvent::SignInRequired { .. } => self.active_view = 0,
-                // A remembered account whose server is temporarily down is
-                // still configured — Overview, never guided setup again
-                // (UI-PLAN §4).
-                AppEvent::ConnectFailed { .. } if self.state.connected_server.is_some() => {
-                    self.active_view = 0;
-                }
                 AppEvent::ConnectionRestored { server, mount_root } => {
+                    if self.active_view == 4 && mount_root.is_some() {
+                        self.active_view = 0;
+                    }
                     self.url_input
                         .update(cx, |input, cx| input.set_value(server.clone(), window, cx));
                     if let Some(root) = mount_root {
@@ -482,6 +500,7 @@ impl RommfsWindow {
                             .update(cx, |input, cx| input.set_value(root.clone(), window, cx));
                     }
                 }
+                AppEvent::MountStarted { .. } if self.active_view == 4 => self.active_view = 0,
                 // An applied folder normalizes the field it was typed in.
                 AppEvent::MountRootConfigured { mount_root, .. } => {
                     self.mount_input.update(cx, |input, cx| {

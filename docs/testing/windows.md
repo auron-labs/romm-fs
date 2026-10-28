@@ -691,7 +691,7 @@ earlier password grant and GET preflight window from all app request counts.
 | `UI-MOUNT-START` | Enter the empty folder; press **Start games folder**. | Platform folders and ROM filenames appear in Explorer and PowerShell. |
 | `UI-MOUNT-LIST` | Run `Get-ChildItem -LiteralPath '<mount>' -Recurse` before opening a ROM. | Metadata appears. Use native fixture counters from section 2 as proof of no content downloads; Explorer may have other readers. |
 | `UI-MOUNT-READ` | Run `Get-FileHash -LiteralPath '<mounted ROM>' -Algorithm SHA256`; compare with its known source. Repeat. | Hashes match; warm reads do not create a new ROM transfer. Hashing performs a content read. |
-| `UI-MOUNT-STOP` | Press **Stop games folder**, inspect the folder, then **Start games folder** again. | Unmodified owned ROM placeholders are removed; owned frontend metadata and sibling ownership markers remain; cached bytes are reused on the next read. Busy or changed files may defer cleanup. |
+| `UI-MOUNT-STOP` | Press **Stop games folder**, inspect the folder, then **Start games folder** again. | Registration, owned placeholders, file identities, hydrated bytes, frontend metadata, and ownership markers remain. Unchanged restart creates and removes no placeholders. Cold reads require the provider to be running. |
 | `UI-MOUNT-CLOSE` | Close the window while mounted, then inspect the folder; reopen from tray and explicitly Quit. | Hiding retains the mount; Quit stops it and preserves owned metadata. If tray creation fails, closing the visible window quits instead. |
 | `UI-MOUNT-LEGACY-ROOT` | Put a sentinel file in a separate disposable folder; record its hash; attempt to mount there. | Mount is refused; sentinel and hash remain unchanged. Never test against a real old ROM/save library. |
 | `UI-MOUNT-OWNERSHIP` | Claim a test folder for server A, stop, then try it for a different server identity. | Ownership mismatch is refused. A configured URL base path is part of server identity. |
@@ -699,9 +699,10 @@ earlier password grant and GET preflight window from all app request counts.
 Replace the quoted placeholders with actual paths. Record errors, screenshots,
 and hashes. Do not remove ownership markers to bypass a rejection. The CFAPI
 backend stores a private copy in `%LOCALAPPDATA%\rommfs\cache\<server>` and an
-NTFS hydrated copy while mounted. Eviction must reclaim both. Clean Stop removes
-verified ROM placeholders and restores the original root ACL; frontend metadata
-remains, and busy/changed entries defer cleanup. Never
+NTFS hydrated copy while mounted. Eviction must reclaim both. Clean Stop retains
+registration, ROM placeholders, downloaded bytes, and frontend metadata.
+Explicit root/account replacement cleans only verified owned entries and
+restores the original root ACL. Busy or changed entries defer that cleanup. Never
 remove ownership markers or run recursive cleanup to bypass a refusal.
 
 For RetroBat layout, use **Settings → RetroBat → Set up RetroBat** with the

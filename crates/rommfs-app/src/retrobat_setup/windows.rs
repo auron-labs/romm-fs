@@ -127,7 +127,12 @@ pub(crate) fn run_elevated(
     }
     anyhow::ensure!(code == 0, "Elevated RetroBat setup did not complete. Close RetroBat and its emulators, check folder access, then retry (helper exit code {code})");
     // Inspect only: the normal app never repeats privileged mutations.
-    let outcome = rommfs_core::retrobat::inspect_setup(installation, managed, server)?;
+    let outcome = rommfs_core::retrobat::inspect_setup_with_root_check(
+        installation,
+        managed,
+        server,
+        |root| rommfs_cfapi::check_mount_root(root, server).map(|_| ()),
+    )?;
     Ok(super::SetupReport {
         messages: vec![outcome.summary(), super::switch_status(installation)],
         skipped: outcome.skipped,

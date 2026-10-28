@@ -215,6 +215,502 @@ fn conflicted_game_does_not_block_a_healthy_local_only_game() {
 }
 
 #[test]
+fn explicit_remote_choice_replaces_only_the_reviewed_local_version_and_keeps_backup() {
+    const REMOTE_BYTES: &[u8] = b"verified remote SRAM";
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    fixture.use_romm_save_store(ACCOUNT_ID, 201);
+    seed_remote(
+        &fixture,
+        92,
+        "550e8400-e29b-41d4-a716-446655440000",
+        REMOTE_BYTES,
+        "2026-10-05T12:34:56Z",
+    );
+    seed_remote(
+        &fixture,
+        96,
+        "550e8400-e29b-41d4-a716-446655440000",
+        b"competing verified remote SRAM",
+        "2026-10-05T12:34:56Z",
+    );
+    fixture.seed_save(FixtureSaveRecord {
+        id: 97,
+        rom_id: ROM_ID,
+        user_id: ACCOUNT_ID,
+        file_name: "foreign-save.srm".into(),
+        file_size_bytes: 18,
+        slot: RETROBAT_GB_SRM_PROFILE.into(),
+        bytes: b"unknown remote save".to_vec(),
+        created_at: "2026-10-05T12:34:56Z".into(),
+        updated_at: "2026-10-05T12:34:56Z".into(),
+    });
+    let case = case(directory.path(), &fixture, false);
+    let (sink, events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(5), |status| {
+            status.attention_games > 0
+        })
+        .is_some()
+    );
+    let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    let incoming = journal
+        .incoming_saves()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.state == "staged" && record.remote_id == "92")
+        .unwrap();
+    let old_hash = sha256_content_hash(SAVE_BYTES);
+    agent
+        .resolve_conflict(
+            1,
+            case.mapping.rom_key.clone(),
+            Some(old_hash),
+            Some(incoming.id),
+        )
+        .unwrap();
+    agent.stop();
+
+    assert_eq!(fs::read(&case.mapping.target_path).unwrap(), REMOTE_BYTES);
+    let backup = case
+        .mapping
+        .target_path
+        .parent()
+        .unwrap()
+        .read_dir()
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("rommfs-backup")
+        })
+        .unwrap();
+    assert_eq!(fs::read(backup).unwrap(), SAVE_BYTES);
+    let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    let slot = journal.slot(&case.mapping.rom_key).unwrap().unwrap();
+    assert!(!slot.needs_attention);
+    assert!(journal.incoming_saves().unwrap().is_empty());
+    assert_eq!(
+        slot.remote_baseline_hash.as_deref(),
+        Some(sha256_content_hash(REMOTE_BYTES).as_str())
+    );
+
+    let (sink, events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(5), |status| {
+            status.attention_games == 0 && status.reconciled_games > 0
+        })
+        .is_some(),
+        "the chosen RomM revision stays applied after restart despite unchanged competing and rejected history"
+    );
+    assert_eq!(fs::read(&case.mapping.target_path).unwrap(), REMOTE_BYTES);
+    agent.stop();
+}
+
+#[test]
+fn remote_choice_is_rejected_when_the_local_save_changed_after_review() {
+    const REMOTE_BYTES: &[u8] = b"verified remote SRAM";
+    const CHANGED_LOCAL: &[u8] = b"new emulator write after review";
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    fixture.use_romm_save_store(ACCOUNT_ID, 201);
+    seed_remote(
+        &fixture,
+        98,
+        "550e8400-e29b-41d4-a716-446655440000",
+        REMOTE_BYTES,
+        "2026-10-05T12:34:56Z",
+    );
+    let case = case(directory.path(), &fixture, false);
+    let (sink, events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(5), |status| {
+            status.attention_games > 0
+        })
+        .is_some()
+    );
+    let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    let incoming = journal
+        .incoming_saves()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.state == "staged")
+        .unwrap();
+    drop(journal);
+
+    fs::write(&case.mapping.target_path, CHANGED_LOCAL).unwrap();
+    let error = agent
+        .resolve_conflict(
+            1,
+            case.mapping.rom_key.clone(),
+            Some(sha256_content_hash(SAVE_BYTES)),
+            Some(incoming.id),
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("local save changed since review"));
+    assert_eq!(fs::read(&case.mapping.target_path).unwrap(), CHANGED_LOCAL);
+    let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    assert!(journal
+        .incoming_saves()
+        .unwrap()
+        .iter()
+        .any(|record| record.remote_id == "98" && record.state == "staged"));
+    agent.stop();
+}
+
+#[test]
+fn remote_choice_restores_a_staged_save_after_reviewed_local_removal() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    fixture.use_romm_save_store(ACCOUNT_ID, 201);
+    seed_remote(
+        &fixture,
+        99,
+        "550e8400-e29b-41d4-a716-446655440000",
+        SAVE_BYTES,
+        "2026-10-05T12:34:56Z",
+    );
+    let case = case(directory.path(), &fixture, false);
+    accept_remote_baseline(&case, "99", SAVE_BYTES);
+    fs::remove_file(&case.mapping.target_path).unwrap();
+
+    let (sink, events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(5), |status| {
+            status
+                .incoming
+                .iter()
+                .any(|incoming| incoming.remote_id == "99" && incoming.state == "staged")
+        })
+        .is_some()
+    );
+    let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    let slot = journal.slot(&case.mapping.rom_key).unwrap().unwrap();
+    assert_eq!(slot.current_local_hash, None);
+    let incoming = journal
+        .incoming_saves()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.state == "staged" && record.remote_id == "99")
+        .unwrap();
+    drop(journal);
+
+    agent
+        .resolve_conflict(1, case.mapping.rom_key.clone(), None, Some(incoming.id))
+        .unwrap();
+    agent.stop();
+
+    assert_eq!(fs::read(&case.mapping.target_path).unwrap(), SAVE_BYTES);
+    let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    let slot = journal.slot(&case.mapping.rom_key).unwrap().unwrap();
+    assert!(!slot.needs_attention);
+    assert_eq!(slot.conflict_resolution.as_deref(), Some("use_remote_ack"));
+    assert_eq!(slot.conflict_local_hash, None);
+    assert!(journal.incoming_saves().unwrap().is_empty());
+
+    let (sink, events) = channel();
+    let mut restarted = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(5), |status| {
+            status.attention_games == 0 && status.reconciled_games > 0
+        })
+        .is_some()
+    );
+    restarted.stop();
+    assert_eq!(fs::read(&case.mapping.target_path).unwrap(), SAVE_BYTES);
+}
+
+#[test]
+fn remote_choice_rejects_a_local_save_created_after_absence_was_reviewed() {
+    const NEW_LOCAL: &[u8] = b"new local save after removal review";
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    fixture.use_romm_save_store(ACCOUNT_ID, 201);
+    seed_remote(
+        &fixture,
+        100,
+        "550e8400-e29b-41d4-a716-446655440000",
+        SAVE_BYTES,
+        "2026-10-05T12:34:56Z",
+    );
+    let case = case(directory.path(), &fixture, false);
+    accept_remote_baseline(&case, "100", SAVE_BYTES);
+    fs::remove_file(&case.mapping.target_path).unwrap();
+
+    let (sink, events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(5), |status| {
+            status
+                .incoming
+                .iter()
+                .any(|incoming| incoming.remote_id == "100" && incoming.state == "staged")
+        })
+        .is_some()
+    );
+    let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    let incoming = journal
+        .incoming_saves()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.state == "staged" && record.remote_id == "100")
+        .unwrap();
+    drop(journal);
+
+    fs::write(&case.mapping.target_path, NEW_LOCAL).unwrap();
+    let error = agent
+        .resolve_conflict(1, case.mapping.rom_key.clone(), None, Some(incoming.id))
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("local save changed since review"));
+    assert_eq!(fs::read(&case.mapping.target_path).unwrap(), NEW_LOCAL);
+    let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    assert!(journal
+        .incoming_saves()
+        .unwrap()
+        .iter()
+        .any(|record| record.remote_id == "100" && record.state == "staged"));
+    agent.stop();
+}
+
+#[test]
+fn explicit_local_choice_uploads_against_unchanged_acknowledged_history() {
+    const REMOTE_BYTES: &[u8] = b"remote SRAM kept in history";
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    fixture.use_romm_save_store(ACCOUNT_ID, 201);
+    seed_remote(
+        &fixture,
+        93,
+        "550e8400-e29b-41d4-a716-446655440000",
+        REMOTE_BYTES,
+        "2026-10-05T12:34:56Z",
+    );
+    let case = case(directory.path(), &fixture, false);
+    let (sink, events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(5), |status| {
+            status.attention_games > 0
+        })
+        .is_some()
+    );
+    agent
+        .resolve_conflict(
+            1,
+            case.mapping.rom_key.clone(),
+            Some(sha256_content_hash(SAVE_BYTES)),
+            None,
+        )
+        .unwrap();
+    assert!(wait_for_log(&events, Duration::from_secs(5), |message| {
+        message.contains("verified upload revision")
+    })
+    .is_some());
+    agent.stop();
+
+    let remote = fixture.saved_saves();
+    assert_eq!(remote.len(), 2, "the kept RomM revision remains present");
+    assert!(remote.iter().any(|save| save.bytes == REMOTE_BYTES));
+    assert!(remote.iter().any(|save| save.bytes == SAVE_BYTES));
+    let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    let slot = journal.slot(&case.mapping.rom_key).unwrap().unwrap();
+    assert!(!slot.needs_attention);
+    assert_eq!(slot.conflict_resolution.as_deref(), Some("keep_local_ack"));
+}
+
+#[test]
+fn keep_local_ack_with_rejected_history_survives_restart_and_later_uploads() {
+    const REMOTE_BYTES: &[u8] = b"remote history kept after choice";
+    const NEXT_LOCAL: &[u8] = b"later emulator save";
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    fixture.use_romm_save_store(ACCOUNT_ID, 201);
+    seed_remote(
+        &fixture,
+        94,
+        "550e8400-e29b-41d4-a716-446655440000",
+        REMOTE_BYTES,
+        "2026-10-05T12:34:56Z",
+    );
+    fixture.seed_save(FixtureSaveRecord {
+        id: 95,
+        rom_id: ROM_ID,
+        user_id: ACCOUNT_ID,
+        file_name: "foreign-save.srm".into(),
+        file_size_bytes: 18,
+        slot: RETROBAT_GB_SRM_PROFILE.into(),
+        bytes: b"unknown remote save".to_vec(),
+        created_at: "2026-10-05T12:34:56Z".into(),
+        updated_at: "2026-10-05T12:34:56Z".into(),
+    });
+    let case = case(directory.path(), &fixture, false);
+    let (sink, events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(5), |status| {
+            status.attention_games > 0
+        })
+        .is_some()
+    );
+    agent
+        .resolve_conflict(
+            1,
+            case.mapping.rom_key.clone(),
+            Some(sha256_content_hash(SAVE_BYTES)),
+            None,
+        )
+        .unwrap();
+    assert!(wait_for_log(&events, Duration::from_secs(5), |message| {
+        message.contains("verified upload revision")
+    })
+    .is_some());
+    agent.stop();
+
+    let (sink, events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(5), |status| {
+            status.attention_games == 0 && status.reconciled_games > 0
+        })
+        .is_some()
+    );
+    fs::write(&case.mapping.target_path, NEXT_LOCAL).unwrap();
+    assert!(wait_for_log(&events, Duration::from_secs(5), |message| {
+        message.contains("verified upload revision")
+    })
+    .is_some());
+    agent.stop();
+
+    let remote = fixture.saved_saves();
+    assert!(remote.iter().any(|save| save.bytes == REMOTE_BYTES));
+    assert!(remote
+        .iter()
+        .any(|save| save.file_name == "foreign-save.srm" && save.bytes == b"unknown remote save"));
+    assert!(remote.iter().any(|save| save.bytes == SAVE_BYTES));
+    assert!(remote.iter().any(|save| save.bytes == NEXT_LOCAL));
+    let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    let slot = journal.slot(&case.mapping.rom_key).unwrap().unwrap();
+    assert!(!slot.needs_attention);
+    assert_eq!(slot.conflict_resolution.as_deref(), Some("keep_local_ack"));
+    assert!(journal.incoming_saves().unwrap().is_empty());
+}
+
+#[test]
+fn keep_pc_after_verified_baseline_appends_a_new_revision_for_competing_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    fixture.use_romm_save_store(ACCOUNT_ID, 201);
+    let case = case(directory.path(), &fixture, false);
+    let reviewed_hash = sha256_content_hash(SAVE_BYTES);
+
+    let (sink, events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(wait_for_log(&events, Duration::from_secs(5), |message| {
+        message.contains("verified upload revision")
+    })
+    .is_some());
+    agent.stop();
+    assert_eq!(
+        fixture.request_count("POST", "/api/saves?rom_id=7&slot="),
+        1
+    );
+
+    let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    let slot = journal.slot(&case.mapping.rom_key).unwrap().unwrap();
+    assert_eq!(
+        slot.local_baseline_hash.as_deref(),
+        Some(reviewed_hash.as_str())
+    );
+    assert_eq!(
+        slot.current_local_hash.as_deref(),
+        Some(reviewed_hash.as_str())
+    );
+    drop(journal);
+
+    fixture.seed_save(FixtureSaveRecord {
+        id: 500,
+        rom_id: ROM_ID,
+        user_id: ACCOUNT_ID,
+        file_name: "foreign-save.srm".into(),
+        file_size_bytes: 18,
+        slot: RETROBAT_GB_SRM_PROFILE.into(),
+        bytes: b"unknown remote save".to_vec(),
+        created_at: "2026-10-06T12:34:56Z".into(),
+        updated_at: "2026-10-06T12:34:56Z".into(),
+    });
+    let (sink, events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(5), |status| {
+            status.attention_games > 0
+        })
+        .is_some()
+    );
+    let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    let slot = journal.slot(&case.mapping.rom_key).unwrap().unwrap();
+    assert!(slot.needs_attention);
+    assert_eq!(
+        slot.current_local_hash.as_deref(),
+        Some(reviewed_hash.as_str())
+    );
+    assert_eq!(
+        slot.local_baseline_hash.as_deref(),
+        Some(reviewed_hash.as_str())
+    );
+    drop(journal);
+
+    agent
+        .resolve_conflict(
+            1,
+            case.mapping.rom_key.clone(),
+            Some(reviewed_hash.clone()),
+            None,
+        )
+        .unwrap();
+    assert!(wait_for_log(&events, Duration::from_secs(5), |message| {
+        message.contains("verified upload revision")
+    })
+    .is_some());
+    agent.stop();
+
+    assert_eq!(
+        fixture.request_count("POST", "/api/saves?rom_id=7&slot="),
+        2
+    );
+    let remote = fixture.saved_saves();
+    assert!(remote.iter().any(|save| save.id == 500));
+    assert!(remote.iter().any(|save| save.bytes == SAVE_BYTES));
+    let local_revisions = remote
+        .iter()
+        .filter(|save| save.file_name.starts_with("rommfs-") && save.bytes == SAVE_BYTES)
+        .count();
+    assert_eq!(
+        local_revisions, 2,
+        "Keep PC appends an upload and preserves the accepted revision"
+    );
+
+    let (sink, events) = channel();
+    let mut restarted = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(5), |status| {
+            status.attention_games == 0 && status.reconciled_games > 0
+        })
+        .is_some()
+    );
+    restarted.stop();
+}
+
+#[test]
 fn tracked_local_removal_and_missing_remote_never_delete_or_resurrect_local_saves() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = FixtureServer::start();

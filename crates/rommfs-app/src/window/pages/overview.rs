@@ -20,6 +20,7 @@ impl RommfsWindow {
                 None,
                 cx,
             ))
+            .child(self.render_mount(window, cx))
             .when(show_connection, |this| {
                 let problem = self.state.conn_error.as_deref().map_or_else(
                     || {
@@ -45,7 +46,6 @@ impl RommfsWindow {
                     cx,
                 ))
             })
-            .child(self.render_mount(window, cx))
             .child(self.render_overview_retrobat(window, cx))
             .child(self.render_overview_saves(cx))
             .when(
@@ -79,7 +79,11 @@ impl RommfsWindow {
             .small()
             .on_click(cx.listener(|view, _, window, cx| {
                 view.active_view = 1;
-                view.save_review_filter = usize::from(view.state.save_sync_review_count() > 0);
+                view.save_review_filter = if view.state.save_sync_review_count() > 0 {
+                    1
+                } else {
+                    2
+                };
                 if view.save_review_filter == 1 {
                     view.save_review_search
                         .update(cx, |input, cx| input.set_value("", window, cx));
@@ -106,6 +110,14 @@ impl RommfsWindow {
         let migration = self.state.retrobat_setup_migration
             && !self.state.retrobat_setup_ok
             && !self.state.retrobat_setup_running;
+        let issues = &self.state.retrobat_setup_issues;
+        let needs_repair =
+            self.state.integration == IntegrationMode::RetroBat && !issues.is_empty();
+        let issue_names = issues
+            .iter()
+            .map(|issue| issue.system.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         let (text, kind, description) = if self.state.integration != IntegrationMode::RetroBat {
             (
                 "Optional",
@@ -117,6 +129,12 @@ impl RommfsWindow {
                 "Setting up…",
                 StatusKind::Muted,
                 "Connecting your RomM games to RetroBat.",
+            )
+        } else if needs_repair {
+            (
+                "Needs repair",
+                StatusKind::Warning,
+                "Some RetroBat links are missing.",
             )
         } else if self.state.retrobat_setup_error.is_some() {
             (
@@ -143,8 +161,22 @@ impl RommfsWindow {
                 "Choose your RetroBat installation and connect it to your library.",
             )
         };
-        let action = self
-            .settings_nav_button(
+        let action = if needs_repair {
+            Button::new("overview-retrobat-repair")
+                .label(if self.state.mount == MountState::Mounted {
+                    "Stop and repair"
+                } else {
+                    "Repair links"
+                })
+                .outline()
+                .small()
+                .disabled(self.state.mount_stopping || self.state.retrobat_setup_running)
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.controller.send(Command::RepairRetroBat);
+                    cx.notify();
+                }))
+        } else {
+            self.settings_nav_button(
                 "overview-retrobat",
                 if self.state.retrobat_setup_ok {
                     "RetroBat settings"
@@ -155,11 +187,13 @@ impl RommfsWindow {
                 false,
                 cx,
             )
-            .small();
+            .small()
+        };
         card(cx).p_4().child(
             v_flex().gap_2()
                 .child(status_row("RetroBat", kind, text, Some(action), cx))
                 .child(muted(description, cx))
+                .when(needs_repair, |this| this.child(muted(format!("Missing links: {issue_names}"), cx)))
                 .when(migration, |this| {
                     this.child(h_flex().child(
                         Button::new("overview-retrobat-update")
@@ -173,16 +207,17 @@ impl RommfsWindow {
                         .child(details_disclosure("overview-retrobat-error", error, window, cx))
                 })
                 .when_some(self.state.play_data_problem.clone(), |this, problem| {
+                    let denied = self.state.play_data_permission_denied;
                     this.child(muted(
-                        if problem.contains("403") {
+                        if denied {
                             "RomM denied access to favourites and play history. Check your account permissions in RomM."
                         } else {
-                            "Favourites and play history couldn't update. Check your RomM connection."
+                            "Favourites and play history couldn't update. See details for the failure."
                         },
                         cx,
                     ))
                     .child(details_disclosure("play-data-problem", problem, window, cx))
-                    .child(h_flex().child(self.settings_nav_button("play-data-connection", "Connection settings", 0, false, cx)))
+                    .when(denied, |this| this.child(h_flex().child(self.settings_nav_button("play-data-connection", "Reconnect", 0, false, cx))))
                 }),
         )
     }
@@ -199,10 +234,19 @@ impl RommfsWindow {
                 (StatusKind::Muted, "Updating…")
             }
             FrontendMetadataSummary::Waiting => (StatusKind::Warning, "Waiting for access"),
+            FrontendMetadataSummary::UpdatedWithIssues => {
+                (StatusKind::Warning, "Updated with issues")
+            }
             FrontendMetadataSummary::Failed => (StatusKind::Danger, "Update failed"),
             FrontendMetadataSummary::UpToDate => (StatusKind::Success, "Up to date"),
         };
-        let retry = (summary == FrontendMetadataSummary::Failed).then(|| {
+        let retry = matches!(
+            summary,
+            FrontendMetadataSummary::Waiting
+                | FrontendMetadataSummary::Failed
+                | FrontendMetadataSummary::UpdatedWithIssues
+        )
+        .then(|| {
             Button::new("overview-metadata-retry")
                 .label("Retry update")
                 .accessibility_label("Retry artwork and game information update")
@@ -216,9 +260,11 @@ impl RommfsWindow {
         card(cx).p_4().child(
             v_flex().gap_2()
                 .child(status_row("Artwork and game information", kind, text, retry, cx))
-                .when(self.state.frontend_metadata_pending, |this| {
-                    this.child(metadata_progress("overview-metadata-progress", &self.state, cx))
-                })
+                .when(
+                    self.state.frontend_metadata_pending
+                        && matches!(summary, FrontendMetadataSummary::CheckingArtwork | FrontendMetadataSummary::Publishing),
+                    |this| this.child(metadata_progress("overview-metadata-progress", &self.state, cx)),
+                )
                 .when(summary == FrontendMetadataSummary::NotStarted, |this| {
                     this.child(muted("Updates automatically when your games are available in RetroBat.", cx))
                 })

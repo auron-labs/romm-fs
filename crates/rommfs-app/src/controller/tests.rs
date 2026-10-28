@@ -47,6 +47,60 @@ fn create_test_retrobat_install(root: &Path, create_saves: bool) {
         .unwrap();
 }
 
+#[test]
+fn integration_and_metadata_summaries_follow_the_latest_result() {
+    let mut state = UiState::new(10);
+    let root = Some("C:/RetroBat".to_string());
+    state.apply_event(&AppEvent::IntegrationUpdated {
+        mode: IntegrationMode::RetroBat,
+        retrobat_root: root.clone(),
+        setup_complete: true,
+        setup_migration: false,
+        setup_issues: Vec::new(),
+        error: None,
+    });
+    assert!(state.retrobat_setup_ok);
+    state.apply_event(&AppEvent::IntegrationUpdated {
+        mode: IntegrationMode::RetroBat,
+        retrobat_root: root,
+        setup_complete: false,
+        setup_migration: false,
+        setup_issues: Vec::new(),
+        error: None,
+    });
+    assert!(!state.retrobat_setup_ok);
+
+    let (sink, events) = rommfs_core::events::channel();
+    let mut worker = Worker::new(sink);
+    worker.metadata_job_id = 1;
+    worker.metadata_status(true, "Waiting for RetroBat.exe to close", None);
+    for event in events.try_iter() {
+        state.apply_event(&event);
+    }
+    assert_eq!(
+        state.frontend_metadata_summary(),
+        FrontendMetadataSummary::Waiting
+    );
+    assert!(state.frontend_metadata_updated_at.is_none());
+
+    state.apply_event(&AppEvent::FrontendMetadata {
+        job_id: 1,
+        pending: true,
+        detail: "Publishing game information".into(),
+        error: None,
+    });
+    state.apply_event(&AppEvent::FrontendMetadata {
+        job_id: 1,
+        pending: false,
+        detail: "Updated with issues; 1 system left as it was".into(),
+        error: Some("one system failed".into()),
+    });
+    assert_eq!(
+        state.frontend_metadata_summary(),
+        FrontendMetadataSummary::UpdatedWithIssues
+    );
+}
+
 #[path = "tests/catalogue.rs"]
 mod catalogue;
 

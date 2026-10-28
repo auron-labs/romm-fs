@@ -1,4 +1,6 @@
+use super::super::hash_save_content;
 use super::super::mapping::SaveMapping;
+use super::super::path::validate_relative_save_path;
 use super::super::path::{
     ensure_no_rtc_companion, is_reparse_point, open_save_read_for, MAX_SAVE_BYTES,
 };
@@ -25,13 +27,68 @@ impl SaveSyncJournal {
         generation: u64,
         expected_hash: &str,
     ) -> Result<SnapshotRecord> {
-        self.validate_confirmed_mapping(mapping)?;
+        self.capture_snapshot_inner(mapping, generation, expected_hash, false)
+    }
+
+    pub fn capture_reviewed_snapshot(
+        &mut self,
+        mapping: &SaveMapping,
+        generation: u64,
+        expected_hash: &str,
+    ) -> Result<SnapshotRecord> {
+        let slot = self
+            .slot(&mapping.rom_key)?
+            .ok_or_else(|| Error::Unsupported("save mapping is no longer available".into()))?;
+        if !slot.needs_attention
+            || slot.local_generation != generation
+            || slot.current_local_hash.as_deref() != Some(expected_hash)
+            || slot.local_removed
+        {
+            return Err(Error::Unsupported(
+                "reviewed save changed before snapshot capture".into(),
+            ));
+        }
+        let mut local = open_save_read_for(
+            &self.scope.effective_saves_root,
+            &mapping.relative_path,
+            mapping.profile.id == crate::save_sync::GENERIC_FILE_PROFILE,
+        )?;
+        if hash_save_content(&mut local)? != expected_hash {
+            return Err(Error::Unsupported(
+                "reviewed save changed before snapshot capture".into(),
+            ));
+        }
+        if let Some(snapshot) = self.snapshots()?.into_iter().find(|snapshot| {
+            snapshot.rom_key == mapping.rom_key
+                && snapshot.generation == generation
+                && snapshot.content_hash == expected_hash
+                && snapshot.state == SnapshotState::Ready
+                && path_has_hash(&snapshot.path, expected_hash).unwrap_or(false)
+        }) {
+            return Ok(snapshot);
+        }
+        self.capture_snapshot_inner(mapping, generation, expected_hash, true)
+    }
+
+    fn capture_snapshot_inner(
+        &mut self,
+        mapping: &SaveMapping,
+        generation: u64,
+        expected_hash: &str,
+        for_review: bool,
+    ) -> Result<SnapshotRecord> {
+        self.validate_key(&mapping.rom_key)?;
+        validate_relative_save_path(&mapping.relative_path).map_err(Error::Unsupported)?;
         let slot = self
             .slot(&mapping.rom_key)?
             .ok_or_else(|| Error::Unsupported("save mapping is no longer available".into()))?;
         if slot.local_generation != generation
+            || !slot.mapping_confirmed
+            || !slot.candidate_available
+            || slot.relative_path != mapping.relative_path
             || slot.current_local_hash.as_deref() != Some(expected_hash)
             || slot.local_removed
+            || slot.needs_attention != for_review
         {
             return Err(Error::Unsupported(
                 "save generation changed before snapshot capture".into(),
@@ -69,13 +126,13 @@ impl SaveSyncJournal {
             }
         }
 
-        if let Err(error) = self.prepare_snapshot(
+        if let Err(error) = self.prepare_snapshot_with_review(
             mapping,
             generation,
             expected_hash,
             &revision,
-            &temporary_path,
-            &snapshot_path,
+            (&temporary_path, &snapshot_path),
+            for_review,
         ) {
             remove_if_present(&temporary_path)?;
             return Err(error);
@@ -339,6 +396,16 @@ impl SaveSyncJournal {
                         ELSE remote_history_ids || ',' || ?1
                     END,
                     remote_outcome = 'readback_verified',
+                    conflict_resolution = CASE
+                        WHEN conflict_resolution = 'keep_local'
+                            AND conflict_local_hash = ?2 THEN 'keep_local_ack'
+                        ELSE conflict_resolution
+                    END,
+                    conflict_local_hash = CASE
+                        WHEN conflict_resolution = 'keep_local'
+                            AND conflict_local_hash = ?2 THEN NULL
+                        ELSE conflict_local_hash
+                    END,
                     last_failure = CASE
                         WHEN local_generation = ?10 AND current_local_hash = ?2
                             AND local_removed = 0 AND needs_attention = 0 THEN NULL
@@ -406,6 +473,7 @@ impl SaveSyncJournal {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn prepare_snapshot(
         &mut self,
         mapping: &SaveMapping,
@@ -415,6 +483,26 @@ impl SaveSyncJournal {
         temporary_path: &Path,
         snapshot_path: &Path,
     ) -> Result<()> {
+        self.prepare_snapshot_with_review(
+            mapping,
+            generation,
+            content_hash,
+            revision,
+            (temporary_path, snapshot_path),
+            false,
+        )
+    }
+
+    fn prepare_snapshot_with_review(
+        &mut self,
+        mapping: &SaveMapping,
+        generation: u64,
+        content_hash: &str,
+        revision: &str,
+        paths: (&Path, &Path),
+        for_review: bool,
+    ) -> Result<()> {
+        let (temporary_path, snapshot_path) = paths;
         let generation = i64::try_from(generation)
             .map_err(|_| Error::Unsupported("save generation exceeds journal range".into()))?;
         let transaction = self.connection.transaction().map_err(sqlite)?;
@@ -422,7 +510,7 @@ impl SaveSyncJournal {
             .ok_or_else(|| Error::Unsupported("save mapping is no longer available".into()))?;
         if !slot.confirmed
             || !slot.candidate_available
-            || slot.needs_attention
+            || slot.needs_attention != for_review
             || slot.relative_path != path_string(&mapping.relative_path)?
             || slot.generation != generation
             || slot.hash.as_deref() != Some(content_hash)

@@ -212,6 +212,16 @@ struct PendingPairing {
     epoch: u64,
 }
 
+struct MountPreparation {
+    root: PathBuf,
+    server_id: String,
+    path: String,
+    started: Instant,
+    active: Arc<std::sync::atomic::AtomicBool>,
+    result: mpsc::Receiver<Result<(Arc<RommFs>, ActiveMount)>>,
+    handle: JoinHandle<()>,
+}
+
 struct Worker {
     auxiliary_job: Option<auxiliary::AuxiliaryJob>,
     startup_restoring: bool,
@@ -227,6 +237,7 @@ struct Worker {
     metadata_source: Option<(Catalogue, CatalogueSnapshot)>,
     metadata_ready: Option<rommfs_core::retrobat::ArtworkBatch>,
     metadata_wait_reported: bool,
+    metadata_retry_at: Option<Instant>,
     /// Gamelist generation and publication run off the worker loop; this is
     /// the in-flight job's result channel.
     metadata_publish: Option<mpsc::Receiver<MetadataPublication>>,
@@ -255,6 +266,11 @@ struct Worker {
     names: HashMap<RomKey, String>,
     fs: Option<Arc<RommFs>>,
     mount: Option<ActiveMount>,
+    mount_preparation: Option<MountPreparation>,
+    cancelled_mount_preparations: Vec<MountPreparation>,
+    pending_root_cleanup: Vec<(PathBuf, String)>,
+    signed_out_root: Option<(PathBuf, String, i64)>,
+    pending_mount_start: Option<String>,
     save_sync_settings: Option<SaveSyncSettingsStore>,
     save_sync_storage_dir: Option<PathBuf>,
     save_sync_selected_root: Option<PathBuf>,
@@ -270,11 +286,13 @@ struct Worker {
     save_sync_gate: SaveSyncCommandGate,
     connection_gate: SaveSyncCommandGate,
     current_connection_epoch: u64,
+    pending_save_sync_disable: Option<u64>,
     current_save_sync_epoch: u64,
     save_sync_runtime_problem: Option<String>,
     save_sync_session_id: u64,
     play_data_enabled: bool,
     play_data_available: bool,
+    play_data_permission_denied: bool,
     play_data_problem: Option<String>,
     /// How many entries the last metadata pass hid ("hide RomM copies").
     hide_copies_count: usize,
@@ -308,6 +326,7 @@ impl Worker {
             metadata_source: None,
             metadata_ready: None,
             metadata_wait_reported: false,
+            metadata_retry_at: None,
             metadata_publish: None,
             metadata_publish_handle: None,
             draining: Vec::new(),
@@ -330,6 +349,11 @@ impl Worker {
             names: HashMap::new(),
             fs: None,
             mount: None,
+            mount_preparation: None,
+            cancelled_mount_preparations: Vec::new(),
+            pending_root_cleanup: Vec::new(),
+            signed_out_root: None,
+            pending_mount_start: None,
             save_sync_settings: None,
             save_sync_storage_dir: None,
             save_sync_selected_root: None,
@@ -345,11 +369,13 @@ impl Worker {
             save_sync_gate,
             connection_gate: SaveSyncCommandGate::new(),
             current_connection_epoch: 0,
+            pending_save_sync_disable: None,
             current_save_sync_epoch,
             save_sync_runtime_problem: None,
             save_sync_session_id: 0,
             play_data_enabled: false,
             play_data_available: false,
+            play_data_permission_denied: false,
             play_data_problem: None,
             hide_copies_count: 0,
             play_watch: None,
@@ -409,8 +435,7 @@ impl Worker {
         self.draining.retain(|handle| !handle.is_finished());
     }
 
-    /// Join every cancelled worker. Used at connection change and shutdown,
-    /// where the owned threads must be fully drained before returning.
+    /// Join every cancelled worker before shutdown returns.
     fn drain_handles(&mut self) {
         for handle in self.draining.drain(..) {
             let _ = handle.join();
@@ -440,6 +465,8 @@ fn worker_loop_with_interval_from(
         worker.poll_pairing();
         worker.poll_catalogue_refresh();
         worker.poll_catalogue_refresh_timer();
+        worker.poll_mount_preparation();
+        worker.poll_cancelled_mount_preparations();
         worker.poll_play_watch();
         worker.poll_metadata();
         if worker.installer.poll(&worker.sink) {
@@ -447,6 +474,9 @@ fn worker_loop_with_interval_from(
         }
         worker.poll_auxiliary();
         let received = if worker.refresh_result.is_some()
+            || worker.mount_preparation.is_some()
+            || !worker.cancelled_mount_preparations.is_empty()
+            || !worker.draining.is_empty()
             || worker.auxiliary_job.is_some()
             || worker.installer.is_running()
             || worker.pairing.is_some()
@@ -481,6 +511,9 @@ fn worker_loop_with_interval_from(
             Ok(envelope) => envelope,
             Err(mpsc::RecvTimeoutError::Timeout)
                 if worker.refresh_result.is_some()
+                    || worker.mount_preparation.is_some()
+                    || !worker.cancelled_mount_preparations.is_empty()
+                    || !worker.draining.is_empty()
                     || worker.auxiliary_job.is_some()
                     || worker.installer.is_running()
                     || worker.pairing.is_some()
@@ -488,7 +521,7 @@ fn worker_loop_with_interval_from(
                     || worker.metadata_ready.is_some()
                     || worker.metadata_publish.is_some() =>
             {
-                continue
+                continue;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // A short wake only polls the play-data watch; eviction is
@@ -537,6 +570,8 @@ fn worker_loop_with_interval_from(
                 installation,
                 managed_root,
             } => worker.setup_retrobat(installation, managed_root),
+            Command::RefreshIntegration => worker.refresh_integration(),
+            Command::RepairRetroBat => worker.repair_retrobat(),
             Command::RemoveForeignLinks { root } => worker.remove_foreign_links(root),
             Command::SetIntegration {
                 mode,
@@ -556,7 +591,7 @@ fn worker_loop_with_interval_from(
             Command::StopMount => worker.stop_mount(),
             Command::RestartMount { path } => worker.restart_mount(path),
             Command::RefreshCatalogue => worker.refresh_catalogue(),
-            Command::RefreshMetadata => worker.queue_metadata(),
+            Command::RefreshMetadata => worker.refresh_metadata(),
             Command::RefreshSaveSync => worker.check_save_sync(),
             Command::SelectSaveSyncInstallation { path } => {
                 worker.select_save_sync_installation(path)
@@ -570,6 +605,19 @@ fn worker_loop_with_interval_from(
                 incoming_id,
                 destination,
             } => worker.export_save_sync_incoming(*session_id, incoming_id, destination),
+            Command::ResolveSaveConflict {
+                session_id,
+                rom_id,
+                file_id,
+                local_hash,
+                incoming_id,
+            } => worker.resolve_save_conflict(
+                *session_id,
+                *rom_id,
+                *file_id,
+                local_hash.as_deref(),
+                incoming_id.as_deref(),
+            ),
             Command::SetMemoryCardFolderEnabled {
                 emulator,
                 relative_dir,
@@ -614,6 +662,8 @@ fn worker_loop_with_interval_from(
                 }),
                 Command::RemoveForeignLinks { .. } => {}
                 Command::SetIntegration { .. }
+                | Command::RefreshIntegration
+                | Command::RepairRetroBat
                 | Command::RefreshCatalogue
                 | Command::RefreshMetadata
                 | Command::RefreshSaveSync
@@ -623,6 +673,7 @@ fn worker_loop_with_interval_from(
                 | Command::SetPlayDataSync { .. }
                 | Command::SetHideOwnedCopies { .. }
                 | Command::ExportSaveSyncIncoming { .. }
+                | Command::ResolveSaveConflict { .. }
                 | Command::SetMemoryCardFolderEnabled { .. } => {}
                 Command::SelectSaveFolder { .. }
                 | Command::AssociateSaveFile { .. }
@@ -647,12 +698,13 @@ fn worker_loop_with_interval_from(
     if worker.save_sync_agent.is_some() {
         worker.stop_save_sync_agent();
     }
-    if worker.mount.is_some() {
+    if worker.mount.is_some() || worker.mount_preparation.is_some() {
         worker.stop_mount();
     }
     if worker.installer.is_running() {
         worker.installer.cancel(&worker.sink);
     }
+    worker.drain_cancelled_mount_preparations();
     worker.drain_handles();
 }
 
@@ -1068,34 +1120,95 @@ impl ContentSource for ClientSource {
 // Mount root + backend seam.
 // ---------------------------------------------------------------------------
 
-/// Deny setup/publication while Windows has a frontend or Switch emulator image
-/// open. Exclusive writable handles also prevent launch during the operation.
-pub(crate) fn stopped_retrobat_guard(installation: &Path) -> anyhow::Result<Vec<std::fs::File>> {
+/// Check only the selected installation's frontend before changing its config.
+pub(crate) fn ensure_frontend_stopped(installation: &Path) -> anyhow::Result<()> {
     rommfs_core::save_sync::ensure_no_reparse_components(installation)?;
+    if let Some(frontend) = running_frontend(installation)? {
+        anyhow::bail!(
+            "Close {} before updating RetroBat configuration",
+            frontend.display()
+        );
+    }
+    Ok(())
+}
+
+fn running_frontend(installation: &Path) -> anyhow::Result<Option<PathBuf>> {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        let mut guards = Vec::new();
-        for relative in [
-            "retrobat.exe",
-            "emulationstation/emulationstation.exe",
-            "emulators/eden/eden.exe",
-            "emulators/citron/citron.exe",
-            "emulators/retroarch/retroarch.exe",
-        ] {
-            let path = installation.join(relative);
-            rommfs_core::save_sync::ensure_no_reparse_components(&path)?;
-            if !path.try_exists()? {
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::ProcessStatus::EnumProcesses;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let mut process_ids = vec![0u32; 4096];
+        let mut bytes_needed = 0u32;
+        // SAFETY: both pointers address live writable storage of the declared sizes.
+        let enumerated = unsafe {
+            EnumProcesses(
+                process_ids.as_mut_ptr(),
+                (process_ids.len() * std::mem::size_of::<u32>()) as u32,
+                &mut bytes_needed,
+            )
+        };
+        anyhow::ensure!(
+            enumerated != 0,
+            "Could not inspect running frontend processes"
+        );
+        process_ids.truncate(bytes_needed as usize / std::mem::size_of::<u32>());
+
+        let install = std::fs::canonicalize(installation)?
+            .to_string_lossy()
+            .replace('/', "\\")
+            .to_ascii_lowercase();
+        let install = format!(
+            "{}\\",
+            install
+                .trim_end_matches(['\\', '/'])
+                .trim_start_matches("\\\\?\\")
+        );
+        for process_id in process_ids.into_iter().filter(|id| *id != 0) {
+            // SAFETY: the PID came from EnumProcesses; the returned handle is checked and closed below.
+            let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+            if process.is_null() {
                 continue;
             }
-            guards.push(std::fs::OpenOptions::new().read(true).write(true).share_mode(0)
-                .open(&path).with_context(|| format!("Exclusive access to {} is unavailable for RetroBat setup or metadata publication; close RetroBat, its emulators, or any other program using this file", path.display()))?);
+            let mut image = vec![0u16; 32768];
+            let mut length = image.len() as u32;
+            // SAFETY: `image` is writable for its capacity and `length` starts at that capacity.
+            let queried =
+                unsafe { QueryFullProcessImageNameW(process, 0, image.as_mut_ptr(), &mut length) };
+            // SAFETY: `process` is the live handle returned by OpenProcess above.
+            unsafe { CloseHandle(process) };
+            if queried == 0 {
+                continue;
+            }
+            let path = PathBuf::from(std::ffi::OsString::from_wide(&image[..length as usize]));
+            let lower = path
+                .to_string_lossy()
+                .replace('/', "\\")
+                .to_ascii_lowercase();
+            let lower = lower.trim_start_matches("\\\\?\\");
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if lower.starts_with(&install)
+                && matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "retrobat.exe" | "emulationstation.exe"
+                )
+            {
+                return Ok(Some(path));
+            }
         }
-        Ok(guards)
+        Ok(None)
     }
     #[cfg(not(windows))]
     {
-        Ok(Vec::new())
+        let _ = installation;
+        Ok(None)
     }
 }
 
@@ -1130,7 +1243,7 @@ pub(crate) fn card_emulator_state(installation: &Path) -> CardEmulatorState {
                     return CardEmulatorState::Unavailable(format!(
                         "{} is not a directory",
                         directory.display()
-                    ))
+                    ));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return CardEmulatorState::Unavailable(error.to_string()),
@@ -1157,13 +1270,13 @@ pub(crate) fn card_emulator_state(installation: &Path) -> CardEmulatorState {
                 {
                     Ok(file) => guards.push(file),
                     Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33)) => {
-                        return CardEmulatorState::Running
+                        return CardEmulatorState::Running;
                     }
                     Err(error) => {
                         return CardEmulatorState::Unavailable(format!(
                             "{}: {error}",
                             path.display()
-                        ))
+                        ));
                     }
                 }
             }
@@ -1275,6 +1388,21 @@ fn create_mount_dir_chain(existing: &Path, root: &Path) -> Result<()> {
 
 pub(crate) fn claim_mount_root(root: &Path, server_id: &str) -> Result<()> {
     rommfs_cfapi::claim_mount_root(root, server_id).map_err(mount_root_error)
+}
+
+pub(crate) fn cleanup_replaced_mount_root(root: &Path, server_id: &str) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    match rommfs_cfapi::check_mount_root(root, server_id)? {
+        rommfs_cfapi::RootCheck::EmptyReady => Ok(()),
+        rommfs_cfapi::RootCheck::RecognizedOwned => {
+            rommfs_cfapi::WindowsMount::cleanup_root(root, server_id)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (root, server_id);
+        Ok(())
+    }
 }
 
 /// Aggregate the per-file warnings a catalogue build produces into one line
@@ -1390,7 +1518,7 @@ fn hydrated_remover(_root: &Path) -> Arc<dyn HydratedRemover> {
 /// A live mount owned and stopped on the worker thread.
 struct ActiveMount {
     root: PathBuf,
-    stop_fn: Box<dyn FnOnce()>,
+    stop_fn: Box<dyn FnOnce() + Send>,
 }
 
 impl ActiveMount {

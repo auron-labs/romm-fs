@@ -176,6 +176,7 @@ fn reconcile(
         mapping: mapping.clone(),
         identity: identity(),
         scope: scope.clone(),
+        verify_reviewed_history: false,
     };
     let inventory = super::super::incoming_transfer::reconcile_attempt(
         client,
@@ -234,6 +235,9 @@ fn upload(
             baseline_id: slot.remote_slot_id,
             baseline_hash: slot.remote_baseline_hash,
             accepted_remote_ids: slot.remote_history_ids,
+            conflict_resolution: slot.conflict_resolution,
+            conflict_local_hash: slot.conflict_local_hash,
+            conflict_history_fingerprint: slot.conflict_history_fingerprint,
         },
     )))
     .unwrap();

@@ -14,6 +14,107 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 impl SaveSyncJournal {
+    pub fn keep_local_after_review(
+        &mut self,
+        mapping: &SaveMapping,
+        local_hash: &str,
+    ) -> Result<()> {
+        let key = &mapping.rom_key;
+        self.validate_key(key)?;
+        let slot = self
+            .slot(key)?
+            .ok_or_else(|| Error::Unsupported("save mapping disappeared during review".into()))?;
+        if !slot.needs_attention
+            || slot.current_local_hash.as_deref() != Some(local_hash)
+            || slot.remote_history_ids.is_empty()
+        {
+            return Err(Error::Unsupported(
+                "save or remote history changed; review the current versions again".into(),
+            ));
+        }
+        let generation = slot.local_generation;
+        let history_ids = slot.remote_history_ids.clone();
+        let history_fingerprint = slot.remote_history_fingerprint.clone();
+        self.capture_reviewed_snapshot(mapping, generation, local_hash)?;
+        let reviewed = self
+            .slot(key)?
+            .ok_or_else(|| Error::Unsupported("save mapping disappeared during review".into()))?;
+        if !reviewed.needs_attention
+            || reviewed.local_generation != generation
+            || reviewed.current_local_hash.as_deref() != Some(local_hash)
+            || reviewed.remote_history_ids != history_ids
+            || reviewed.remote_history_fingerprint != history_fingerprint
+        {
+            return Err(Error::Unsupported(
+                "save or remote history changed while preparing the local revision".into(),
+            ));
+        }
+        let transaction = self.connection.transaction().map_err(sqlite)?;
+        let updated = transaction
+            .execute(
+                "UPDATE save_sync_slots SET needs_attention=0, last_failure=NULL,
+                    conflict_resolution=?1, conflict_local_hash=?2,
+                    conflict_history_ids=remote_history_ids,
+                    conflict_history_fingerprint=remote_history_fingerprint,
+                    remote_outcome='conflict_kept_local'
+                 WHERE server_id=?3 AND account_id=?4 AND installation_root=?5
+                   AND effective_saves_root=?6 AND rom_server_id=?7 AND rom_id=?8
+                   AND file_id=?9 AND needs_attention=1 AND current_local_hash=?2
+                   AND remote_history_ids=?10 AND remote_history_fingerprint=?11
+                   AND local_generation=?12",
+                rusqlite::params![
+                    if reviewed.local_baseline_hash.as_deref() == Some(local_hash) {
+                        "keep_local_ack"
+                    } else {
+                        "keep_local"
+                    },
+                    local_hash,
+                    self.scope.server_id,
+                    self.scope.account_id,
+                    windows_path_key(&self.scope.installation_root),
+                    windows_path_key(&self.scope.effective_saves_root),
+                    key.server_id,
+                    key.rom_id,
+                    key.file_id,
+                    history_ids.join(","),
+                    history_fingerprint,
+                    i64::try_from(generation).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(sqlite)?;
+        if updated != 1 {
+            return Err(Error::Unsupported(
+                "save or remote history changed while applying the local choice".into(),
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE save_sync_incoming SET state = 'resolved'
+                 WHERE server_id = ?1 AND account_id = ?2 AND installation_root = ?3
+                   AND effective_saves_root = ?4 AND rom_server_id = ?5 AND rom_id = ?6
+                   AND file_id = ?7 AND state IN ('staged', 'interrupted')",
+                rusqlite::params_from_iter(scope_key_params(&self.scope, key)),
+            )
+            .map_err(sqlite)?;
+        transaction.commit().map_err(sqlite)
+    }
+
+    pub fn clear_conflict_resolution(&mut self, key: &RomKey) -> Result<()> {
+        self.validate_key(key)?;
+        self.connection
+            .execute(
+                "UPDATE save_sync_slots SET conflict_resolution=NULL,
+                    conflict_local_hash=NULL, conflict_history_ids='',
+                    conflict_history_fingerprint=''
+                 WHERE server_id=?1 AND account_id=?2 AND installation_root=?3
+                   AND effective_saves_root=?4 AND rom_server_id=?5 AND rom_id=?6
+                   AND file_id=?7",
+                rusqlite::params_from_iter(scope_key_params(&self.scope, key)),
+            )
+            .map_err(sqlite)?;
+        Ok(())
+    }
+
     /// Persist the recovery location before moving a previously synchronized
     /// baseline. Recovery never deletes this file or overwrites a new local save.
     pub fn record_incoming_backup(&self, incoming_id: &str, backup: &Path) -> Result<()> {
@@ -370,11 +471,51 @@ impl SaveSyncJournal {
         mapping: &SaveMapping,
         remote_history_ids: &[String],
     ) -> Result<()> {
+        self.finish_incoming_publication_with_review(incoming_id, mapping, remote_history_ids, None)
+    }
+
+    pub fn finish_incoming_publication_after_review(
+        &mut self,
+        incoming_id: &str,
+        mapping: &SaveMapping,
+        remote_history_ids: &[String],
+        reviewed_local_hash: Option<&str>,
+        history_fingerprint: &str,
+    ) -> Result<()> {
+        self.finish_incoming_publication_with_review(
+            incoming_id,
+            mapping,
+            remote_history_ids,
+            Some((reviewed_local_hash, history_fingerprint)),
+        )
+    }
+
+    fn finish_incoming_publication_with_review(
+        &mut self,
+        incoming_id: &str,
+        mapping: &SaveMapping,
+        remote_history_ids: &[String],
+        reviewed_history: Option<(Option<&str>, &str)>,
+    ) -> Result<()> {
         let record = self.incoming_by_id(incoming_id)?;
         if record.state != "publishing" || record.rom_key != mapping.rom_key {
             return Err(Error::Unsupported(
                 "incoming publication intent is no longer active".into(),
             ));
+        }
+        if let Some((reviewed_local_hash, history_fingerprint)) = reviewed_history {
+            let slot = self.slot(&mapping.rom_key)?.ok_or_else(|| {
+                Error::Unsupported("save mapping disappeared during review".into())
+            })?;
+            if !slot.needs_attention
+                || slot.current_local_hash.as_deref() != reviewed_local_hash
+                || slot.remote_history_ids != remote_history_ids
+                || slot.remote_history_fingerprint != history_fingerprint
+            {
+                return Err(Error::Unsupported(
+                    "save or RomM history changed during recovery; review again".into(),
+                ));
+            }
         }
         let transaction = self.connection.transaction().map_err(sqlite)?;
         let generation: i64 = transaction
@@ -396,15 +537,22 @@ impl SaveSyncJournal {
                     local_generation = ?2, local_ever_existed = 1, local_removed = 0,
                  remote_baseline_hash = ?3, remote_slot_id = ?4,
                     remote_history_ids = ?5, needs_attention = 0,
-                    remote_outcome = 'incoming_installed', last_failure = NULL
-                 WHERE server_id = ?6 AND account_id = ?7 AND installation_root = ?8
-                   AND effective_saves_root = ?9 AND rom_server_id = ?10 AND rom_id = ?11
-                   AND file_id = ?12",
+                    remote_outcome = 'incoming_installed', last_failure = NULL,
+                    conflict_resolution = CASE WHEN ?6 IS NULL THEN NULL ELSE 'use_remote_ack' END,
+                    conflict_local_hash = ?7,
+                    conflict_history_ids = CASE WHEN ?6 IS NULL THEN '' ELSE ?8 END,
+                    conflict_history_fingerprint = COALESCE(?6, '')
+                 WHERE server_id = ?9 AND account_id = ?10 AND installation_root = ?11
+                   AND effective_saves_root = ?12 AND rom_server_id = ?13 AND rom_id = ?14
+                   AND file_id = ?15",
                 rusqlite::params![
                     record.content_hash,
                     generation,
                     record.content_hash,
                     record.remote_id,
+                    remote_history_ids.join(","),
+                    reviewed_history.map(|(_, fingerprint)| fingerprint),
+                    reviewed_history.and_then(|(local_hash, _)| local_hash),
                     remote_history_ids.join(","),
                     self.scope.server_id,
                     self.scope.account_id,
@@ -430,6 +578,17 @@ impl SaveSyncJournal {
                 ],
             )
             .map_err(sqlite)?;
+        if reviewed_history.is_some() {
+            transaction
+                .execute(
+                    "UPDATE save_sync_incoming SET state = 'resolved'
+                     WHERE server_id = ?1 AND account_id = ?2 AND installation_root = ?3
+                       AND effective_saves_root = ?4 AND rom_server_id = ?5 AND rom_id = ?6
+                       AND file_id = ?7 AND state IN ('staged', 'interrupted')",
+                    rusqlite::params_from_iter(scope_key_params(&self.scope, &mapping.rom_key)),
+                )
+                .map_err(sqlite)?;
+        }
         transaction.commit().map_err(sqlite)
     }
 
@@ -465,7 +624,9 @@ impl SaveSyncJournal {
             .execute(
                 "UPDATE save_sync_slots SET local_baseline_hash = ?1,
                     remote_slot_id = ?2, remote_baseline_hash = ?3, remote_history_ids = ?4,
-                    needs_attention = 0, remote_outcome = 'reconciled', last_failure = NULL
+                    needs_attention = 0, remote_outcome = 'reconciled', last_failure = NULL,
+                    conflict_resolution = NULL, conflict_local_hash = NULL,
+                    conflict_history_ids = '', conflict_history_fingerprint = ''
                  WHERE server_id = ?5 AND account_id = ?6 AND installation_root = ?7
                    AND effective_saves_root = ?8 AND rom_server_id = ?9 AND rom_id = ?10
                    AND file_id = ?11",
@@ -492,12 +653,49 @@ impl SaveSyncJournal {
         self.connection
             .execute(
                 "UPDATE save_sync_slots SET needs_attention = 1, last_failure = ?1,
-                    remote_outcome = 'incoming_attention'
+                    remote_outcome = 'incoming_attention', conflict_resolution = NULL,
+                    conflict_local_hash = NULL, conflict_history_ids = '',
+                    conflict_history_fingerprint = ''
                  WHERE server_id = ?2 AND account_id = ?3 AND installation_root = ?4
                    AND effective_saves_root = ?5 AND rom_server_id = ?6 AND rom_id = ?7
                    AND file_id = ?8",
                 rusqlite::params![
                     reason,
+                    self.scope.server_id,
+                    self.scope.account_id,
+                    windows_path_key(&self.scope.installation_root),
+                    windows_path_key(&self.scope.effective_saves_root),
+                    key.server_id,
+                    key.rom_id,
+                    key.file_id,
+                ],
+            )
+            .map_err(sqlite)?;
+        Ok(())
+    }
+
+    pub fn mark_reconciliation_attention_with_history(
+        &mut self,
+        key: &RomKey,
+        reason: &str,
+        history_ids: &[String],
+        history_fingerprint: &str,
+    ) -> Result<()> {
+        self.validate_key(key)?;
+        self.connection
+            .execute(
+                "UPDATE save_sync_slots SET needs_attention=1, last_failure=?1,
+                    remote_outcome='incoming_attention', remote_history_ids=?2,
+                    remote_history_fingerprint=?3,
+                    conflict_resolution=NULL, conflict_local_hash=NULL,
+                    conflict_history_ids='', conflict_history_fingerprint=''
+                 WHERE server_id=?4 AND account_id=?5 AND installation_root=?6
+                   AND effective_saves_root=?7 AND rom_server_id=?8 AND rom_id=?9
+                   AND file_id=?10",
+                rusqlite::params![
+                    reason,
+                    history_ids.join(","),
+                    history_fingerprint,
                     self.scope.server_id,
                     self.scope.account_id,
                     windows_path_key(&self.scope.installation_root),

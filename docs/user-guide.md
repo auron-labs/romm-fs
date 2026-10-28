@@ -23,9 +23,10 @@ to play. Keep RomMFS running for the games folder to remain available.
   playing before choosing **Apply library changes**, which restarts the folder.
 - **Artwork: Updating…** includes checking images and writing game information
   into RetroBat. Finished image checks do not mean the whole update is finished.
-- **Artwork: Waiting for access** means RetroBat files are unavailable for the
-  update. Close RetroBat or its emulators if they are open. RomMFS retries
-  automatically; the games folder can remain available while it waits.
+- **Artwork: Waiting for access** means the selected RetroBat frontend is
+  running. Close that frontend to publish its game information. RomMFS checks
+  again every two seconds; **Retry update** checks immediately. Games and
+  artwork downloads can continue while publication waits.
 - **Saves: Off** means automatic save sync is disabled. Enable it in **Saves**
   after selecting the save folder or RetroBat installation you want to use.
 
@@ -191,13 +192,13 @@ RomMFS discovers the latest stable official Windows package, streams its bytes,
 checks the release size and SHA-256 digest, and rechecks integrity before launch.
 Cancel a download in RomMFS; cancel installation inside the official wizard.
 RomMFS does not guess unattended switches, terminate a writing installer, or
-remove partial installation files. Stop RetroBat and its emulators before setup.
+remove partial installation files. Close the RetroBat frontend before setup.
 Compatible versions are accepted by required layout,
 not version equality; 8.2.1 is the source/package research reference.
 
-In **Settings → Games folder**, select RetroBat, choose its installation and a
-separate managed ROM folder, then choose **Set up RetroBat** in the **RetroBat**
-tab. For each system RetroBat defines,
+On first run, connect to RomM, choose a games folder and RetroBat installation,
+choose **Connect RetroBat**, then start the games folder. You can also change
+these folders in **Settings**. For each system RetroBat defines,
 setup adds one folder link, `roms/<system>/RomM` → `<managed folder>/<system>`.
 `roms/<system>` stays a real folder holding your own files; setup creates it
 only when RetroBat has none. A system that can't be linked (its folder is a link
@@ -231,7 +232,8 @@ concurrent downloads). A gamelist that can't be read is left untouched and
 reported; other systems are still updated. Each changed gamelist is replaced
 atomically while RetroBat is stopped; publication waits while it is running.
 If a gamelist can't be written, other systems are still attempted and the error
-is reported. After fixing folder access, refresh or remount to retry; saved
+is reported as **Updated with issues**. After fixing folder access, choose
+**Retry update**; saved
 identity state protects favourites and history even if filenames changed.
 Artwork and the identity index live in the managed folder. Switch update/DLC
 `.nsp` files go in flat `switchupdates` and are not listed as launchable games.
@@ -266,10 +268,9 @@ last played, play count and play time both ways with RomM for the games in the
 account; consent is never inferred from a discovered installation.
 
 It needs the RomM scopes `roms.user.read`, `roms.user.write`, `collections.read`
-and `collections.write`. If the signed-in account lacks them, ROM access is
-unchanged and **Settings → Account** shows
-`Favourites & play history · Needs permission` with a **Reconnect** action; sign
-in again with the wider permissions to enable it.
+and `collections.write`. **Needs permission** appears after RomM actually denies
+access. Check the account's RomM permissions and reconnect with the required
+access. Other failures retain their diagnostic in **Technical details**.
 
 Merge rules never lose data. Only the side that changed contributes; play counts
 and times add up; last played takes the later value; a favourite changed on both
@@ -357,6 +358,15 @@ Use **Export…** to write a staged incoming copy to a separate `.rommfs-incomin
 file; export cannot replace a mapped save or resolve/clear the review item.
 Review/export remain available while paused or disabled, and export is local-only.
 
+Saves opens on **Tracked**. **Review saves** opens **Needs review**. For a mapped
+save that needs a choice, **Keep this PC's save** retains the remote copies and
+queues the reviewed local save for upload. **Use this RomM copy** is available
+for a staged, verified copy and preserves the replaced local save in a backup.
+Turn automatic sync on before applying a choice. A reviewed missing local save
+can also be restored explicitly from its staged RomM copy.
+The choice survives restart. A changed local save or competing remote history
+requires a fresh choice. Unsupported remote records remain untouched.
+
 Pending snapshots, incoming review items, and consent/settings survive app
 restarts in the private `%LOCALAPPDATA%\rommfs\settings\` save-sync database and
 snapshot directory. If sync is offline or the app closes, uploads wait for a
@@ -436,9 +446,11 @@ live RomM server.
 - Each mounted tree uses a catalogue snapshot. Explicit/background refresh can update the stored catalogue; a running mount keeps its current tree, and remount reuses the loaded catalogue when available.
 - The mounted volume is read-only, including new files and directories.
   Store saves outside the ROM mount.
-- CFAPI uses real NTFS placeholders. Clean Stop removes only verified, unmodified
-  app-owned placeholders and restores the original root ACL. Busy or changed files
-  defer cleanup and remain for restart; user files are never recursively cleared.
+- CFAPI uses real NTFS placeholders. Stop and Quit disconnect the provider and
+  retain registration, placeholders, and downloaded bytes. Starting reuses
+  unchanged entries and reconciles changed entries after ownership checks.
+  New downloads require RomMFS to be running. Replacing a root or account uses
+  explicit cleanup; busy, changed, and unowned files are preserved.
   Keep both sibling `.rommfs-root` and `.rommfs-lock` files while using that root.
 - Migration from the old backend requires a fresh empty mount folder. Old
   roots may contain hydrated ROMs, modified files, or local saves; RomMFS

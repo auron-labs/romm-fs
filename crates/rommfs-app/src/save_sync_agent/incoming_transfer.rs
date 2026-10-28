@@ -11,6 +11,7 @@ pub(super) struct IncomingJob {
     pub(super) mapping: SaveMapping,
     pub(super) identity: SaveSyncIdentity,
     pub(super) scope: SaveSyncScope,
+    pub(super) verify_reviewed_history: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -25,7 +26,35 @@ pub(super) struct VerifiedRemoteSave {
 #[derive(Clone, Debug)]
 pub(super) struct IncomingInventory {
     pub(super) saves: Vec<VerifiedRemoteSave>,
-    pub(super) unsupported_count: usize,
+    pub(super) rejected: Vec<RejectedRemoteSave>,
+    pub(super) history_fingerprint: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct RejectedRemoteSave {
+    pub(super) id: String,
+    pub(super) reason: String,
+}
+
+pub(super) fn remote_save_fingerprint(save: &RemoteSave) -> String {
+    let fields = [
+        save.id.to_string(),
+        save.rom_id.to_string(),
+        save.user_id.to_string(),
+        save.file_name.clone(),
+        save.file_size_bytes.to_string(),
+        save.missing_from_fs.to_string(),
+        save.created_at.clone(),
+        save.updated_at.clone(),
+        save.emulator.clone().unwrap_or_default(),
+        save.slot.clone().unwrap_or_default(),
+    ];
+    let mut encoded = Vec::new();
+    for field in fields {
+        encoded.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(field.as_bytes());
+    }
+    format!("{}:{}", save.id, sha256_content_hash(&encoded))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -104,7 +133,8 @@ pub(super) fn reconcile_attempt(
             || present_ids.contains(&key.save_id)
     });
     let mut saves = Vec::new();
-    let mut unsupported_count = 0;
+    let mut rejected = Vec::new();
+    let mut history_fingerprint = Vec::new();
     let mut seen_ids = HashSet::new();
     for metadata in inventory {
         if metadata.id <= 0 || !seen_ids.insert(metadata.id) {
@@ -115,12 +145,23 @@ pub(super) fn reconcile_attempt(
                 retry_after: None,
             });
         }
-        if owned_revision_from_filename(&metadata.file_name).is_none()
-            || metadata.missing_from_fs
-            || (job.mapping.profile.id != rommfs_core::save_sync::GENERIC_FILE_PROFILE
-                && (metadata.file_size_bytes == 0 || metadata.file_size_bytes > MAX_SAVE_BYTES))
+        let reason = if owned_revision_from_filename(&metadata.file_name).is_none() {
+            Some("filename is outside the verified owned revision format")
+        } else if metadata.missing_from_fs {
+            Some("file is missing from RomM storage")
+        } else if job.mapping.profile.id != rommfs_core::save_sync::GENERIC_FILE_PROFILE
+            && (metadata.file_size_bytes == 0 || metadata.file_size_bytes > MAX_SAVE_BYTES)
         {
-            unsupported_count += 1;
+            Some("size is outside the supported Game Boy save range")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            history_fingerprint.push(format!("{}\t-", remote_save_fingerprint(&metadata)));
+            rejected.push(RejectedRemoteSave {
+                id: metadata.id.to_string(),
+                reason: format!("{} ({})", metadata.file_name, reason),
+            });
             continue;
         }
         let history_time = parse_history_time(&metadata.updated_at)
@@ -141,7 +182,7 @@ pub(super) fn reconcile_attempt(
         let cached = cache
             .saves
             .get(&key)
-            .filter(|cached| cached.metadata == metadata)
+            .filter(|cached| cached.metadata == metadata && !job.verify_reviewed_history)
             .cloned();
         let (bytes, file, content_hash) = if let Some(cached) = cached {
             (cached.bytes, cached.file, cached.content_hash)
@@ -212,6 +253,11 @@ pub(super) fn reconcile_attempt(
             }
             (bytes, file, content_hash)
         };
+        history_fingerprint.push(format!(
+            "{}\t{}",
+            remote_save_fingerprint(&metadata),
+            content_hash
+        ));
         saves.push(VerifiedRemoteSave {
             metadata,
             content_hash,
@@ -220,9 +266,11 @@ pub(super) fn reconcile_attempt(
             history_time,
         });
     }
+    history_fingerprint.sort();
     Ok(IncomingInventory {
         saves,
-        unsupported_count,
+        rejected,
+        history_fingerprint,
     })
 }
 

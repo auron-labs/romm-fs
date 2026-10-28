@@ -138,6 +138,40 @@ fn attention_section(
     let state = &view.state;
     let mut rows: Vec<AnyElement> = Vec::new();
 
+    if !state.retrobat_setup_issues.is_empty() {
+        let systems = state
+            .retrobat_setup_issues
+            .iter()
+            .map(|issue| issue.system.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        rows.push(
+            attention_row(
+                "attention-retrobat-links",
+                "RetroBat links need repair",
+                Some(format!("Missing links: {systems}")),
+                Some(
+                    Button::new("repair-retrobat-links")
+                        .label(if state.mount == MountState::Mounted {
+                            "Stop and repair"
+                        } else {
+                            "Repair links"
+                        })
+                        .outline()
+                        .small()
+                        .disabled(state.mount_stopping || state.retrobat_setup_running)
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.controller.send(Command::RepairRetroBat);
+                            cx.notify();
+                        })),
+                ),
+                window,
+                cx,
+            )
+            .into_any_element(),
+        );
+    }
+
     if let Some(error) = &state.conn_error {
         rows.push(
             attention_row(

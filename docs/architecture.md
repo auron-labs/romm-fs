@@ -106,7 +106,10 @@ live RomM instance. `route_hit_count` counts scripted route matches;
   before comparing its setup record. Ordinary save/setup paths still reject
   reparse points. Artwork publication and favourites/history failures have
   separate presentation state.
-- Mount ownership is recorded beside the root. Cleanup validates ownership and
+- Mount ownership is recorded beside the root. Ordinary Stop disconnects CFAPI
+  and drains callbacks while retaining registration and projected files.
+  Restart compares path, original-file identity, version, and size, reusing
+  unchanged entries. Explicit root/account replacement uses owned cleanup and
   does not recursively clear user data.
 - Worker threads/tasks are owned by the app/controller lifecycle and are joined
   or drained on stop, logout, or quit. Cancelling a background job moves its
@@ -125,9 +128,11 @@ live RomM instance. `route_hit_count` counts scripted route matches;
   counts as `FrontendMetadataProgress`. These counts describe artwork checks,
   including cache hits, rather than the whole update. Once they finish, the UI
   uses an indeterminate indicator while game information is prepared and
-  published. A blocked exclusive-access guard remains a pending wait with its
-  diagnostic available; it is not a terminal failure or a reason to restart the
-  update. Cancelling/stopping a pass does not advance the last-success time.
+  published. A read-only process check of the selected RetroBat installation
+  defers frontend writes while its frontend runs. A single timer checks again
+  every two seconds; explicit Retry checks immediately. Waiting and finished
+  states have no running progress bar. Partial publication reports issues.
+  Cancelling/stopping a pass does not advance the last-success time.
   Artwork uses eight bounded workers
   (`CONCURRENCY` in `retrobat/artwork.rs`, matching this note), and progress is
   throttled to about 4 Hz with the completed count only moving forward (the
@@ -164,8 +169,8 @@ live RomM instance. `route_hit_count` counts scripted route matches;
   launch is pushed as a play session. The first reconciliation adopts the union
   of both sides instead of adding two histories. A failed push keeps the local
   delta for the next pass. A debounced gamelist watch re-runs metadata after
-  RetroBat writes play data, on the metadata thread and under the same
-  stopped-RetroBat guard.
+  RetroBat writes play data, on the metadata thread and after the same scoped
+  frontend process check.
 - "Hide RomM games you already have" is on by default and runs in the metadata
   pass (`retrobat/owned.rs`). It reads the user's own files in `roms/<system>/`
   read-only, matching by name-without-extension and exact size, then confirming
@@ -182,6 +187,9 @@ live RomM instance. `route_hit_count` counts scripted route matches;
   sync carries `hidden` verbatim and never pushes it to RomM.
 - Save-sync consent and journal state are separate from mount configuration.
   Paths, scopes, and identities are validated before reads or writes.
+  An explicit disable during initial catalogue loading is retained for that
+  connection and persisted when its save scope becomes available, before
+  workers can start from older remembered consent.
 - Memory-card sync (`save_sync/memory_cards.rs`, `save_sync/memory_card_journal.rs`,
   `save_sync_agent/memory_cards.rs`, `romm/memory_cards.rs`) is a separate sync
   kind next to ordinary saves. A card's identity is (server, account, emulator,

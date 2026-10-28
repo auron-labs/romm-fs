@@ -1,4 +1,4 @@
-use super::files::export_incoming;
+use super::files::{export_incoming, publish_changed_save, publish_missing_save};
 use super::gate::SaveSyncEnablement;
 use super::incoming::reconcile_inventory;
 use super::memory_cards::{MemoryCardAgent, MemoryCardConfig};
@@ -42,6 +42,13 @@ enum AgentCommand {
     Export {
         incoming_id: String,
         destination: PathBuf,
+        response: Sender<Result<()>>,
+    },
+    ResolveConflict {
+        session_id: u64,
+        key: RomKey,
+        local_hash: Option<String>,
+        incoming_id: Option<String>,
         response: Sender<Result<()>>,
     },
 }
@@ -155,13 +162,20 @@ impl SaveSyncAgent {
     }
 
     pub(crate) fn stop(&mut self) {
-        self.active.store(false, Ordering::SeqCst);
-        let _ = self.stop.send(());
+        self.cancel();
         if let Some(mut agent) = self.card_agent.take() {
             agent.stop();
         }
         if let Some(actor) = self.actor.take() {
             let _ = actor.join();
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.active.store(false, Ordering::SeqCst);
+        let _ = self.stop.send(());
+        if let Some(agent) = self.card_agent.as_ref() {
+            agent.cancel();
         }
     }
 
@@ -178,6 +192,124 @@ impl SaveSyncAgent {
             .recv()
             .map_err(|_| rommfs_core::error::Error::Cancelled)?
     }
+
+    pub(crate) fn resolve_conflict(
+        &self,
+        session_id: u64,
+        key: RomKey,
+        local_hash: Option<String>,
+        incoming_id: Option<String>,
+    ) -> Result<()> {
+        let (response, result) = mpsc::channel();
+        self.commands
+            .send(AgentCommand::ResolveConflict {
+                session_id,
+                key,
+                local_hash,
+                incoming_id,
+                response,
+            })
+            .map_err(|_| Error::Cancelled)?;
+        result.recv().map_err(|_| Error::Cancelled)?
+    }
+}
+
+fn resolve_conflict_choice(
+    journal: &mut SaveSyncJournal,
+    mapping: &SaveMapping,
+    context: &ActorContext<'_>,
+    reviewed_local_hash: Option<&str>,
+    incoming_id: Option<&str>,
+) -> Result<()> {
+    let observation = journal.observe_local_save_for_reconciliation(mapping)?;
+    if observation.content_hash.as_deref() != reviewed_local_hash {
+        return Err(Error::Unsupported(
+            "local save changed since review; refresh the review before choosing".into(),
+        ));
+    }
+    let slot = journal
+        .slot(&mapping.rom_key)?
+        .ok_or_else(|| Error::Unsupported("save mapping disappeared during review".into()))?;
+    if !slot.needs_attention || !slot.mapping_confirmed || !slot.candidate_available {
+        return Err(Error::Unsupported(
+            "save no longer has an active review decision".into(),
+        ));
+    }
+    let Some(incoming_id) = incoming_id else {
+        let Some(reviewed_local_hash) = reviewed_local_hash else {
+            return Err(Error::Unsupported(
+                "Keep this PC requires a present local save; refresh the review".into(),
+            ));
+        };
+        journal.keep_local_after_review(mapping, reviewed_local_hash)?;
+        return Ok(());
+    };
+    let incoming = journal
+        .incoming_saves()?
+        .into_iter()
+        .find(|record| {
+            record.id == incoming_id
+                && record.rom_key == mapping.rom_key
+                && record.state == "staged"
+        })
+        .ok_or_else(|| {
+            Error::Unsupported("selected RomM copy is no longer staged for this save".into())
+        })?;
+    let target = rommfs_core::save_sync::resolve_save_target(
+        &context.scope.effective_saves_root,
+        &mapping.relative_path,
+    )?;
+    let intent = journal.begin_incoming_publication(incoming_id, mapping)?;
+    let result = (|| {
+        let validate = || {
+            if !is_active(context.enabled, context.active) {
+                return Err(Error::Cancelled);
+            }
+            validate_configuration(
+                context.scope,
+                std::slice::from_ref(mapping),
+                context.identity,
+            )
+        };
+        if let Some(reviewed_local_hash) = reviewed_local_hash {
+            let name = target
+                .file_name()
+                .ok_or_else(|| Error::Unsupported("Save target has no name".into()))?
+                .to_string_lossy();
+            let backup = target.with_file_name(format!(".{name}.rommfs-backup-{}", intent.id));
+            journal.record_incoming_backup(&intent.id, &backup)?;
+            publish_changed_save(
+                &intent.path,
+                &target,
+                &intent.content_hash,
+                reviewed_local_hash,
+                &backup,
+                &context.scope.effective_saves_root,
+                validate,
+            )?;
+        } else {
+            publish_missing_save(
+                &intent.path,
+                &target,
+                &intent.content_hash,
+                &context.scope.effective_saves_root,
+                validate,
+            )?;
+        }
+        journal.finish_incoming_publication_after_review(
+            &intent.id,
+            mapping,
+            &slot.remote_history_ids,
+            reviewed_local_hash,
+            &slot.remote_history_fingerprint,
+        )
+    })();
+    if let Err(error) = result {
+        journal.cancel_incoming_publication(&intent.id, &error.to_string())?;
+        return Err(error);
+    }
+    let _ = incoming;
+    Ok(())
 }
 
 fn actor_failure_status(
@@ -482,6 +614,12 @@ fn run_actor(
                 mapping: mapping.clone(),
                 identity: identity.clone(),
                 scope: scope.clone(),
+                verify_reviewed_history: journal.slot(&mapping.rom_key)?.is_some_and(|slot| {
+                    matches!(
+                        slot.conflict_resolution.as_deref(),
+                        Some("keep_local" | "keep_local_ack" | "use_remote_ack")
+                    )
+                }),
             })))
             .is_ok()
         {
@@ -589,6 +727,7 @@ fn run_actor(
                             mapping: mapping.clone(),
                             identity: identity.clone(),
                             scope: scope.clone(),
+                            verify_reviewed_history: false,
                         })))
                         .is_ok()
                     {
@@ -625,6 +764,67 @@ fn run_actor(
                         ));
                     }
                     let _ = response.send(result);
+                }
+                AgentCommand::ResolveConflict {
+                    session_id,
+                    key,
+                    local_hash,
+                    incoming_id,
+                    response,
+                } => {
+                    let started = Instant::now();
+                    sink.emit(AppEvent::log(
+                        Level::Info,
+                        "save-sync",
+                        format!("applying save conflict decision for ROM {}", key.rom_id),
+                    ));
+                    let result =
+                        if session_id != context.session_id || !is_active(&enabled, &active) {
+                            Err(Error::Cancelled)
+                        } else if let Some(mapping) = mappings.iter().find(|m| m.rom_key == key) {
+                            resolve_conflict_choice(
+                                &mut journal,
+                                mapping,
+                                &context,
+                                local_hash.as_deref(),
+                                incoming_id.as_deref(),
+                            )
+                        } else {
+                            Err(Error::Unsupported(
+                                "save mapping is no longer active".into(),
+                            ))
+                        };
+                    match &result {
+                        Ok(()) => {
+                            if let Some(mapping) = mappings.iter().find(|m| m.rom_key == key) {
+                                scheduler.hint(mapping, Instant::now());
+                                state.attention_keys.remove(&key);
+                                state.reconciliation_failures.remove(&key);
+                                state.reconciled_keys.insert(key.clone());
+                                state.inventory_dispatched.remove(&key);
+                                state.next_inventory_poll = Instant::now();
+                            }
+                            sink.emit(AppEvent::log(
+                                Level::Info,
+                                "save-sync",
+                                format!(
+                                    "save conflict decision finished for ROM {} in {} ms",
+                                    key.rom_id,
+                                    started.elapsed().as_millis()
+                                ),
+                            ));
+                        }
+                        Err(error) => sink.emit(AppEvent::log(
+                            Level::Warn,
+                            "save-sync",
+                            format!(
+                                "save conflict decision failed after {} ms: {error}",
+                                started.elapsed().as_millis()
+                            ),
+                        )),
+                    }
+                    let _ = response.send(result);
+                    emit_queue_status(&context, &mappings, &journal, &scheduler, &state, &sink)?;
                 }
             }
         }
@@ -865,6 +1065,14 @@ fn run_actor(
                         mapping: mapping.clone(),
                         identity: identity.clone(),
                         scope: scope.clone(),
+                        verify_reviewed_history: journal.slot(&mapping.rom_key)?.is_some_and(
+                            |slot| {
+                                matches!(
+                                    slot.conflict_resolution.as_deref(),
+                                    Some("keep_local" | "keep_local_ack" | "use_remote_ack")
+                                )
+                            },
+                        ),
                     })))
                     .is_ok()
                 {
@@ -961,6 +1169,9 @@ fn run_actor(
                     baseline_id: slot.remote_slot_id,
                     baseline_hash: slot.remote_baseline_hash,
                     accepted_remote_ids: slot.remote_history_ids,
+                    conflict_resolution: slot.conflict_resolution,
+                    conflict_local_hash: slot.conflict_local_hash,
+                    conflict_history_fingerprint: slot.conflict_history_fingerprint,
                 })))
                 .is_ok()
             {

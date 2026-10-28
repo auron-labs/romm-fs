@@ -84,6 +84,7 @@ reports a test actually ran.
 
 The [architecture guide](architecture.md) documents observed ownership and
 flow. The [API contract](contracts/romm-api.md) distinguishes live checks from
-source/fixture-backed behavior. The dated [validation record](validation/2026-10-12.md)
-reports what was executed on Linux and Windows Server 2022 and lists remaining
-Windows 10/11 and manual acceptance.
+source/fixture-backed behavior. The [repair validation record](validation/2026-10-28.md)
+reports the current portable checks, macOS UI inspection and remaining native
+Windows checks. The earlier [validation record](validation/2026-10-12.md)
+reports what was executed on Linux and Windows Server 2022 before these repairs.

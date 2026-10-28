@@ -1,6 +1,30 @@
 use super::*;
 
 #[test]
+fn executable_reader_does_not_block_retrobat_setup() {
+    let directory = tempfile::tempdir().unwrap();
+    let install = directory.path().join("RetroBat");
+    let managed = directory.path().join("games");
+    create_test_retrobat_install(&install, false);
+    std::fs::write(install.join("retrobat.exe"), b"fixture").unwrap();
+    std::fs::write(
+        install.join("emulationstation/.emulationstation/es_systems.cfg"),
+        "<systemList><system><name>gb</name><path>~/../roms/gb</path><extension>.gb</extension></system></systemList>",
+    )
+    .unwrap();
+    std::fs::create_dir(&managed).unwrap();
+    let reader = std::fs::File::open(install.join("retrobat.exe")).unwrap();
+
+    let result = crate::retrobat_setup::setup(&install, &managed, "server").unwrap();
+    assert!(result.skipped.is_empty());
+    assert_eq!(
+        std::fs::read_link(install.join("roms/gb/RomM")).unwrap(),
+        managed.join("gb")
+    );
+    assert_eq!(reader.metadata().unwrap().len(), b"fixture".len() as u64);
+}
+
+#[test]
 fn application_owner_keeps_worker_alive_after_view_handle_drops_and_quit_joins_once() {
     let (sink, _events) = rommfs_core::events::channel();
     let (cmd_tx, commands) = mpsc::channel::<CommandEnvelope>();
@@ -63,6 +87,92 @@ fn set_up_retrobat(installation: &std::path::Path, root: &std::path::Path) {
     )
     .unwrap();
     rommfs_core::retrobat::setup_roms_link(installation, root, "s").unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_artwork_keeps_published_games_and_reports_partial_completion() {
+    use rommfs_fixture::contract;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("games");
+    let installation = directory.path().join("RetroBat");
+    std::fs::create_dir(&root).unwrap();
+    rommfs_cfapi::claim_mount_root(&root, "s").unwrap();
+    set_up_retrobat(&installation, &root);
+    let fixture = FixtureServer::start();
+    let resource = "/assets/romm/resources/cover.png";
+    fixture.on(
+        "GET",
+        resource,
+        ResponseSpec::Json {
+            status: 500,
+            body: "{}".into(),
+        },
+    );
+    let client = RommClient::new(fixture.url()).unwrap();
+    client
+        .restore_paired_session(&PairedSession {
+            access_token: "fixture".into(),
+            device_id: "fixture".into(),
+            scopes: Vec::new(),
+            expires_at: None,
+        })
+        .unwrap();
+    let platforms =
+        serde_json::from_str(&contract::platforms(&[(1, "gb", "gb", "Game Boy")])).unwrap();
+    let mut rom = contract::rom(7, "gb", "Game.gb", 3, "version");
+    rom["path_cover_large"] = serde_json::json!(resource);
+    let snapshot = CatalogueSnapshot {
+        platforms,
+        roms: vec![serde_json::from_value(rom).unwrap()],
+        refreshed_at: 0,
+        full_refreshed_at: 0,
+    };
+    let catalogue =
+        rommfs_core::catalogue::build_catalogue("s", &snapshot.platforms, &snapshot.roms, |_| {})
+            .unwrap();
+    let artwork = rommfs_core::retrobat::cache_artwork(
+        &client,
+        &catalogue,
+        &snapshot.roms,
+        &directory.path().join("artwork"),
+    )
+    .unwrap();
+    assert_eq!(artwork.failed_downloads(), 1);
+    let (sink, events) = rommfs_core::events::channel();
+    let mut worker = Worker::new(sink);
+    worker.metadata_job_id = 1;
+    worker.server_id = Some("s".into());
+    worker.preferences = Some(ConnectionPreferences {
+        server: "s".into(),
+        account_id: 7,
+        device_identifier: "fixture".into(),
+        mount_root: Some(root.clone()),
+        integration: IntegrationMode::RetroBat,
+        retrobat_root: Some(installation.clone()),
+        start_at_login: false,
+        save_root: None,
+        hide_owned_copies: false,
+    });
+    worker.mount = Some(ActiveMount {
+        root,
+        stop_fn: Box::new(|| {}),
+    });
+    worker.metadata_source = Some((catalogue, snapshot));
+    worker.metadata_ready = Some(artwork);
+    worker.metadata_status(true, "Checking artwork", None);
+    poll_metadata_until(&mut worker, |worker| worker.metadata_source.is_none());
+    let mut state = UiState::new(32);
+    for event in events.try_iter() {
+        state.apply_event(&event);
+    }
+    assert_eq!(
+        state.frontend_metadata_summary(),
+        FrontendMetadataSummary::UpdatedWithIssues
+    );
+    assert!(!state.frontend_metadata_pending);
+    assert!(installation.join("roms/gb/gamelist.xml").is_file());
 }
 
 #[cfg(unix)]
@@ -297,33 +407,70 @@ fn stopping_cancels_artwork_and_discards_late_metadata_results() {
 }
 
 #[test]
-fn changing_accounts_drains_catalogue_and_artwork_threads_before_returning() {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    let (sink, _events) = rommfs_core::events::channel();
+fn sign_out_returns_while_a_catalogue_http_response_is_held() {
+    use rommfs_fixture::contract;
+    let fixture = FixtureServer::start();
+    fixture.on(
+        "POST",
+        "/api/token",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::token_ok(),
+        },
+    );
+    fixture.on(
+        "GET",
+        "/api/platforms",
+        ResponseSpec::Json {
+            status: 200,
+            body: contract::platforms(&[(1, "nes", "nes", "NES")]),
+        },
+    );
+    let barrier = FixtureBodyBarrier::new();
+    fixture.on(
+        "GET",
+        "/api/roms?limit=500&offset=0&",
+        ResponseSpec::HeldJson {
+            status: 200,
+            body: contract::roms_page(&[], 0, 500, 0),
+            barrier: barrier.clone(),
+        },
+    );
+    let url = fixture.url().to_string();
+    let client = Arc::new(RommClient::new(url.clone()).unwrap());
+    client
+        .authenticate(Credentials {
+            username: "user",
+            password: "password",
+        })
+        .unwrap();
+    let (sink, events) = rommfs_core::events::channel();
     let mut worker = Worker::new(sink);
-    let completed = Arc::new(AtomicUsize::new(0));
-    for artwork in [true, false] {
-        let active = Arc::new(AtomicBool::new(true));
-        let flag = active.clone();
-        let done = completed.clone();
-        let handle = std::thread::spawn(move || {
-            while flag.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-            done.fetch_add(1, Ordering::SeqCst);
-        });
-        if artwork {
-            worker.metadata_active = Some(active);
-            worker.metadata_handle = Some(handle);
-        } else {
-            worker.refresh_active = Some(active);
-            worker.refresh_handle = Some(handle);
-        }
-    }
-    worker.clear_active_connection();
-    assert_eq!(completed.load(Ordering::SeqCst), 2);
+    worker.client = Some(client);
+    worker.server_id = Some(url);
+    worker.refresh_catalogue();
+    assert!(barrier.wait_until_blocked(Duration::from_secs(5)));
+
+    let started = Instant::now();
+    worker.logout();
+    assert!(started.elapsed() < Duration::from_millis(250));
     assert!(worker.metadata_handle.is_none());
     assert!(worker.refresh_handle.is_none());
+    let events: Vec<_> = events.try_iter().collect();
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AppEvent::SignedOut)));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AppEvent::CatalogueLoaded { .. })));
+    barrier.release();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !worker.draining.iter().all(|handle| handle.is_finished()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+        worker.reap_draining();
+    }
+    worker.reap_draining();
+    assert!(worker.draining.is_empty());
 }
 
 #[test]

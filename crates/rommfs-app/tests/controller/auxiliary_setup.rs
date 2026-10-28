@@ -61,6 +61,7 @@ fn selecting_an_installation_clears_stale_installer_and_setup_state() {
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
         setup_migration: false,
+        setup_issues: Vec::new(),
         error: None,
     });
     assert!(ui.installer_error.is_none());
@@ -79,6 +80,7 @@ fn selecting_an_installation_clears_stale_installer_and_setup_state() {
         retrobat_root: Some("C:\\RetroBat".into()),
         setup_complete: false,
         setup_migration: false,
+        setup_issues: Vec::new(),
         error: None,
     });
     assert!(ui.retrobat_setup_error.is_some());

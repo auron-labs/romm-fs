@@ -2,6 +2,29 @@
 use super::*;
 
 #[test]
+fn remote_history_fingerprint_changes_when_same_id_metadata_changes() {
+    let original = rommfs_core::romm::RemoteSave {
+        id: 31,
+        rom_id: ROM_ID,
+        user_id: ACCOUNT_ID,
+        file_name: "rommfs-revision.srm".into(),
+        file_size_bytes: 16,
+        missing_from_fs: false,
+        created_at: "2026-10-05T12:34:56Z".into(),
+        updated_at: "2026-10-05T12:34:56Z".into(),
+        emulator: None,
+        slot: Some(RETROBAT_GB_SRM_PROFILE.into()),
+    };
+    let mut changed = original.clone();
+    changed.file_name = "rommfs-revision-edited.srm".into();
+    assert_eq!(original.id, changed.id);
+    assert_ne!(
+        super::super::incoming_transfer::remote_save_fingerprint(&original),
+        super::super::incoming_transfer::remote_save_fingerprint(&changed)
+    );
+}
+
+#[test]
 fn reconciliation_failure_for_one_game_survives_another_games_success() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = FixtureServer::start();

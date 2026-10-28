@@ -78,6 +78,11 @@ pub struct JournalSlot {
     /// Exact IDs from the last verified inventory. Older owned revisions in
     /// RomM history stay recognized without trusting array order.
     pub remote_history_ids: Vec<String>,
+    pub conflict_resolution: Option<String>,
+    pub conflict_local_hash: Option<String>,
+    pub conflict_history_ids: Vec<String>,
+    pub remote_history_fingerprint: String,
+    pub conflict_history_fingerprint: String,
     pub snapshot_revision: Option<String>,
     pub snapshot_path: Option<PathBuf>,
     pub snapshot_hash: Option<String>,
@@ -165,6 +170,11 @@ impl SaveSyncJournal {
                     remote_baseline_hash TEXT,
                     remote_slot_id TEXT,
                     remote_history_ids TEXT NOT NULL DEFAULT '',
+                    conflict_resolution TEXT,
+                    conflict_local_hash TEXT,
+                    conflict_history_ids TEXT NOT NULL DEFAULT '',
+                    remote_history_fingerprint TEXT NOT NULL DEFAULT '',
+                    conflict_history_fingerprint TEXT NOT NULL DEFAULT '',
                     snapshot_revision TEXT,
                     snapshot_path TEXT,
                     snapshot_hash TEXT,
@@ -211,6 +221,36 @@ impl SaveSyncJournal {
             &connection,
             "save_sync_slots",
             "remote_history_ids",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &connection,
+            "save_sync_slots",
+            "conflict_resolution",
+            "TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "save_sync_slots",
+            "conflict_local_hash",
+            "TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "save_sync_slots",
+            "conflict_history_ids",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &connection,
+            "save_sync_slots",
+            "remote_history_fingerprint",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &connection,
+            "save_sync_slots",
+            "conflict_history_fingerprint",
             "TEXT NOT NULL DEFAULT ''",
         )?;
         connection

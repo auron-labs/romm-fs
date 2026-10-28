@@ -233,6 +233,8 @@ pub enum AppEvent {
         available: bool,
         /// Consent is on for this server and account.
         enabled: bool,
+        /// A RomM request actually failed with a permission response.
+        permission_denied: bool,
         problem: Option<String>,
     },
     /// "Hide RomM games you already have": the switch state and how many
@@ -275,6 +277,8 @@ pub enum AppEvent {
         /// An earlier build's setup record is present: setup must run to
         /// migrate its links before the integration can mount.
         setup_migration: bool,
+        /// RetroBat systems whose recorded RomM link is missing or invalid.
+        setup_issues: Vec<crate::retrobat::SkippedSystem>,
         error: Option<String>,
     },
     SignedOut,

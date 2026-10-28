@@ -206,17 +206,29 @@ fn collect_review_rows(state: &UiState, show_ignored: bool) -> Vec<ReviewRow> {
                     SaveSyncWork::UpToDate => RowStatus::UpToDate,
                 }
             };
+            let last_update = state
+                .save_sync_transfers
+                .iter()
+                .filter(|transfer| transfer.rom_id == game.rom_id)
+                .max_by_key(|transfer| transfer.updated_at)
+                .map(|transfer| {
+                    format!(
+                        " · updated {}",
+                        super::super::relative_time(transfer.updated_at)
+                    )
+                })
+                .unwrap_or_default();
             let detail = if matches!(
                 status,
                 RowStatus::NeedsAttention | RowStatus::ConflictingChanges
             ) {
-                "Review details".to_string()
+                format!("Review details{last_update}")
             } else if !state.save_sync_enabled {
-                "Last known result · automatic sync is off".to_string()
+                format!("Last known result{last_update} · automatic sync is off")
             } else if status == RowStatus::UpToDate {
-                "Local and RomM copies match".to_string()
+                format!("Local and RomM copies match{last_update}")
             } else {
-                "Save details".to_string()
+                format!("Save details{last_update}")
             };
             rows.push(ReviewRow {
                 key: SharedString::from(format!("game:{}:{}", game.rom_id, game.file_id)),
@@ -277,11 +289,10 @@ fn row_matches_query(row: &ReviewRow, query: &str) -> bool {
 
 /// The game chosen in the shared picker, parsed from its "id · name" value.
 fn selected_rom_id(view: &RommfsWindow, cx: &App) -> Option<i64> {
-    view.save_game_select
-        .read(cx)
-        .selected_value()
-        .and_then(|value| value.split_once(" · "))
-        .and_then(|(id, _)| id.parse::<i64>().ok())
+    let selected = view.save_game_select.read(cx).selected_value()?;
+    super::super::save_game_options(&view.state.save_file_games)
+        .into_iter()
+        .find_map(|(id, label)| (label == selected.as_ref()).then_some(id))
 }
 
 fn toggle_expanded(view: &mut RommfsWindow, key: &SharedString) {
@@ -549,14 +560,73 @@ impl RommfsWindow {
                     .save_sync_review_versions(*rom_id, *file_id)
                     .cloned()
                     .collect::<Vec<_>>();
+                if matches!(
+                    row.status,
+                    RowStatus::NeedsAttention | RowStatus::ConflictingChanges
+                ) {
+                    detail = detail.child(section_heading("Choose which save to keep"));
+                    if !self.state.save_sync_enabled {
+                        detail = detail.child(muted_xs(
+                            "Turn on automatic sync above to apply a choice.",
+                            cx,
+                        ));
+                    }
+                    if let Some(local_hash) = local_hash.clone() {
+                        let session_id = self.state.save_sync_session_id;
+                        let local_hash_for_action = local_hash.clone();
+                        let rom_id = *rom_id;
+                        let file_id = *file_id;
+                        detail = detail.child(
+                            Button::new(format!("keep-local-{}-{file_id}", row.key))
+                                .label("Keep this PC’s save")
+                                .outline()
+                                .small()
+                                .disabled(!self.state.save_sync_enabled)
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    let still_current = view.state.save_sync_enabled
+                                        && view.state.save_sync_session_id
+                                        == session_id
+                                        && view.state.save_sync_queue.as_ref().is_some_and(
+                                            |queue| {
+                                                queue.games.iter().any(|game| {
+                                                    game.rom_id == rom_id
+                                                        && game.file_id == file_id
+                                                        && game.local_hash.as_deref()
+                                                            == Some(local_hash_for_action.as_str())
+                                                        && (game.work == rommfs_core::events::SaveSyncWork::NeedsReview
+                                                            || !game.incoming_ids.is_empty())
+                                                })
+                                            },
+                                        );
+                                    if still_current {
+                                        view.controller.send(Command::ResolveSaveConflict {
+                                            session_id,
+                                            rom_id,
+                                            file_id,
+                                            local_hash: Some(local_hash_for_action.clone()),
+                                            incoming_id: None,
+                                        });
+                                    }
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                }
                 if !records.is_empty() {
-                    detail = detail.child(section_heading("Remote versions to review"));
+                    detail = detail.child(section_heading("Remote copies"));
                     for (index, record) in records.into_iter().enumerate() {
                         detail = detail
                             .child(muted(format!("Remote version {}", index + 1), cx))
-                            .child(self.render_incoming_row(&record, can_export, window, cx));
+                            .child(self.render_incoming_row(
+                                &record,
+                                can_export,
+                                *rom_id,
+                                *file_id,
+                                local_hash.clone(),
+                                window,
+                                cx,
+                            ));
                     }
-                    detail = detail.child(muted("No automatic recovery is available for these review records. Export a copy for inspection; automatic sync cannot adopt an unverified version.", cx));
                 }
             }
             RowPayload::MemoryCard(conflict) => {
@@ -951,6 +1021,9 @@ impl RommfsWindow {
         &mut self,
         incoming: &SaveSyncIncomingStatus,
         can_export: bool,
+        rom_id: i64,
+        file_id: i64,
+        local_hash: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -965,33 +1038,76 @@ impl RommfsWindow {
             .save_sync_export_feedback
             .get(&incoming.incoming_id)
             .cloned();
+        let session_id = self.state.save_sync_session_id;
+        let incoming_id = incoming.incoming_id.clone();
+        let eligible = incoming.state == "staged";
+        let enabled = self.state.save_sync_enabled;
+        let checked_hash = local_hash.clone();
+        let use_copy = eligible.then(|| {
+            Button::new(format!("use-romm-{}", incoming.incoming_id))
+                .label("Use this RomM copy")
+                .outline()
+                .small()
+                .disabled(!enabled)
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    let still_current = view.state.save_sync_enabled
+                        && view.state.save_sync_session_id == session_id
+                        && view.state.save_sync_queue.as_ref().is_some_and(|queue| {
+                            queue.games.iter().any(|game| {
+                                game.rom_id == rom_id
+                                    && game.file_id == file_id
+                                    && game.local_hash == checked_hash
+                            })
+                        })
+                        && view.state.save_sync_queue.as_ref().is_some_and(|queue| {
+                            queue.incoming.iter().any(|record| {
+                                record.incoming_id == incoming_id && record.state == "staged"
+                            })
+                        });
+                    if still_current {
+                        view.controller.send(Command::ResolveSaveConflict {
+                            session_id,
+                            rom_id,
+                            file_id,
+                            local_hash: checked_hash.clone(),
+                            incoming_id: Some(incoming_id.clone()),
+                        });
+                    }
+                    cx.notify();
+                }))
+        });
+        let export_record = incoming.clone();
+        let export = Button::new(format!("export-{}", incoming.incoming_id))
+            .label("Export…")
+            .outline()
+            .small()
+            .disabled(!can_export)
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.prompt_export(export_record.clone(), cx);
+            }));
+        let reason = match incoming.reason.as_str() {
+            "two_sided_conflict" => "Local and RomM saves both changed.",
+            "remote_changed" => "RomM has a newer save.",
+            "first_sync_conflict" => "Both copies exist and need an initial choice.",
+            "local_save_removed" => "The local save was removed.",
+            _ => "This remote save needs review.",
+        };
         let mut row = v_flex()
             .gap_1()
+            .child(muted(format!("{} · {reason}", incoming.rom_name), cx))
             .child(details_disclosure(
                 SharedString::from(format!("incoming-details-{}", incoming.incoming_id)),
                 format!(
-                    "{} · RomM save {} · revision {} · {} · {} · {}",
-                    incoming.rom_name,
-                    incoming.remote_id,
-                    incoming.incoming_id,
-                    incoming.state,
-                    incoming.reason,
-                    incoming.content_hash
+                    "RomM save {} · revision {} · {} · hash {}",
+                    incoming.remote_id, incoming.incoming_id, incoming.state, incoming.content_hash
                 ),
                 window,
                 cx,
             ))
             .child(
-                h_flex().child(
-                    Button::new(format!("export-{}", incoming.incoming_id))
-                        .label("Export…")
-                        .outline()
-                        .small()
-                        .disabled(!can_export)
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.prompt_export(incoming.clone(), cx);
-                        })),
-                ),
+                h_flex()
+                    .gap_2()
+                    .children(use_copy.into_iter().chain(std::iter::once(export))),
             );
         if let Some(error) = error {
             row = row.child(error_line(format!("Export failed: {error}"), cx));

@@ -17,7 +17,9 @@ impl Worker {
         }
         let result = (|| -> anyhow::Result<AuxiliaryJob> {
             anyhow::ensure!(
-                self.mount.is_none(),
+                self.mount.is_none()
+                    && self.mount_preparation.is_none()
+                    && self.pending_mount_start.is_none(),
                 "Stop the games folder before installing support files"
             );
             anyhow::ensure!(
@@ -49,7 +51,9 @@ impl Worker {
             let (tx, rx) = mpsc::channel();
             let handle = std::thread::spawn(move || {
                 let result = (|| -> anyhow::Result<AuxiliaryReport> {
-                    let _stopped = stopped_retrobat_guard(&installation)?;
+                    if !flag.load(Ordering::Acquire) {
+                        anyhow::bail!("support file install cancelled");
+                    }
                     Ok(rommfs_core::retrobat::materialize_auxiliaries(
                         &client,
                         &server,
@@ -131,7 +135,7 @@ impl Worker {
     pub(super) fn cancel_auxiliary(&mut self) {
         if let Some(job) = self.auxiliary_job.take() {
             job.active.store(false, Ordering::Release);
-            let _ = job.handle.join();
+            self.draining.push(job.handle);
             self.sink.emit(AppEvent::AuxiliaryStatus { running:false,detail:"Support file install cancelled; completed files were kept and partial files were not published".into(),error:None,summary:None });
         }
     }
@@ -149,7 +153,7 @@ impl Worker {
 mod tests {
     use super::*;
     #[test]
-    fn cancellation_invalidates_late_events_and_joins_the_account_owned_job() {
+    fn cancellation_invalidates_late_events_and_drains_the_account_owned_job() {
         let (sink, events) = rommfs_core::events::channel();
         let mut worker = Worker::new(sink.clone());
         let active = Arc::new(AtomicBool::new(true));
@@ -183,5 +187,13 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, AppEvent::AuxiliaryStatus { running: true, .. })));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !worker.draining.iter().all(|handle| handle.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        worker.reap_draining();
+        assert!(worker.draining.is_empty());
     }
 }

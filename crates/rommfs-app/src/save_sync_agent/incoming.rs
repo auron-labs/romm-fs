@@ -10,6 +10,8 @@ use rommfs_core::save_sync::{
     resolve_save_target, IncomingSaveRecord, SaveMapping, SaveSyncJournal, SaveSyncScope,
     SnapshotState,
 };
+use std::collections::HashSet;
+use std::fs;
 use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Debug, Default)]
@@ -40,12 +42,80 @@ pub(super) fn reconcile_inventory(
     acknowledge_uncertain_snapshots(journal, mapping, &inventory.saves)?;
     let local_hash = observation.content_hash;
 
-    if inventory.unsupported_count > 0 {
-        let message = format!(
-            "RomM returned {} save record(s) outside the verified owned revision format; no remote file was adopted",
-            inventory.unsupported_count
+    let mut observed_history_ids = inventory
+        .saves
+        .iter()
+        .map(|save| save.metadata.id.to_string())
+        .chain(inventory.rejected.iter().map(|record| record.id.clone()))
+        .collect::<Vec<_>>();
+    observed_history_ids.sort();
+    let observed_history_fingerprint = &inventory.history_fingerprint;
+    let observed_fingerprint = observed_history_fingerprint.join(",");
+    if slot.conflict_resolution.as_deref() == Some("keep_local") {
+        let mut acknowledged_ids = slot.conflict_history_ids.clone();
+        acknowledged_ids.sort();
+        if slot.conflict_local_hash == local_hash
+            && acknowledged_ids == observed_history_ids
+            && slot.conflict_history_fingerprint == observed_fingerprint
+        {
+            return Ok(ReconciliationOutcome {
+                local_hash,
+                remote_id: slot.remote_slot_id,
+                remote_hash: slot.remote_baseline_hash,
+                ..Default::default()
+            });
+        }
+        journal.clear_conflict_resolution(&mapping.rom_key)?;
+        return require_fresh_choice(
+            journal,
+            mapping,
+            &slot,
+            &inventory,
+            &observed_history_ids,
+            &observed_fingerprint,
+            local_hash,
         );
-        journal.mark_reconciliation_attention(&mapping.rom_key, &message)?;
+    }
+    if matches!(
+        slot.conflict_resolution.as_deref(),
+        Some("keep_local_ack" | "use_remote_ack")
+    ) {
+        if reviewed_history_is_unchanged(&slot, &inventory, journal)? {
+            return Ok(ReconciliationOutcome {
+                local_hash,
+                remote_id: slot.remote_slot_id,
+                remote_hash: slot.remote_baseline_hash,
+                ..Default::default()
+            });
+        }
+        journal.clear_conflict_resolution(&mapping.rom_key)?;
+        return require_fresh_choice(
+            journal,
+            mapping,
+            &slot,
+            &inventory,
+            &observed_history_ids,
+            &observed_fingerprint,
+            local_hash,
+        );
+    }
+
+    if !inventory.rejected.is_empty() {
+        let details = inventory
+            .rejected
+            .iter()
+            .map(|record| format!("{}: {}", record.id, record.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let message = format!(
+            "RomM save records need review because their contents cannot be verified; no rejected record was adopted ({details})"
+        );
+        journal.mark_reconciliation_attention_with_history(
+            &mapping.rom_key,
+            &message,
+            &observed_history_ids,
+            &observed_fingerprint,
+        )?;
         let incoming = stage_all(
             journal,
             mapping,
@@ -70,7 +140,12 @@ pub(super) fn reconcile_inventory(
         }
         let message =
             "RomM save history has a tie for the latest compatible revision; review required";
-        journal.mark_reconciliation_attention(&mapping.rom_key, message)?;
+        journal.mark_reconciliation_attention_with_history(
+            &mapping.rom_key,
+            message,
+            &observed_history_ids,
+            &observed_fingerprint,
+        )?;
         let incoming = stage_all(
             journal,
             mapping,
@@ -137,9 +212,11 @@ pub(super) fn reconcile_inventory(
             slot.remote_baseline_hash.as_deref(),
         )?;
         if !is_active(enabled, active) {
-            journal.mark_reconciliation_attention(
+            journal.mark_reconciliation_attention_with_history(
                 &mapping.rom_key,
                 "save sync was disabled before incoming publication",
+                &observed_history_ids,
+                &observed_fingerprint,
             )?;
             return Ok(ReconciliationOutcome {
                 local_hash,
@@ -162,7 +239,12 @@ pub(super) fn reconcile_inventory(
                 && (check.present || after_check.local_ever_existed || after_check.local_removed))
         {
             let message = "a local save appeared while the remote download was in flight; both copies were preserved";
-            journal.mark_reconciliation_attention(&mapping.rom_key, message)?;
+            journal.mark_reconciliation_attention_with_history(
+                &mapping.rom_key,
+                message,
+                &observed_history_ids,
+                &observed_fingerprint,
+            )?;
             return Ok(ReconciliationOutcome {
                 local_hash: check.content_hash,
                 remote_id: Some(remote_id),
@@ -301,7 +383,12 @@ pub(super) fn reconcile_inventory(
         slot.remote_baseline_hash.as_deref(),
     )?;
     let message = message.unwrap_or("incoming save requires review");
-    journal.mark_reconciliation_attention(&mapping.rom_key, message)?;
+    journal.mark_reconciliation_attention_with_history(
+        &mapping.rom_key,
+        message,
+        &observed_history_ids,
+        &observed_fingerprint,
+    )?;
     Ok(ReconciliationOutcome {
         local_hash,
         remote_id: Some(remote_id),
@@ -351,6 +438,94 @@ fn acknowledge_uncertain_snapshots(
         )?;
     }
     Ok(())
+}
+
+fn reviewed_history_is_unchanged(
+    slot: &rommfs_core::save_sync::JournalSlot,
+    inventory: &IncomingInventory,
+    journal: &SaveSyncJournal,
+) -> Result<bool> {
+    let reviewed = slot
+        .conflict_history_fingerprint
+        .split(',')
+        .collect::<HashSet<_>>();
+    let current = inventory
+        .history_fingerprint
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if !reviewed.is_subset(&current) {
+        return Ok(false);
+    }
+    let snapshots = journal.snapshots()?;
+    for fingerprint in current.difference(&reviewed) {
+        let Some((metadata_fingerprint, content_hash)) = fingerprint.split_once('\t') else {
+            return Ok(false);
+        };
+        let Some((remote_id, _)) = metadata_fingerprint.split_once(':') else {
+            return Ok(false);
+        };
+        let Some(remote) = inventory.saves.iter().find(|save| {
+            save.metadata.id.to_string() == remote_id && save.content_hash == content_hash
+        }) else {
+            return Ok(false);
+        };
+        let Some(revision) = owned_revision_from_filename(&remote.metadata.file_name) else {
+            return Ok(false);
+        };
+        let is_our_upload = snapshots.iter().any(|snapshot| {
+            snapshot.rom_key == slot.rom_key
+                && snapshot.state == SnapshotState::RemoteComplete
+                && snapshot.revision == revision
+                && snapshot.content_hash == remote.content_hash
+                && snapshot.remote_slot_id.as_deref() == Some(remote_id)
+                && fs::metadata(&snapshot.path)
+                    .is_ok_and(|metadata| metadata.len() == remote.metadata.file_size_bytes)
+        });
+        if !is_our_upload {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn require_fresh_choice(
+    journal: &mut SaveSyncJournal,
+    mapping: &SaveMapping,
+    slot: &rommfs_core::save_sync::JournalSlot,
+    inventory: &IncomingInventory,
+    history_ids: &[String],
+    history_fingerprint: &str,
+    local_hash: Option<String>,
+) -> Result<ReconciliationOutcome> {
+    let mut message = String::from(
+        "save or RomM history changed after the previous choice; review the current versions",
+    );
+    for rejected in &inventory.rejected {
+        message.push_str(&format!("; {}: {}", rejected.id, rejected.reason));
+    }
+    journal.mark_reconciliation_attention_with_history(
+        &mapping.rom_key,
+        &message,
+        history_ids,
+        history_fingerprint,
+    )?;
+    let incoming = stage_all(
+        journal,
+        mapping,
+        &inventory.saves,
+        "history_changed_after_review",
+        slot.local_baseline_hash.as_deref(),
+        slot.remote_slot_id.as_deref(),
+        slot.remote_baseline_hash.as_deref(),
+    )?;
+    Ok(ReconciliationOutcome {
+        local_hash,
+        incoming,
+        message: Some(message),
+        conflict: true,
+        ..Default::default()
+    })
 }
 
 fn reconcile_missing_remote(

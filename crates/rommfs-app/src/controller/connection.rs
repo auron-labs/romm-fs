@@ -3,13 +3,17 @@ use super::*;
 
 impl Worker {
     pub(super) fn connect(&mut self, url: &str, username: &str, password: &str) {
+        self.pending_save_sync_disable = None;
         // Credentials are used to authenticate and then dropped from this
         // stack frame; they are never stored in logs/events (R1).
         self.advance_save_sync_session();
         self.sink.emit(AppEvent::Connecting);
         self.stop_save_sync_agent();
         self.cancel_pairing();
-        if self.mount.is_some() {
+        if self.mount.is_some()
+            || self.mount_preparation.is_some()
+            || self.pending_mount_start.is_some()
+        {
             self.stop_mount();
         }
 
@@ -55,9 +59,54 @@ impl Worker {
     }
 
     pub(super) fn forget_other_account(&mut self, url: &str, account_id: Option<i64>) {
+        let server_id = server_id_of(url);
+        if let Some((root, previous_server, previous_account)) = self.signed_out_root.take() {
+            if previous_server != server_id || account_id != Some(previous_account) {
+                if self
+                    .cancelled_mount_preparations
+                    .iter()
+                    .any(|job| job.root == root)
+                {
+                    self.pending_root_cleanup.push((root, previous_server));
+                } else if let Err(error) = cleanup_replaced_mount_root(&root, &previous_server) {
+                    self.log(
+                        Level::Error,
+                        "mount",
+                        format!(
+                            "could not replace previous account games folder {}: {error:#}",
+                            root.display()
+                        ),
+                    );
+                }
+            } else {
+                self.signed_out_root = Some((root, previous_server, previous_account));
+            }
+        }
         if self.preferences.as_ref().is_some_and(|p| {
             server_id_of(&p.server) != server_id_of(url) || account_id != Some(p.account_id)
         }) {
+            if let Some(preferences) = self.preferences.as_ref() {
+                if let Some(root) = preferences.mount_root.as_deref() {
+                    let server_id = server_id_of(&preferences.server);
+                    if self
+                        .cancelled_mount_preparations
+                        .iter()
+                        .any(|job| job.root == root)
+                    {
+                        self.pending_root_cleanup
+                            .push((root.to_path_buf(), server_id));
+                    } else if let Err(error) = cleanup_replaced_mount_root(root, &server_id) {
+                        self.log(
+                            Level::Error,
+                            "mount",
+                            format!(
+                                "could not replace previous account games folder {}: {error:#}",
+                                root.display()
+                            ),
+                        );
+                    }
+                }
+            }
             if let Some(p) = self.preferences.take() {
                 if let Err(error) =
                     rommfs_core::credential_store::delete(&server_id_of(&p.server), p.account_id)
@@ -86,11 +135,18 @@ impl Worker {
         self.forget_other_account(url, identity.as_ref().map(|i| i.account_id));
         if self.preferences.is_none() {
             if let Some(identity) = &identity {
+                let mount_root = self
+                    .signed_out_root
+                    .as_ref()
+                    .filter(|(_, server, account)| {
+                        server == &server_id_of(url) && *account == identity.account_id
+                    })
+                    .map(|(root, _, _)| root.clone());
                 self.preferences = Some(ConnectionPreferences {
                     server: url.into(),
                     account_id: identity.account_id,
                     device_identifier: uuid::Uuid::new_v4().to_string(),
-                    mount_root: None,
+                    mount_root,
                     integration: IntegrationMode::Generic,
                     retrobat_root: None,
                     start_at_login: false,
@@ -131,25 +187,7 @@ impl Worker {
             self.refresh_catalogue();
             return;
         }
-        match self.load_catalogue(&client) {
-            Ok(cat) => {
-                self.store_catalogue(cat);
-                self.refresh_save_sync();
-            }
-            Err(error) => {
-                if error.needs_sign_in() {
-                    self.sink.emit(AppEvent::SignInRequired {
-                        reason: Some(error.to_string()),
-                    });
-                } else {
-                    self.sink.emit(AppEvent::CatalogueFailed {
-                        reason: error.to_string(),
-                    });
-                }
-                self.log(Level::Error, "catalogue", error.to_string());
-                self.refresh_save_sync();
-            }
-        }
+        self.refresh_catalogue();
     }
 
     pub(super) fn begin_pairing(&mut self, url: &str) {
@@ -373,6 +411,7 @@ impl Worker {
     }
 
     pub(super) fn clear_active_connection(&mut self) {
+        self.pending_save_sync_disable = None;
         self.startup_requires_mount = false;
         self.startup_restoring = false;
         self.cancel_auxiliary();
@@ -393,12 +432,23 @@ impl Worker {
         self.save_sync_identity = None;
         self.save_sync_scope = None;
         self.save_sync_enabled = false;
-        // The owned worker threads must be gone before a new session starts.
-        self.drain_handles();
+        // Cancelled requests stay owned by `draining` and are reaped from the
+        // worker loop when they finish. Sign-out must not wait for an HTTP
+        // response that may be delayed indefinitely.
     }
 
     pub(super) fn logout(&mut self) {
+        let signed_out_root = self.preferences.as_ref().and_then(|preferences| {
+            preferences.mount_root.as_ref().map(|root| {
+                (
+                    root.clone(),
+                    server_id_of(&preferences.server),
+                    preferences.account_id,
+                )
+            })
+        });
         self.clear_active_connection();
+        self.signed_out_root = signed_out_root.or(self.signed_out_root.take());
         let result: Result<()> = (|| {
             if let Some(preferences) = &self.preferences {
                 rommfs_core::credential_store::delete(

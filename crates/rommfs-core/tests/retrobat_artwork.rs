@@ -219,6 +219,7 @@ fn missing_invalid_images_are_nonfatal_and_cancellation_does_not_publish_cache()
     let batch = cache_artwork(&client, &catalogue, &roms, cache.path()).unwrap();
     // One aggregated line, not one per ROM and role.
     assert_eq!(batch.warnings().len(), 1, "{:?}", batch.warnings());
+    assert_eq!(batch.failed_downloads(), 1);
     assert!(
         batch.warnings()[0].contains("no artwork on the server"),
         "{:?}",

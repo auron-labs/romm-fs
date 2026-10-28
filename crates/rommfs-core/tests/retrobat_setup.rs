@@ -1,4 +1,6 @@
-use rommfs_core::retrobat::{configure_switch_saves, setup_roms_link, switch_save_setting};
+use rommfs_core::retrobat::{
+    configure_switch_saves, setup_roms_link, setup_roms_link_with_root_guard, switch_save_setting,
+};
 #[cfg(unix)]
 use rommfs_core::retrobat::{verify_setup_link, ROMM_FOLDER};
 use std::fs;
@@ -261,6 +263,39 @@ fn missing_system_configuration_asks_to_start_retrobat_once() {
 }
 
 #[cfg(unix)]
+#[test]
+fn backend_root_guard_can_hold_a_managed_reparse_while_default_setup_stays_strict() {
+    let dir = tempfile::tempdir().unwrap();
+    let (install, managed) = installation(dir.path());
+    let real = dir.path().join("real-managed");
+    fs::rename(&managed, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &managed).unwrap();
+
+    assert!(setup_roms_link(&install, &managed, "s").is_err());
+    assert!(!install.join("roms/gb/RomM").exists());
+    let error = setup_roms_link_with_root_guard(
+        &install,
+        &managed,
+        "s",
+        |_| -> anyhow::Result<Vec<fs::File>> { anyhow::bail!("backend rejected managed root") },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("backend rejected managed root"), "{error}");
+    assert!(!install.join("roms/gb/RomM").exists());
+
+    let outcome = setup_roms_link_with_root_guard(&install, &managed, "s", |root| {
+        if !fs::symlink_metadata(root)?.file_type().is_symlink() {
+            anyhow::bail!("test backend expected its managed reparse root");
+        }
+        Ok(vec![fs::File::open(root)?])
+    })
+    .unwrap();
+    assert_eq!(outcome.linked, ["gb"]);
+    assert!(path_is_link(&install.join("roms/gb/RomM")));
+}
+
+#[cfg(unix)]
 fn path_is_link(path: &Path) -> bool {
     fs::symlink_metadata(path).unwrap().file_type().is_symlink()
 }
@@ -461,4 +496,28 @@ fn metadata_uses_backend_root_check_and_still_checks_setup_identity() {
             .is_err()
     );
     assert!(linked_systems_with_root_check(&install, &managed, "other", |_| Ok(())).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn backend_setup_inspection_reports_removed_links_and_rejects_foreign_roots() {
+    use rommfs_core::retrobat::inspect_setup_with_root_check;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (install, managed) = installation(dir.path());
+    setup_roms_link(&install, &managed, "s").unwrap();
+    let inspect = || inspect_setup_with_root_check(&install, &managed, "s", |_| Ok(()));
+    assert_eq!(inspect().unwrap().linked, ["gb"]);
+
+    fs::remove_file(install.join("roms/gb").join(ROMM_FOLDER)).unwrap();
+    let outcome = inspect().unwrap();
+    assert!(outcome.linked.is_empty());
+    assert_eq!(outcome.skipped.len(), 1);
+    assert_eq!(outcome.skipped[0].system, "gb");
+    assert!(outcome.skipped[0].reason.contains("no longer links"));
+    assert!(inspect_setup_with_root_check(&install, &managed, "s", |_| {
+        anyhow::bail!("foreign root")
+    })
+    .is_err());
+    assert!(inspect_setup_with_root_check(&install, &managed, "other", |_| Ok(())).is_err());
 }

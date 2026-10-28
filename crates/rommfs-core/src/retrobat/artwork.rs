@@ -48,6 +48,7 @@ pub struct ArtworkBatch {
     references: HashMap<(i64, &'static str), String>,
     files: BTreeMap<String, PathBuf>,
     warnings: Vec<String>,
+    failed_downloads: usize,
 }
 impl ArtworkBatch {
     pub fn references(&self) -> &HashMap<(i64, &'static str), String> {
@@ -58,6 +59,9 @@ impl ArtworkBatch {
     }
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+    pub fn failed_downloads(&self) -> usize {
+        self.failed_downloads
     }
 }
 
@@ -171,6 +175,7 @@ pub fn cache_artwork_cancellable(
         references: HashMap::new(),
         files: BTreeMap::new(),
         warnings: Vec::new(),
+        failed_downloads: 0,
     };
     let mut results = results.into_inner().unwrap_or_else(|e| e.into_inner());
     results.sort_by_key(|(index, _)| *index);
@@ -192,6 +197,7 @@ pub fn cache_artwork_cancellable(
             }
             Err(error) if error.needs_sign_in() => return Err(error),
             Err(error) => {
+                batch.failed_downloads += 1;
                 artless
                     .entry(assignments[0].0)
                     .or_insert(Some(error.to_string()));

@@ -123,6 +123,70 @@ fn confirmed_mapping_survives_restart_and_changed_target_needs_attention() {
 }
 
 #[test]
+fn explicit_keep_local_decision_survives_restart_and_new_history_requires_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let saves = dir.path().join("saves");
+    let target = saves.join("gb/Tetris.srm");
+    let (mut journal, mapping) = confirmed_journal(dir.path(), &saves, &target);
+    let local_hash = journal
+        .observe_local_save_for_reconciliation(&mapping)
+        .unwrap()
+        .content_hash
+        .unwrap();
+    let ids = vec!["31".into(), "34".into()];
+    journal
+        .mark_reconciliation_attention_with_history(
+            &mapping.rom_key,
+            "review",
+            &ids,
+            "31:original,34:original",
+        )
+        .unwrap();
+    let generation = journal
+        .slot(&mapping.rom_key)
+        .unwrap()
+        .unwrap()
+        .local_generation;
+    let prepared = journal
+        .capture_reviewed_snapshot(&mapping, generation, &local_hash)
+        .unwrap();
+    drop(journal);
+
+    let mut journal = open(dir.path(), &saves);
+    journal
+        .keep_local_after_review(&mapping, &local_hash)
+        .unwrap();
+    drop(journal);
+
+    let mut reopened = open(dir.path(), &saves);
+    let slot = reopened.slot(&mapping.rom_key).unwrap().unwrap();
+    assert!(!slot.needs_attention);
+    assert_eq!(slot.conflict_resolution.as_deref(), Some("keep_local"));
+    assert_eq!(
+        slot.conflict_local_hash.as_deref(),
+        Some(local_hash.as_str())
+    );
+    assert_eq!(slot.conflict_history_ids, ids);
+    assert_eq!(slot.conflict_history_fingerprint, "31:original,34:original");
+    let ready = reopened.ready_snapshots().unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].content_hash, local_hash);
+    assert_eq!(ready[0].revision, prepared.revision);
+
+    reopened
+        .mark_reconciliation_attention_with_history(
+            &mapping.rom_key,
+            "new competing record",
+            &["31".into(), "34".into(), "35".into()],
+            "31:original,34:original,35:new",
+        )
+        .unwrap();
+    let slot = reopened.slot(&mapping.rom_key).unwrap().unwrap();
+    assert!(slot.needs_attention);
+    assert_eq!(slot.conflict_resolution, None);
+}
+
+#[test]
 fn ambiguous_rescan_cannot_be_reconfirmed_as_the_previous_first_match() {
     let dir = tempfile::tempdir().unwrap();
     let saves = dir.path().join("retrobat/saves");

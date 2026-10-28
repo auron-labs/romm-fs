@@ -54,6 +54,7 @@ pub enum FrontendMetadataSummary {
     CheckingArtwork,
     Publishing,
     Waiting,
+    UpdatedWithIssues,
     Failed,
     UpToDate,
 }
@@ -230,6 +231,7 @@ pub struct UiState {
     pub retrobat_setup_ok: bool,
     /// An earlier build's setup record must be migrated by running setup.
     pub retrobat_setup_migration: bool,
+    pub retrobat_setup_issues: Vec<rommfs_core::retrobat::SkippedSystem>,
     pub retrobat_setup_detail: Option<String>,
     pub retrobat_setup_error: Option<String>,
     /// Systems the last setup run could not link, each with its reason.
@@ -245,6 +247,7 @@ pub struct UiState {
     pub frontend_metadata_updated_at: Option<u64>,
     /// The session holds the scopes play-data sync needs.
     pub play_data_available: bool,
+    pub play_data_permission_denied: bool,
     /// Consent is on for the connected server and account.
     pub play_data_enabled: bool,
     pub play_data_problem: Option<String>,
@@ -341,6 +344,7 @@ impl UiState {
             retrobat_setup_running: false,
             retrobat_setup_ok: false,
             retrobat_setup_migration: false,
+            retrobat_setup_issues: Vec::new(),
             retrobat_setup_detail: None,
             retrobat_setup_error: None,
             retrobat_setup_skipped: Vec::new(),
@@ -351,6 +355,7 @@ impl UiState {
             frontend_metadata_job_id: 0,
             frontend_metadata_updated_at: None,
             play_data_available: false,
+            play_data_permission_denied: false,
             play_data_enabled: false,
             play_data_problem: None,
             hide_copies_enabled: true,
@@ -512,7 +517,7 @@ impl UiState {
                     self.frontend_metadata_error = error.clone();
                     if !pending {
                         self.frontend_metadata_progress = None;
-                        if error.is_none() {
+                        if error.is_none() || detail.starts_with("Updated with issues") {
                             self.frontend_metadata_updated_at =
                                 Some(rommfs_core::cache::now_unix_secs());
                         }
@@ -548,9 +553,11 @@ impl UiState {
             AppEvent::PlayDataUpdated {
                 available,
                 enabled,
+                permission_denied,
                 problem,
             } => {
                 self.play_data_available = *available;
+                self.play_data_permission_denied = *permission_denied;
                 self.play_data_enabled = *enabled;
                 self.play_data_problem = problem.clone();
             }
@@ -587,6 +594,7 @@ impl UiState {
                 retrobat_root,
                 setup_complete,
                 setup_migration,
+                setup_issues,
                 error,
             } => {
                 let changed = self.integration != *mode;
@@ -594,6 +602,7 @@ impl UiState {
                 self.integration = *mode;
                 self.retrobat_root = retrobat_root.clone();
                 self.retrobat_setup_migration = *setup_migration;
+                self.retrobat_setup_issues = setup_issues.clone();
                 if error.is_none() && retrobat_root.is_some() {
                     // A usable installation is selected: the installer's
                     // download/launch problems no longer apply.
@@ -602,7 +611,7 @@ impl UiState {
                 self.retrobat_setup_ok = !*setup_migration
                     && *mode == IntegrationMode::RetroBat
                     && retrobat_root.is_some()
-                    && (*setup_complete || (!root_changed && self.retrobat_setup_ok));
+                    && *setup_complete;
                 if root_changed {
                     // Results belong to the installation that produced them.
                     self.retrobat_setup_error = None;
@@ -665,6 +674,7 @@ impl UiState {
                 self.mount_error = None;
                 self.mount_progress = None;
                 self.play_data_available = false;
+                self.play_data_permission_denied = false;
                 self.play_data_enabled = false;
                 self.play_data_problem = None;
                 // Metadata belongs to the session that just ended. The job
@@ -1177,7 +1187,12 @@ impl UiState {
 
     pub fn frontend_metadata_summary(&self) -> FrontendMetadataSummary {
         if self.frontend_metadata_pending {
-            if self.frontend_metadata_error.is_some() {
+            if self.frontend_metadata_error.is_some()
+                || self
+                    .frontend_metadata_detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.starts_with("Waiting for "))
+            {
                 FrontendMetadataSummary::Waiting
             } else if self
                 .frontend_metadata_progress
@@ -1187,6 +1202,12 @@ impl UiState {
             } else {
                 FrontendMetadataSummary::CheckingArtwork
             }
+        } else if self
+            .frontend_metadata_detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("Updated with issues"))
+        {
+            FrontendMetadataSummary::UpdatedWithIssues
         } else if self.frontend_metadata_error.is_some() {
             FrontendMetadataSummary::Failed
         } else if self.frontend_metadata_updated_at.is_some() {

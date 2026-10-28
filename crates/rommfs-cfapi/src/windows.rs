@@ -335,7 +335,6 @@ impl CallbackContext {
 /// One registered, connected NTFS sync root. No WinFsp/ProjFS runtime is used.
 pub struct WindowsMount {
     connection: Option<CF_CONNECTION_KEY>,
-    registered: bool,
     context: Box<CallbackContext>,
     root: PathBuf,
     manifest: Manifest,
@@ -413,7 +412,6 @@ impl WindowsMount {
             .collect();
         let mut mount = Self {
             connection: None,
-            registered: false,
             context: Box::new(CallbackContext {
                 core,
                 inodes,
@@ -428,7 +426,6 @@ impl WindowsMount {
             _directories: directories,
         };
         register_root(&mount.root, &manifest.server_id)?;
-        mount.registered = true;
         security::set(&root_handle, security::MIXED_DIRECTORY).with_context(|| {
             format!(
                 "apply protected mixed-content directory ACL to {}",
@@ -437,13 +434,58 @@ impl WindowsMount {
         })?;
         let scan = root::scan_tree(&mount.root, &mount.manifest, verify_owned)?;
         let unowned = root::adopt_entries(&mount.root, &mut mount.manifest, scan.unowned)?;
-        // ponytail: rebuilds owned placeholders on start; reconcile unchanged entries
-        // if catalogue startup costs become significant. Private bytes survive.
         let mut failures = scan.failures;
-        failures.extend(remove_entries(&mount.root, &mount.manifest));
         if !unowned.is_empty() {
             failures.push(format!("{}", root::UnownedEntries(unowned)));
         }
+        anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
+        let desired_paths: HashMap<_, _> = manifest
+            .entries
+            .iter()
+            .map(|entry| (entry.path.to_lowercase(), entry))
+            .collect();
+        let obsolete = Manifest {
+            server_id: mount.manifest.server_id.clone(),
+            entries: mount
+                .manifest
+                .entries
+                .iter()
+                .filter(|old| {
+                    !old.is_local()
+                        && desired_paths
+                            .get(&old.path.to_lowercase())
+                            .is_none_or(|new| new.identity != old.identity)
+                })
+                .cloned()
+                .collect(),
+            ..Manifest::default()
+        };
+        let reused: std::collections::HashSet<_> = mount
+            .manifest
+            .entries
+            .iter()
+            .filter(|old| {
+                desired_paths
+                    .get(&old.path.to_lowercase())
+                    .is_some_and(|new| new.identity == old.identity)
+                    && std::fs::symlink_metadata(mount.root.join(&old.path)).is_ok()
+            })
+            .map(|entry| entry.path.to_lowercase())
+            .collect();
+        let reused_placeholders = mount
+            .manifest
+            .entries
+            .iter()
+            .filter(|old| {
+                !old.is_local()
+                    && desired_paths
+                        .get(&old.path.to_lowercase())
+                        .is_some_and(|new| new.identity == old.identity)
+                    && std::fs::symlink_metadata(mount.root.join(&old.path)).is_ok()
+            })
+            .count();
+        let removed = obsolete.entries.len();
+        let failures = remove_entries(&mount.root, &obsolete);
         anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
         root::write_manifest(&mount.root, &manifest)?;
         mount.manifest = manifest;
@@ -498,12 +540,14 @@ impl WindowsMount {
                 elapsed_ms: started.elapsed().as_millis() as u64,
             });
         for (index, entry) in mount.manifest.entries.iter().enumerate() {
-            create_placeholder(&mount.root, entry).with_context(|| {
-                format!(
-                    "create placeholder {}",
-                    mount.root.join(&entry.path).display()
-                )
-            })?;
+            if !reused.contains(&entry.path.to_lowercase()) {
+                create_placeholder(&mount.root, entry).with_context(|| {
+                    format!(
+                        "create placeholder {}",
+                        mount.root.join(&entry.path).display()
+                    )
+                })?;
+            }
             if (index + 1) % 64 == 0 || index + 1 == total as usize {
                 mount
                     .context
@@ -517,7 +561,108 @@ impl WindowsMount {
                     });
             }
         }
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            reused = reused_placeholders,
+            changed_or_removed = removed,
+            created = mount
+                .manifest
+                .entries
+                .iter()
+                .filter(|entry| !entry.is_local() && !entry.directory)
+                .count()
+                .saturating_sub(reused_placeholders),
+            "Cloud Files mount reconciled"
+        );
         Ok(mount)
+    }
+
+    /// Remove this provider's entries before a caller replaces the root or account.
+    pub fn cleanup_root(root: impl AsRef<Path>, server_id: &str) -> anyhow::Result<()> {
+        let root = std::fs::canonicalize(root.as_ref())?;
+        root::check_directory(&root)?;
+        let lock_path = root::sidecar_path(&root, ".rommfs-lock")?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(&lock_path)
+            .with_context(|| format!("open exclusive mount lock {}", lock_path.display()))?;
+        let _lock = lock;
+        let mut manifest = root::read_manifest(&root)?;
+        anyhow::ensure!(
+            manifest.server_id == server_id,
+            "mount root belongs to a different server"
+        );
+        let registered = registration_flags(&root, &format!("RomMFS-CFAPI-v1:{server_id}"))?
+            & CF_REGISTER_FLAG_UPDATE
+            != 0;
+        anyhow::ensure!(
+            !registered || !manifest.root_security.is_empty(),
+            "registered root is missing its original permissions"
+        );
+        let started = std::time::Instant::now();
+        let scan = root::scan_tree(&root, &manifest, verify_owned)?;
+        anyhow::ensure!(
+            scan.failures.is_empty(),
+            "owned entries failed verification: {}",
+            scan.failures.join("; ")
+        );
+        let unowned = root::adopt_entries(&root, &mut manifest, scan.unowned)?;
+        anyhow::ensure!(unowned.is_empty(), "{}", root::UnownedEntries(unowned));
+        let removed = manifest
+            .entries
+            .iter()
+            .filter(|entry| !entry.is_local() || entry.directory)
+            .count();
+        let failures = remove_entries(&root, &manifest);
+        anyhow::ensure!(
+            failures.is_empty(),
+            "partial cleanup: {}",
+            failures.join("; ")
+        );
+        let placeholders_left = manifest
+            .entries
+            .iter()
+            .filter(|entry| {
+                !entry.is_local() && std::fs::symlink_metadata(root.join(&entry.path)).is_ok()
+            })
+            .count();
+        anyhow::ensure!(
+            placeholders_left == 0,
+            "{placeholders_left} placeholders remain before unregister"
+        );
+        let path = wide(&root)?;
+        if registered {
+            // SAFETY: verified RomMFS placeholders and empty managed directories were removed above.
+            hr(
+                unsafe { CfUnregisterSyncRoot(path.as_ptr()) },
+                "unregister sync root",
+            )?;
+        }
+        if !manifest.root_security.is_empty() {
+            security::restore(&open_metadata(&root, false)?, &manifest.root_security)?;
+        }
+        root::write_manifest(
+            &root,
+            &Manifest {
+                server_id: manifest.server_id.clone(),
+                entries: manifest
+                    .entries
+                    .into_iter()
+                    .filter(|entry| entry.is_local() && !entry.directory)
+                    .collect(),
+                ..Manifest::default()
+            },
+        )?;
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            removed,
+            "Cloud Files root cleaned before replacement"
+        );
+        Ok(())
     }
     pub fn stop(self) {
         drop(self);
@@ -556,84 +701,6 @@ impl Drop for WindowsMount {
                 .unwrap_or_else(|e| e.into_inner());
         }
         drop(count);
-        if !self.registered {
-            return;
-        }
-        let cleanup = (|| -> anyhow::Result<()> {
-            let latest = root::read_manifest(&self.root)?;
-            anyhow::ensure!(
-                latest.server_id == self.manifest.server_id,
-                "root ownership changed while mounted"
-            );
-            self.manifest = latest;
-            let scan = root::scan_tree(&self.root, &self.manifest, verify_owned)?;
-            // A frontend may have written its own files (gamelist.xml) while
-            // mounted; claim those so everything RomMFS owns can still come
-            // down. Unknown foreign entries stay untouched and reported.
-            let unowned = root::adopt_entries(&self.root, &mut self.manifest, scan.unowned)?;
-            let mut problems = scan.failures;
-            problems.extend(remove_entries(&self.root, &self.manifest));
-            let leftovers = self
-                .manifest
-                .entries
-                .iter()
-                .filter(|entry| {
-                    !entry.is_local()
-                        && std::fs::symlink_metadata(self.root.join(&entry.path)).is_ok()
-                })
-                .count();
-            if leftovers != 0 {
-                problems.push(format!(
-                    "{leftovers} owned placeholders could not be removed"
-                ));
-            }
-            if !unowned.is_empty() {
-                problems.push(format!("{}", root::UnownedEntries(unowned)));
-            }
-            anyhow::ensure!(
-                problems.is_empty(),
-                "partial cleanup; registration preserved for remount: {}",
-                problems.join("; ")
-            );
-            let path = wide(&self.root)?;
-            // SAFETY: no connection or placeholders remain; never traverse user files.
-            hr(
-                unsafe { CfUnregisterSyncRoot(path.as_ptr()) },
-                "unregister sync root without ROM placeholders",
-            )?;
-            security::restore(
-                &open_metadata(&self.root, false)?,
-                &self.manifest.root_security,
-            )?;
-            root::write_manifest(
-                &self.root,
-                &Manifest {
-                    server_id: self.manifest.server_id.clone(),
-                    entries: self
-                        .manifest
-                        .entries
-                        .iter()
-                        .filter(|entry| entry.is_local())
-                        .cloned()
-                        .collect(),
-                    ..Manifest::default()
-                },
-            )
-        })();
-        if let Err(error) = cleanup {
-            self.context
-                .core
-                .events()
-                .emit(rommfs_core::events::AppEvent::log(
-                    rommfs_core::events::Level::Warn,
-                    "native-stop",
-                    format!(
-                        "Cloud Files cleanup deferred at {}: {error:#}",
-                        self.root.display()
-                    ),
-                ));
-            tracing::warn!(error = %error, root = %self.root.display(), "Cloud Files cleanup deferred; owned placeholders preserved for restart");
-        }
     }
 }
 
