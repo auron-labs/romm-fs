@@ -10,12 +10,19 @@ fn main() {
     if let Some(code) = rommfs_app::retrobat_setup::windows::run_helper(std::env::args_os()) {
         std::process::exit(code);
     }
-    // The GPUI element tree is laid out recursively; the default main-thread
-    // stack is too small for deep review/detail trees in debug builds.
-    std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
-        .spawn(rommfs_app::window::run)
-        .expect("UI thread")
-        .join()
-        .expect("UI thread panicked");
+    #[cfg(windows)]
+    {
+        // The GPUI element tree is laid out recursively; the default
+        // main-thread stack is too small for deep review/detail trees in
+        // debug builds.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(rommfs_app::window::run)
+            .expect("UI thread")
+            .join()
+            .expect("UI thread panicked");
+    }
+    // macOS GPUI must run on the main thread (MainThreadMarker).
+    #[cfg(not(windows))]
+    rommfs_app::window::run();
 }
