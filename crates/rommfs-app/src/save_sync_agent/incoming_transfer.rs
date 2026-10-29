@@ -11,7 +11,6 @@ pub(super) struct IncomingJob {
     pub(super) mapping: SaveMapping,
     pub(super) identity: SaveSyncIdentity,
     pub(super) scope: SaveSyncScope,
-    pub(super) verify_reviewed_history: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +80,135 @@ pub(super) struct IncomingContentCache {
 }
 
 impl IncomingContentCache {
+    pub(super) fn verify_hash(
+        &mut self,
+        client: &RommClient,
+        job: &IncomingJob,
+        remote: &RemoteSave,
+        expected_hash: &str,
+        enabled: &SaveSyncEnablement,
+        active: &AtomicBool,
+    ) -> Result<bool, SaveApiFailure> {
+        Ok(self
+            .content(client, job, remote, enabled, active)?
+            .content_hash
+            == expected_hash)
+    }
+
+    fn content(
+        &mut self,
+        client: &RommClient,
+        job: &IncomingJob,
+        metadata: &RemoteSave,
+        enabled: &SaveSyncEnablement,
+        active: &AtomicBool,
+    ) -> Result<CachedRemoteSave, SaveApiFailure> {
+        if !super::transfer::is_active(enabled, active) {
+            return Err(cancelled_failure());
+        }
+        self.enter_scope(&job.scope);
+        let cache = self;
+        let key = CacheKey {
+            server_id: job.scope.server_id.clone(),
+            account_id: job.identity.account_id,
+            rom_id: metadata.rom_id,
+            slot: metadata.slot.clone().unwrap_or_default(),
+            save_id: metadata.id,
+        };
+        let cached = cache
+            .saves
+            .get(&key)
+            .filter(|cached| cached.metadata == *metadata)
+            .cloned();
+        if let Some(cached) = cached {
+            Ok(cached)
+        } else {
+            let (bytes, file, content_hash) =
+                if job.mapping.profile.id == rommfs_core::save_sync::GENERIC_FILE_PROFILE {
+                    let mut file = tempfile::NamedTempFile::new().map_err(|e| SaveApiFailure {
+                        error: e.into(),
+                        retry_after: None,
+                    })?;
+                    client.download_save_to(
+                        metadata.id,
+                        metadata.file_size_bytes,
+                        &mut file,
+                        active,
+                    )?;
+                    file.as_file().sync_all().map_err(|e| SaveApiFailure {
+                        error: e.into(),
+                        retry_after: None,
+                    })?;
+                    let mut reader = file.reopen().map_err(|e| SaveApiFailure {
+                        error: e.into(),
+                        retry_after: None,
+                    })?;
+                    let hash = rommfs_core::save_sync::hash_save_content(&mut reader).map_err(
+                        |error| SaveApiFailure {
+                            error,
+                            retry_after: None,
+                        },
+                    )?;
+                    (Vec::new(), Some(Arc::new(file)), hash)
+                } else {
+                    let bytes = client.download_save_content(metadata.id)?;
+                    let hash = sha256_content_hash(&bytes);
+                    (bytes, None, hash)
+                };
+            if file.is_none() && bytes.len() as u64 != metadata.file_size_bytes {
+                return Err(SaveApiFailure {
+                    error: Error::InvalidCatalogue(format!(
+                        "RomM save {} content size did not match inventory",
+                        metadata.id
+                    )),
+                    retry_after: None,
+                });
+            }
+            cache.saves.insert(
+                key.clone(),
+                CachedRemoteSave {
+                    metadata: metadata.clone(),
+                    bytes: bytes.clone(),
+                    file: file.clone(),
+                    content_hash: content_hash.clone(),
+                },
+            );
+            // Retain verified metadata and disk payloads for this scope; evict only resident bytes.
+            while cache
+                .saves
+                .values()
+                .filter(|save| !save.bytes.is_empty())
+                .count()
+                > 16
+            {
+                let cached = cache
+                    .saves
+                    .values_mut()
+                    .find(|save| !save.bytes.is_empty())
+                    .expect("resident payload exists");
+                let mut file = tempfile::NamedTempFile::new().map_err(|error| SaveApiFailure {
+                    error: error.into(),
+                    retry_after: None,
+                })?;
+                std::io::Write::write_all(&mut file, &cached.bytes).map_err(|error| {
+                    SaveApiFailure {
+                        error: error.into(),
+                        retry_after: None,
+                    }
+                })?;
+                cached.file = Some(Arc::new(file));
+                cached.bytes.clear();
+                cached.bytes.shrink_to_fit();
+            }
+            Ok(CachedRemoteSave {
+                metadata: metadata.clone(),
+                bytes,
+                file,
+                content_hash,
+            })
+        }
+    }
+
     fn enter_scope(&mut self, scope: &SaveSyncScope) {
         if self.scope.as_ref() != Some(scope) {
             self.saves.clear();
@@ -172,87 +300,8 @@ pub(super) fn reconcile_attempt(
                 ),
                 retry_after: None,
             })?;
-        let key = CacheKey {
-            server_id: job.scope.server_id.clone(),
-            account_id: job.identity.account_id,
-            rom_id: metadata.rom_id,
-            slot: metadata.slot.clone().unwrap_or_default(),
-            save_id: metadata.id,
-        };
-        let cached = cache
-            .saves
-            .get(&key)
-            .filter(|cached| cached.metadata == metadata && !job.verify_reviewed_history)
-            .cloned();
-        let (bytes, file, content_hash) = if let Some(cached) = cached {
-            (cached.bytes, cached.file, cached.content_hash)
-        } else {
-            if !super::transfer::is_active(enabled, active) {
-                return Err(cancelled_failure());
-            }
-            let (bytes, file, content_hash) =
-                if job.mapping.profile.id == rommfs_core::save_sync::GENERIC_FILE_PROFILE {
-                    let mut file = tempfile::NamedTempFile::new().map_err(|e| SaveApiFailure {
-                        error: e.into(),
-                        retry_after: None,
-                    })?;
-                    client.download_save_to(
-                        metadata.id,
-                        metadata.file_size_bytes,
-                        &mut file,
-                        active,
-                    )?;
-                    file.as_file().sync_all().map_err(|e| SaveApiFailure {
-                        error: e.into(),
-                        retry_after: None,
-                    })?;
-                    let mut reader = file.reopen().map_err(|e| SaveApiFailure {
-                        error: e.into(),
-                        retry_after: None,
-                    })?;
-                    let hash = rommfs_core::save_sync::hash_save_content(&mut reader).map_err(
-                        |error| SaveApiFailure {
-                            error,
-                            retry_after: None,
-                        },
-                    )?;
-                    (Vec::new(), Some(Arc::new(file)), hash)
-                } else {
-                    let bytes = client.download_save_content(metadata.id)?;
-                    let hash = sha256_content_hash(&bytes);
-                    (bytes, None, hash)
-                };
-            if file.is_none() && bytes.len() as u64 != metadata.file_size_bytes {
-                return Err(SaveApiFailure {
-                    error: Error::InvalidCatalogue(format!(
-                        "RomM save {} content size did not match inventory",
-                        metadata.id
-                    )),
-                    retry_after: None,
-                });
-            }
-            cache.saves.insert(
-                key.clone(),
-                CachedRemoteSave {
-                    metadata: metadata.clone(),
-                    bytes: bytes.clone(),
-                    file: file.clone(),
-                    content_hash: content_hash.clone(),
-                },
-            );
-            while cache.saves.len() > 16 {
-                let Some(oldest_key) = cache
-                    .saves
-                    .keys()
-                    .find(|cached_key| **cached_key != key)
-                    .cloned()
-                else {
-                    break;
-                };
-                cache.saves.remove(&oldest_key);
-            }
-            (bytes, file, content_hash)
-        };
+        let cached = cache.content(client, job, &metadata, enabled, active)?;
+        let (bytes, file, content_hash) = (cached.bytes, cached.file, cached.content_hash);
         history_fingerprint.push(format!(
             "{}\t{}",
             remote_save_fingerprint(&metadata),

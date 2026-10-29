@@ -649,11 +649,7 @@ impl WindowsMount {
             &root,
             &Manifest {
                 server_id: manifest.server_id.clone(),
-                entries: manifest
-                    .entries
-                    .into_iter()
-                    .filter(|entry| entry.is_local() && !entry.directory)
-                    .collect(),
+                entries: root::preserved_local_entries(&manifest),
                 ..Manifest::default()
             },
         )?;

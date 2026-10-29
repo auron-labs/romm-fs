@@ -21,6 +21,12 @@ impl Worker {
             reason: reason.clone(),
         });
         self.log(Level::Error, "mount", reason);
+        if self.startup_requires_mount {
+            self.sink.emit(AppEvent::StartupPreference {
+                enabled: self.preferences.as_ref().is_some_and(|p| p.start_at_login),
+                error: Some("The games folder did not start automatically. Start it before resuming save sync.".into()),
+            });
+        }
     }
 
     /// The classified foreign entries under a directory the app does not own —
@@ -240,11 +246,9 @@ impl Worker {
                         },
                     )
                     .map_err(|error| Error::Unsupported(format!("{error:#}")))?;
-                    if !outcome.skipped.is_empty()
-                        || outcome.linked.len() != outcome.record.links.len()
-                    {
+                    if outcome.linked.is_empty() {
                         return Err(Error::Unsupported(
-                            "one or more RetroBat system links are missing".into(),
+                            "no working RetroBat system links remain".into(),
                         ));
                     }
                 } else {
@@ -398,6 +402,7 @@ impl Worker {
                         enabled: self.preferences.as_ref().is_some_and(|p| p.start_at_login),
                         error: None,
                     });
+                    self.refresh_save_sync();
                 }
                 self.queue_metadata();
                 self.log(

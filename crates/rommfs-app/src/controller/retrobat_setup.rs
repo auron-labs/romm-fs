@@ -33,9 +33,7 @@ impl Worker {
             &server,
             |root| rommfs_cfapi::check_mount_root(root, &server).map(|_| ()),
         )
-        .is_ok_and(|outcome| {
-            outcome.skipped.is_empty() && outcome.linked.len() == outcome.record.links.len()
-        });
+        .is_ok_and(|outcome| !outcome.linked.is_empty());
         if let Some(path) = restart.filter(|_| repaired) {
             self.start_mount(&path.display().to_string());
         }
@@ -66,9 +64,9 @@ impl Worker {
                 )
                 .ok()
             });
-        let setup_complete = setup.as_ref().is_some_and(|outcome| {
-            outcome.skipped.is_empty() && outcome.linked.len() == outcome.record.links.len()
-        });
+        let setup_complete = setup
+            .as_ref()
+            .is_some_and(|outcome| !outcome.linked.is_empty());
         let setup_issues = setup.map_or_else(Vec::new, |outcome| outcome.skipped);
         // Only the RetroBat layout needs a migration; a leftover root from a
         // previous selection must not raise the prompt.
@@ -528,6 +526,7 @@ impl Worker {
                     report.messages.join(". ")
                 );
                 self.log(Level::Info, "retrobat-setup", detail.clone());
+                self.set_mount_root(&managed_root.display().to_string());
                 self.set_integration(IntegrationMode::RetroBat, Some(installation.to_path_buf()));
                 self.sink.emit(AppEvent::RetroBatSetup {
                     running: false,

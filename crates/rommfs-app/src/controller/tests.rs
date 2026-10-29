@@ -112,3 +112,66 @@ mod mount;
 
 #[path = "tests/save_sync.rs"]
 mod save_sync;
+
+#[test]
+fn inspected_retrobat_readiness_matches_the_selected_folders() {
+    let mut state = UiState::new(10);
+    for usable in [true, false] {
+        state.apply_event(&AppEvent::RetroBatSetup {
+            running: true,
+            detail: "Connecting".into(),
+            skipped: Vec::new(),
+            error: None,
+        });
+        state.apply_event(&AppEvent::MountRootConfigured {
+            server: "server".into(),
+            mount_root: "games-A".into(),
+        });
+        state.apply_event(&AppEvent::IntegrationUpdated {
+            mode: IntegrationMode::RetroBat,
+            retrobat_root: Some("RetroBat".into()),
+            setup_complete: usable,
+            setup_migration: false,
+            setup_issues: vec![rommfs_core::retrobat::SkippedSystem {
+                system: "snes".into(),
+                reason: "Busy".into(),
+            }],
+            error: None,
+        });
+        state.apply_event(&AppEvent::RetroBatSetup {
+            running: false,
+            detail: "Finished".into(),
+            skipped: Vec::new(),
+            error: None,
+        });
+        assert_eq!(
+            state.retrobat_ready_for(Some(Path::new("RetroBat")), Path::new("games-A")),
+            usable
+        );
+        assert!(!state.retrobat_ready_for(Some(Path::new("RetroBat")), Path::new("games-B")));
+        assert!(!state.retrobat_ready_for(Some(Path::new("Other")), Path::new("games-A")));
+    }
+}
+
+#[test]
+fn reconnecting_the_selected_games_folder_makes_it_ready() {
+    let mut state = UiState::new(10);
+    for games in ["games-A", "games-B"] {
+        if games == "games-B" {
+            assert!(!state.retrobat_ready_for(Some(Path::new("RetroBat")), Path::new(games)));
+        }
+        state.apply_event(&AppEvent::MountRootConfigured {
+            server: "server".into(),
+            mount_root: games.into(),
+        });
+        state.apply_event(&AppEvent::IntegrationUpdated {
+            mode: IntegrationMode::RetroBat,
+            retrobat_root: Some("RetroBat".into()),
+            setup_complete: true,
+            setup_migration: false,
+            setup_issues: Vec::new(),
+            error: None,
+        });
+        assert!(state.retrobat_ready_for(Some(Path::new("RetroBat")), Path::new(games)));
+    }
+}

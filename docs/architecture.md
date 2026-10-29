@@ -96,6 +96,20 @@ live RomM instance. `route_hit_count` counts scripted route matches;
 - Catalogue snapshots are scoped by normalized server and authenticated account.
   Tokens remain in memory; only paired secrets use Windows Credential Manager.
 - ROM content cache and save-sync state are separate persistence areas.
+- Save conflict choices retire superseded upload snapshots in the journal while
+  keeping their private recovery files. Pending transfers are cancelled and drained
+  before applying a choice; their retry queue and late results are discarded.
+  Other unfinished uploads resume from the journal. Keep PC authorizes the selected snapshot
+  against the reviewed history; an obsolete earlier baseline cannot override
+  that choice. The acknowledgement follows verified upload. Reconciliation and
+  upload history checks share verified content by account, scope, revision ID,
+  and unchanged metadata; new or changed metadata triggers a fresh download.
+  The worker retains verified metadata and hashes for the current scope. After
+  16 resident payloads, additional payloads spill to temporary files, avoiding
+  repeated downloads of unchanged history. Those files live until the revision
+  disappears, the scope changes, or the worker stops.
+- Login startup resumes consented save sync only after the asynchronous mount
+  completes successfully; failed mounting keeps sync stopped.
 - Save presentation uses current per-identity work emitted by the actor, not
   historical transfer stages. A settled unchanged watcher hint publishes its
   drained queue. Retained remote review versions remain attached to their save
@@ -110,7 +124,8 @@ live RomM instance. `route_hit_count` counts scripted route matches;
   and drains callbacks while retaining registration and projected files.
   Restart compares path, original-file identity, version, and size, reusing
   unchanged entries. Explicit root/account replacement uses owned cleanup and
-  does not recursively clear user data.
+  does not recursively clear user data. Preserved frontend files keep their
+  owned parent-directory entries in the cleanup manifest.
 - Worker threads/tasks are owned by the app/controller lifecycle and are joined
   or drained on stop, logout, or quit. Cancelling a background job moves its
   handle to a draining list the worker loop reaps with `is_finished()`, so an
@@ -155,7 +170,9 @@ live RomM instance. `route_hit_count` counts scripted route matches;
   An earlier-schema record is surfaced to the UI as a migration prompt rather
   than a mount error: Overview offers an update that reruns setup, and Start is
   disabled while setup or migration is pending. Rerunning setup converts the
-  old links and restores any folders an earlier build moved aside.
+  old links and restores any folders an earlier build moved aside. Successful
+  setup persists the selected games folder before publishing health. Skipped
+  systems remain visible as issues; working system links can still start.
   Gamelists are merged in place: RomMFS rewrites only its `./RomM/…` entries.
   Publication checks current link targets; missing or redirected links are
   excluded. Unreadable systems retain their identity state. Gamelist writes

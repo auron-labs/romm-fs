@@ -576,6 +576,70 @@ mod tests {
         assert_eq!(fixture.request_count("GET", "/api/saves"), 0);
     }
 
+    #[test]
+    fn completed_startup_mount_resumes_previously_consented_save_sync() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut worker, _fixture, events) = generic_worker(directory.path());
+        worker.refresh_save_sync();
+        let scope = worker.save_sync_scope.clone().unwrap();
+        worker
+            .save_sync_settings
+            .as_ref()
+            .unwrap()
+            .save_files(
+                &scope,
+                ConsentSettings {
+                    enabled: true,
+                    debounce_secs: 1,
+                },
+            )
+            .unwrap();
+        worker.startup_requires_mount = true;
+        worker.refresh_save_sync();
+        assert!(worker.save_sync_agent.is_none());
+        let root = directory.path().join("roms");
+        worker.rom_cache_directory = Some(directory.path().join("cache"));
+        let fs = worker
+            .build_fs(
+                &worker.client.clone().unwrap(),
+                &root,
+                Arc::new(NoopHydratedRemover),
+            )
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        worker.mount_preparation = Some(MountPreparation {
+            root: root.clone(),
+            server_id: scope.server_id.clone(),
+            path: root.display().to_string(),
+            started: Instant::now(),
+            active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            result: rx,
+            handle: std::thread::spawn(|| {}),
+        });
+        worker.poll_mount_preparation();
+        assert!(worker.save_sync_agent.is_none(), "mount still pending");
+        assert!(!events
+            .try_iter()
+            .any(|event| matches!(event, AppEvent::StartupPreference { error: Some(_), .. })));
+        tx.send(Ok((
+            fs,
+            ActiveMount {
+                root,
+                stop_fn: Box::new(|| {}),
+            },
+        )))
+        .unwrap();
+        worker.poll_mount_preparation();
+        assert!(worker.mount.is_some());
+        assert!(!worker.startup_requires_mount);
+        assert!(worker.save_sync_agent.is_some());
+        assert!(worker
+            .save_sync_gate
+            .enabled_for(worker.current_save_sync_epoch));
+        worker.stop_save_sync_agent();
+        worker.stop_mount();
+    }
+
     fn populate_games(worker: &mut Worker) {
         let platform = serde_json::from_value(serde_json::json!({
             "id": 1, "slug": "gb", "fs_slug": "gb", "name": "Game Boy", "rom_count": 2

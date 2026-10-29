@@ -448,6 +448,7 @@ fn reviewed_history_is_unchanged(
     let reviewed = slot
         .conflict_history_fingerprint
         .split(',')
+        .filter(|entry| !entry.is_empty())
         .collect::<HashSet<_>>();
     let current = inventory
         .history_fingerprint

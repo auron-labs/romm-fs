@@ -24,10 +24,7 @@ impl SaveSyncJournal {
         let slot = self
             .slot(key)?
             .ok_or_else(|| Error::Unsupported("save mapping disappeared during review".into()))?;
-        if !slot.needs_attention
-            || slot.current_local_hash.as_deref() != Some(local_hash)
-            || slot.remote_history_ids.is_empty()
-        {
+        if !slot.needs_attention || slot.current_local_hash.as_deref() != Some(local_hash) {
             return Err(Error::Unsupported(
                 "save or remote history changed; review the current versions again".into(),
             ));
@@ -35,7 +32,7 @@ impl SaveSyncJournal {
         let generation = slot.local_generation;
         let history_ids = slot.remote_history_ids.clone();
         let history_fingerprint = slot.remote_history_fingerprint.clone();
-        self.capture_reviewed_snapshot(mapping, generation, local_hash)?;
+        let snapshot = self.capture_reviewed_snapshot(mapping, generation, local_hash)?;
         let reviewed = self
             .slot(key)?
             .ok_or_else(|| Error::Unsupported("save mapping disappeared during review".into()))?;
@@ -63,11 +60,7 @@ impl SaveSyncJournal {
                    AND remote_history_ids=?10 AND remote_history_fingerprint=?11
                    AND local_generation=?12",
                 rusqlite::params![
-                    if reviewed.local_baseline_hash.as_deref() == Some(local_hash) {
-                        "keep_local_ack"
-                    } else {
-                        "keep_local"
-                    },
+                    "keep_local",
                     local_hash,
                     self.scope.server_id,
                     self.scope.account_id,
@@ -87,6 +80,14 @@ impl SaveSyncJournal {
                 "save or remote history changed while applying the local choice".into(),
             ));
         }
+        transaction.execute(
+            "UPDATE save_sync_snapshots SET state='superseded', remote_outcome='review_superseded', failure=NULL
+             WHERE server_id=?1 AND account_id=?2 AND installation_root=?3
+               AND effective_saves_root=?4 AND rom_server_id=?5 AND rom_id=?6 AND file_id=?7
+               AND state IN ('ready', 'remote_in_flight', 'remote_ambiguous', 'failed')
+               AND revision<>?8",
+            rusqlite::params_from_iter(scope_key_params(&self.scope, key).into_iter().chain([snapshot.revision.into()])),
+        ).map_err(sqlite)?;
         transaction
             .execute(
                 "UPDATE save_sync_incoming SET state = 'resolved'
@@ -579,6 +580,13 @@ impl SaveSyncJournal {
             )
             .map_err(sqlite)?;
         if reviewed_history.is_some() {
+            transaction.execute(
+                "UPDATE save_sync_snapshots SET state='superseded', remote_outcome='review_superseded', failure=NULL
+                 WHERE server_id=?1 AND account_id=?2 AND installation_root=?3
+                   AND effective_saves_root=?4 AND rom_server_id=?5 AND rom_id=?6 AND file_id=?7
+                   AND state IN ('ready', 'remote_in_flight', 'remote_ambiguous', 'failed')",
+                rusqlite::params_from_iter(scope_key_params(&self.scope, &mapping.rom_key)),
+            ).map_err(sqlite)?;
             transaction
                 .execute(
                     "UPDATE save_sync_incoming SET state = 'resolved'

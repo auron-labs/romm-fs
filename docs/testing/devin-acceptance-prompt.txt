@@ -1,0 +1,373 @@
+Test and finish RomMFS on Windows Server
+
+You are responsible for proving that this checkout works as a usable desktop
+product. Use computer-use on the real Windows app, real CFAPI, real RetroBat,
+real emulators and a disposable real RomM server. Run the existing automated
+tests too. Find omissions and excessive restrictions, fix reproducible product
+defects in the existing architecture, and retest. Deliver a runnable Windows
+build and evidence-backed acceptance report, not another proposed test plan.
+
+The user has explicitly accepted Windows Server for this run. A successful run
+on this host is sufficient to close this acceptance task. Do not demand Windows
+10/11, a particular update/build, a physical PC, USB hardware, a particular GPU,
+or a second OS run. Record the actual environment without turning its name into
+a failure. Do not claim compatibility with environments you have not tested.
+This instruction overrides the older client-only acceptance gate in
+docs/testing/windows.md and historical validation records. This prompt defines
+the finite acceptance scope; do not expand it into a certification programme.
+
+OPERATING RULES
+
+- Work autonomously in the assigned disposable environment. Install ordinary
+  build/runtime prerequisites, provision test accounts/data, and use available
+  infrastructure. Solve setup problems rather than sending the user a shopping
+  list. Use secure credential input if access is genuinely missing; never put
+  passwords/tokens in the report. Ask only for access or consequential choices
+  you cannot resolve within the assigned environment.
+- Preserve pre-existing source changes and user data. Use disposable roots and
+  accounts. Do not change Defender, weaken system-wide permissions, disable app
+  protections, or run the whole app elevated to manufacture a pass. Limited
+  elevation for prerequisite installation and the app's intended UAC flows is
+  fine. Normal use and native permission assertions must run unelevated.
+- Use repository AGENTS.md and relevant skills when editing. Keep fixes focused
+  in existing owners. Do not replace the architecture, remove features, loosen
+  acceptance assertions, skip tests, or add speculative security controls.
+- A guard is correct only if it rejects the unsafe case AND permits ordinary
+  use. Test both sides and the recovery after the condition clears. A harmless
+  executable reader must not block setup; stock RetroBat files must not make
+  integration unusable; unrelated failures must not stop healthy games/saves.
+- Computer-use must drive the actual user journeys. Shell/API calls may prepare
+  test data and independently verify results; they cannot substitute for the
+  UI action under test. Do not edit settings/journals/ownership markers to get
+  past broken UI. Keep any diagnostic workaround separate from a product pass.
+- Do not stop the entire run at a failure. Preserve the first failure, diagnose,
+  repair, retest, and continue independent cases. Use bounded waits (normally
+  60 seconds after debounce for a small local operation); downloads/builds get
+  sensible progress-based limits. Never retry until green and hide the failures.
+
+1. ESTABLISH THE ACTUAL BUILD AND CONTRACT
+
+Read AGENTS.md, README.md, docs/user-guide.md, docs/architecture.md,
+docs/contracts/romm-api.md, consult/ROMMFS-REPAIR-PLAN.md, and the validation
+records dated 2026-10-12 and 2026-10-28. Use docs/testing/windows.md for existing
+commands, fixtures and detailed cases, with the scope overrides below.
+
+Treat historical failures as retest inputs, not proof of today's behavior.
+Some older prose conflicts with the repairs: Stop/Quit now retains owned
+placeholders; stock RetroBat content is preserved alongside per-system RomM
+links; compatible versions are not rejected merely by version string; saves
+have explicit Keep PC/Use RomM choices; memory cards now have separate opt-in.
+Do not preserve an old restriction just because a test encodes it. Resolve
+conflicting expectations against the user's repair requirements, current
+documented product behavior and observable outcome; record the discrepancy.
+Source implementation alone cannot define whether its own behavior is correct.
+
+Record the starting commit, branch and git status. Include intended uncommitted
+changes in the test build and save a binary diff against HEAD plus relevant
+untracked source files. Do not silently test an older remote branch instead.
+Record the final revision/patch, build command, executable SHA-256 and tested
+binary path. Build using the repository's configured Rust/MSVC toolchain and
+Windows SDK. Use the normal desktop build for acceptance; the optional MCP
+bridge can assist diagnosis but is not a prerequisite or a substitute for
+native picker/tray/computer-use checks.
+
+Create a small evidence directory outside the mount/save roots. Keep one case
+ledger from the start: ID, expected outcome, result, evidence, defect/fix/retest.
+Inventory every user-visible feature/action on Overview, Saves, Activity and
+Settings against the cases below. Add a concrete case for any implemented
+feature that would otherwise be omitted; no new speculative feature scope.
+
+2. SET UP A WORKING TEST ENVIRONMENT
+
+Use an interactive Windows Server desktop, a local NTFS games folder outside
+other sync roots, and a standard-user app session. Record OS/build, elevation,
+Cloud Files availability, toolchain and actual RomM/RetroBat/emulator versions.
+Verify CFAPI by executing the native test, not by interpreting the OS name.
+If a capability is missing, repair the test environment or use another available
+Windows Server desktop with that capability. Do not substitute WinFsp/ProjFS.
+
+Provision a disposable RomM with its supported database. Reuse compose.dev.yaml
+or testing/romm-harness/docker-compose.yml. Linux containers need not run on
+the Windows desktop: use an available Linux host/VM and a private tunnel or
+private network connection. Do not make Docker Desktop on Windows Server a
+prerequisite. Preserve authentication on non-local access. Record the exact
+server image/version. If a documented feature route is absent, investigate
+the actual server/API compatibility rather than reporting a generic auth error
+or silently dropping the feature.
+
+The committed harness contains three deterministic source-matched ROMs. Use it
+unchanged for the existing live_romm test; finish that test before adding other
+games, or use a separate library/server for the later cases. Set ROMM_URL,
+ROMM_USER and ROMM_PASS privately when using a nondefault harness endpoint.
+scripts/create-demo-roms.py provides a larger synthetic catalogue if useful.
+Its zero-filled files are suitable for byte tests, never gameplay evidence.
+
+Obtain an openly licensed/homebrew playable game from its author's source, or
+use an already supplied lawful game. Prefer a game supporting a persistent
+in-game save; verify that it actually creates one. Record provenance and hash.
+Do not send the user away to find a ROM. If needed, build an existing licensed
+save-capable homebrew example; retain its source/license. Use real emulator
+save states as additional coverage, not as a mislabeled in-game save. Never
+substitute a renamed executable or zero-filled ROM for a running emulator.
+
+Install a compatible official RetroBat normally, including through the app's
+installer flow. Keep stock files. Prepare independent disposable installations
+or profiles A and B for sync, with no copied first-client journal. Both may run
+sequentially on this same machine. Back up test saves/configuration and record
+hashes before destructive test scenarios. No second physical PC is required.
+Use actual emulator-created blank memory cards where possible; synthetic card
+content is fine for transport edge cases when clearly labeled.
+
+3. RUN THE EXISTING CHECKS
+
+Run from the repository root, retaining --locked and serial test execution:
+
+  cargo fmt --all --check
+  cargo test --locked -p rommfs-core -p rommfs-fixture -p rommfs-cfapi -p rommfs-app --no-default-features -- --test-threads=1
+  cargo test --locked --workspace -- --test-threads=1
+  cargo clippy --locked -p rommfs-core -p rommfs-fixture -p rommfs-cfapi -p rommfs-app --no-default-features --all-targets -- -D warnings
+  cargo check --locked -p rommfs-app --all-targets
+  cargo build --locked -p rommfs-app
+  cargo test --locked -p rommfs-cfapi --test live_romm -- --ignored --nocapture --test-threads=1
+
+Capture exit codes and actual passed/failed/ignored counts. Confirm execution
+of the CFAPI lifecycle test, Windows save-handle and directory guards, canonical
+path/publication/export tests, no-clobber publication and actual watcher tests.
+Use docs/testing/windows.md selectors when individual logs are needed; verify
+names with --list if they changed. Zero selected tests prove nothing. Classify
+ignored tests: the warm-reader subprocess helper is invoked by its parent test,
+whereas the live RomM test needs the explicit command above. Inspect output for
+assertions skipped inside successful tests: cfapi_native suppresses namespace
+ACL checks when elevated. Rerun those unelevated on the same Server host.
+
+Reuse existing deterministic fixtures for failure/race contracts: interrupted
+or ambiguous upload responses, 401/403, 429, concurrent edits, tied history,
+unsafe paths/archives, legacy consent migration, cancellation and stale events.
+Add focused regression coverage for each actual fix, not a new testing system.
+Do not simulate every rare fault manually when an existing meaningful test
+already proves it. Real UI/server/filesystem happy paths remain mandatory.
+
+4. COMPUTER-USE ACCEPTANCE CASES
+
+AUTH — Fresh profile: browser pairing, cancel, retry, approve; password fallback
+and wrong password; remembered restart; sign-out and token revocation in RomM;
+reauthenticate without losing the chosen folder. Switch between disposable
+accounts/server identities and confirm catalogue, consent and pending operations
+do not leak. A repeated pairing must provide a usable new approval flow, not a
+consumed URL. Password/token values must not appear in screenshots/shared logs.
+
+SETUP — Follow Connect -> select folders/RetroBat -> Connect RetroBat -> start
+games folder. Also complete Generic folders without RetroBat. Fresh RetroBat
+with bundled games/configuration must work without deleting its stock content
+or first mounting and then stopping just to finish onboarding. Test a path
+with spaces/non-ASCII characters. Browse and cancel native folder pickers.
+Exercise needed UAC approval and cancellation, then retry normally. Routine
+use must not require running RomMFS as administrator or hand-editing files.
+
+MOUNT — Enumerate before reading and prove no ROM downloads with controlled
+native counters. Cold read matches the known source hash; warm read uses cached
+bytes. Play through the mounted path. Stop/start and Quit/reopen preserve owned
+placeholders, file identities and downloaded bytes; unchanged restart creates
+and removes zero placeholders. Test an actual catalogue addition/content change:
+refresh preserves the running snapshot; Apply library changes exposes the new
+tree. Identical/artwork-only refresh does not demand remount. Exercise safe
+eviction/re-download and busy-file deferral through the native regression.
+Try a populated unowned root and a root owned by another server; rejection
+preserves sentinels and offers a usable route to select a suitable folder.
+
+RETROBAT — Discover/select the actual install, including Browse outside the
+default location. Integrate alongside stock/user games. Verify per-system RomM
+links and merged gamelists, idempotent setup, and preservation of unrelated
+entries. A foreign link or conflicting item affects only its system, with an
+explanation. Remove one tester-owned link: focus/refresh clears false healthy
+status and Stop and repair restores operation through the UI. Test the real
+frontend running and a harmless read handle on its executable separately:
+the reader must not block setup; the frontend delays only affected publication.
+Close the frontend; automatic retry and explicit Retry recover without restart.
+An unrelated installation's frontend must not lock this one. Do not require
+the RetroBat launcher itself to stay alive after handing off to EmulationStation.
+
+PLAY — Launch the genuine frontend and a real playable title through RomMFS.
+Interact, create identifiable saved progress, exit cleanly, launch again and
+load that progress. Create and load a save state too. Verify the actual save
+paths are outside the ROM mount. Collect short visual evidence of gameplay
+and restored progress, plus ROM/save hashes. Fix supported runtime/display
+configuration in the disposable host if needed; record it. A process name or
+startup screenshot alone is not a gameplay pass.
+
+METADATA — Observe artwork and gamelist publication in the real frontend.
+Refresh unchanged data: no unnecessary image replacement/download. Delete one
+owned image: only that image needs restoration. Favourite/play a game, remount
+and refresh; favourites/history survive. Create one destination write failure:
+other systems and games remain usable, status says Updated with issues, and
+Retry recovers after access is restored. Overview/Settings/Activity agree.
+
+HISTORY — Enable the separate favourites/play-history consent. Make a favourite
+change in each direction and a new real play session; verify RomM and RetroBat
+converge without repeated refreshes multiplying counts/time or uploading old
+plays again. Disable and change account: consent does not carry over. Missing
+permission affects this feature with a useful remedy, not ROM availability.
+
+DUPLICATES — Put a lawful matching local game alongside its RomM copy. Hide
+RomM games you already have hides only the RomM entry. Toggle it off or remove
+the disposable local duplicate: that entry returns; user-hidden games, local
+bytes, favourites and history remain intact. Include a same-name nonmatch and
+the documented large-file fallback in appropriate existing fixture coverage.
+
+SAVES — Verify default Off is quiet, not an alarm; filename preview does not
+upload or read save bodies. Stock/unmatched files stay understandable and do
+not prevent healthy mapped saves syncing. Exercise explicit file/folder mapping
+and confirm only intended paths are associated. Verify game/account/root and
+save API access before starting app-only traffic capture; do not count tester
+API requests as app requests. Use independent A/B scopes for these subcases:
+
+  S1. Enable explicitly. Upload a real emulator-created save from A. Download
+      the exact remote revision independently and compare bytes. Restore to a
+      genuinely new B path, launch the game there and load the same progress.
+      Include a real save-state round trip; supported saves must not be SRAM-only.
+  S2. Round-trip companions, nested/extensionless files, empty files and a file
+      larger than 1 MiB. Compare exact relative paths and hashes. Newly created
+      files are noticed without waiting for the fallback scan; incoming writes
+      do not echo into endless duplicate revisions.
+  S3. With a verified baseline, change only remote. The unchanged local baseline
+      is safely replaced and a recoverable backup retained. Hold the real target
+      busy, then release it: defer and recover without loss or permanent refusal.
+  S4. Establish baseline X, different local Y and different remote Z. Confirm
+      conflict preserves both copies. Export writes exact Z to a fresh path,
+      refuses clobbering an existing/mapped destination and does not clear review.
+      Disable sync, restart and export again offline: review persists, and this
+      staged export needs no save API request. Test the native filename field
+      by replacing its text, catching the historical concatenation bug.
+  S5. Choose Keep this PC's save through the UI. Y uploads as a new revision;
+      remote copies remain, review resolves and survives restart. Repeat in a
+      separate conflict with Use this RomM copy: Z becomes local and Y remains
+      recoverable. A later local edit syncs normally. A changed local file after
+      review requires a fresh choice; unchanged acknowledged remote history
+      must not immediately recreate the conflict. New competing history must.
+  S6. Stop the test server, change a tracked save and wait past debounce. Quit,
+      restart, restore server and reconnect: queued bytes survive and upload.
+      No successful/up-to-date status before verification. Do not clear the
+      journal/cache or re-onboard to recover an ordinary outage.
+  S7. Delete a previously tracked disposable save while sync is disabled, then
+      enable. It stays absent and the remote copy stays intact. An explicit
+      reviewed Use RomM choice may restore it; silent resurrection may not.
+  S8. Switch account/server/root, disable, sign out and Quit during work. Old
+      consent/results cannot write into the new scope. One conflicted save
+      does not block a healthy save. Use deterministic held-request tests to
+      prove cancellation boundaries that cannot be timed reliably by clicking.
+
+CARDS — Do not omit the current PS1/PS2 feature because the old checklist says
+shared cards are unsupported. Exercise DuckStation .mcd, PCSX2 .ps2 and folder
+cards with independent per-folder opt-in, the actual real-server routes and
+real discovered paths. Upload/download and compare extracted contents and
+layout, including remote-only restore to an empty destination. Open the actual
+emulator: no card replacement/upload until it exits and the quiet period passes;
+then sync resumes. Remote-only changes update an unchanged baseline; competing
+changes preserve local plus version-specific conflict siblings. A broken card
+does not stop another, and ordinary save mapping excludes these folders. Verify
+restored real cards are recognized by the emulator's card UI where available.
+Use fixtures for malformed/unsafe zip cases. Do not require commercial BIOS or
+games to test archive transport, consent and file/card recognition. External
+broker/container-client interoperability is supplemental unless it is actually
+part of this checkout's exposed user workflow; identify that boundary explicitly.
+
+INSTALLER / SUPPORT — Through the app, download the official installer, cancel
+and retry, launch its real wizard, cancel there, then complete an installation.
+Verify integrity checking and usable success/error/cancel states; don't count
+an exit code as installation. Never kill a writing installer. Install available
+lawful support files and harmless test payloads through the supported BIOS,
+keys/unpacked firmware and RetroArch cheat routes; check effective destinations
+and bytes, repeat reuse, cancellation, unsupported input diagnostics and
+preservation of existing/modified files. Synthetic payloads prove materialization,
+not firmware boot. Missing proprietary material does not block these tests.
+An optional support-file problem must not mark working games unavailable.
+
+DESKTOP / RECOVERY — Visit every page and visible action with mouse and keyboard.
+Tab/Shift+Tab has visible sensible focus; Enter/Space activate once; Space types
+normally in text fields; Escape cancels dialogs without losing state. Resize
+and use an available larger display scale: controls/errors remain reachable.
+Try a few thousand synthetic catalogue/review entries using existing fixtures
+and generators; verify search, filtering, pagination, counts and mapping of a
+late-page entry. Measure first-use and repeat mount/refresh times, and capture
+any long freeze or misleading progress. Do not invent hardware benchmark gates.
+Activity must show real work, useful error/retry and readable bounded logs,
+without per-tick floods. Recover outages and permission failures from the UI.
+
+LIFECYCLE — Hide the window while mounting/syncing; work continues. Reopen from
+tray, including after --startup: all pages/sidebar render. Launch a second
+instance: it activates the first without another mount/worker. Enable login
+startup with remembered sign-in; perform an actual sign-out/sign-in cycle in
+the disposable Windows session if the host allows it. Authenticate -> mount ->
+resume only previously consented sync, in that order. Test rejected auth and a
+failed mount: visible recovery, no unauthorized sync. Disable startup/logout:
+registration is removed. Quit during catalogue, hydration or save work: owned
+workers drain, no stale completion reactivates a session, roots/data remain safe.
+
+5. CLOSE THE REPAIRS AND KNOWN FAILURES EXPLICITLY
+
+Give each of the seven sections of consult/ROMMFS-REPAIR-PLAN.md a final result
+with links to the case evidence above. Retest the six historical Windows issues
+from docs/validation/2026-10-12.md: consumed pairing URL, recovery after server
+outage, raw installation errors, refusal around pre-existing links, empty sidebar
+after tray reopen, and export-name concatenation. Preserve legitimate ownership
+refusals, but prove a practical in-app recovery; do not bless a dead end.
+Existing passing tests do not excuse a reproduced UI/integration failure.
+
+For every defect, retain a brief reproduction, expected/actual behavior, affected
+data, cause, focused fix and after-fix evidence. Add the smallest meaningful
+regression test. Rebuild after changes, rerun affected cases and required checks,
+then finish with one uninterrupted clean journey on the final binary:
+connect -> set up stock RetroBat -> mount -> play -> save -> sync to B -> load
+the progress -> restart/reconnect -> continue without repeating setup.
+Also exercise returning-user state; a clean-profile-only pass is insufficient.
+
+6. EVIDENCE AND SIGN-OFF — KEEP IT SMALL AND DECISIVE
+
+Return one report, one evidence ZIP and the runnable Windows build with its
+required runtime files. Include only what establishes the outcomes:
+
+- Revision/patch and binary hash, exact build/check commands, actual environment.
+- Case ledger with PASS, FAIL or NOT EXERCISED and an evidence path; distinguish
+  actual GUI/live/native execution from fixture-only evidence. Every required
+  case needs an outcome, including newly discovered exposed features.
+- Command logs with exit/test counts, a few annotated screenshots or short
+  recordings of setup/play/recovery, before/after sentinel/save hashes, and
+  relevant redacted server/app request records. Separate tester API traffic.
+  Status labels/screenshots alone cannot prove bytes, isolation or no downloads.
+- Defects fixed and retested, remaining issues with user impact, and the seven
+  repair outcomes. Keep evidence names stable enough to locate without guessing.
+- Cleanup: Quit/release handles, restore tester-made changes where appropriate,
+  preserve pending work and diagnostic state, and stop only test services you
+  started. Keep the working test setup reproducible. No recursive mount cleanup.
+
+Screenshots need not cover every click. Reuse one observation across cases
+where it proves both; do not force separate elaborate reports per scenario.
+Do not attach credentials or copyrighted ROMs. Update current canonical docs
+only when the run establishes a correction, and add a new dated validation
+record linking durable artifacts. Do not rewrite old execution history.
+
+Acceptance is PASS when all required product outcomes above work on the final
+binary, the required automated/native checks pass with meaningful execution,
+and there is no unresolved defect that prevents setup, play, sync, recovery,
+ordinary-user operation, data preservation or account isolation. Small cosmetic
+issues may be listed without blocking acceptance. An omitted exposed feature,
+data-loss risk, unusable security restriction or shell-only workaround for a
+normal UI journey is a product failure to fix, not an accepted limitation.
+
+The following are supplemental and do NOT veto this accepted Server run:
+a second Windows edition/build, physical removable-drive discovery, a specific
+display scale/GPU unavailable on the host, performance on other hardware,
+commercial firmware/game compatibility, and external clients not integrated
+into this app. Record them once as outside this run, without a follow-up task
+for the user. If host policy makes real Windows logoff inaccessible, verify
+startup registration and launch the actual registered command in a fresh app
+process; label that substitution and leave only OS-trigger validation supplemental.
+
+Do not fabricate PASS if a required capability genuinely cannot be exercised.
+First provision/repair an equivalent environment within the accepted Server
+scope and continue all independent work. If still impossible, return the exact
+failed capability, attempted remedies and affected outcomes as an honest
+incomplete result. Never use an OS-version policy, a historical checklist, or
+missing optional hardware as the reason. No finite run proves absence of all
+bugs; this task closes on these concrete observed workflows and invariants,
+without an additional mandatory human test round.

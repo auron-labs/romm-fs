@@ -246,6 +246,19 @@ fn explicit_remote_choice_replaces_only_the_reviewed_local_version_and_keeps_bac
         updated_at: "2026-10-05T12:34:56Z".into(),
     });
     let case = case(directory.path(), &fixture, false);
+    let mut journal =
+        SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    let observation = journal
+        .observe_local_save_for_reconciliation(&case.mapping)
+        .unwrap();
+    let pending = journal
+        .capture_snapshot(
+            &case.mapping,
+            observation.generation,
+            observation.content_hash.as_deref().unwrap(),
+        )
+        .unwrap();
+    drop(journal);
     let (sink, events) = channel();
     let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
     assert!(
@@ -308,6 +321,11 @@ fn explicit_remote_choice_replaces_only_the_reviewed_local_version_and_keeps_bac
         "the chosen RomM revision stays applied after restart despite unchanged competing and rejected history"
     );
     assert_eq!(fs::read(&case.mapping.target_path).unwrap(), REMOTE_BYTES);
+    assert_eq!(
+        fixture.request_count("POST", "/api/saves?rom_id=7&slot="),
+        0
+    );
+    assert_eq!(fs::read(pending.path).unwrap(), SAVE_BYTES);
     agent.stop();
 }
 
@@ -516,6 +534,11 @@ fn explicit_local_choice_uploads_against_unchanged_acknowledged_history() {
         message.contains("verified upload revision")
     })
     .is_some());
+    assert_eq!(
+        fixture.request_count("GET", "/api/saves/93/content"),
+        1,
+        "reconciliation and pre/post-upload review checks share verified content"
+    );
     agent.stop();
 
     let remote = fixture.saved_saves();
@@ -637,6 +660,11 @@ fn keep_pc_after_verified_baseline_appends_a_new_revision_for_competing_history(
     );
     drop(journal);
 
+    let mut baseline = fixture.saved_saves().into_iter().next().unwrap();
+    baseline.bytes = b"remote baseline changed before review".to_vec();
+    baseline.file_size_bytes = baseline.bytes.len();
+    baseline.updated_at = "2026-10-06T12:34:55Z".into();
+    fixture.seed_save(baseline);
     fixture.seed_save(FixtureSaveRecord {
         id: 500,
         rom_id: ROM_ID,
@@ -695,8 +723,8 @@ fn keep_pc_after_verified_baseline_appends_a_new_revision_for_competing_history(
         .filter(|save| save.file_name.starts_with("rommfs-") && save.bytes == SAVE_BYTES)
         .count();
     assert_eq!(
-        local_revisions, 2,
-        "Keep PC appends an upload and preserves the accepted revision"
+        local_revisions, 1,
+        "Keep PC appends an upload against the reviewed changed baseline"
     );
 
     let (sink, events) = channel();
@@ -794,4 +822,164 @@ fn tracked_local_removal_and_missing_remote_never_delete_or_resurrect_local_save
         missing_fixture.route_hit_count("POST", "/api/saves?rom_id=7&slot="),
         0
     );
+}
+
+#[test]
+fn keep_pc_recovers_when_the_accepted_remote_baseline_disappeared() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    fixture.use_romm_save_store(ACCOUNT_ID, 201);
+    let case = case(directory.path(), &fixture, false);
+    let mut journal =
+        SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    journal
+        .set_remote_baseline(
+            &case.mapping.rom_key,
+            Some("999"),
+            Some(&sha256_content_hash(b"old baseline")),
+        )
+        .unwrap();
+    drop(journal);
+    let (sink, events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(5), |status| status
+            .attention_games
+            > 0)
+        .is_some()
+    );
+    agent
+        .resolve_conflict(
+            1,
+            case.mapping.rom_key.clone(),
+            Some(sha256_content_hash(SAVE_BYTES)),
+            None,
+        )
+        .unwrap();
+    assert!(
+        wait_for_log(&events, Duration::from_secs(5), |message| message
+            .contains("verified upload revision"))
+        .is_some()
+    );
+    agent.stop();
+    assert_eq!(fixture.saved_saves().len(), 1);
+    assert_eq!(fixture.saved_saves()[0].bytes, SAVE_BYTES);
+    let (sink, events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(5), |status| status
+            .reconciled_games
+            == 1
+            && status.attention_games == 0
+            && status.pending_outbound == 0)
+        .is_some()
+    );
+    agent.stop();
+    let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    assert!(
+        !journal
+            .slot(&case.mapping.rom_key)
+            .unwrap()
+            .unwrap()
+            .needs_attention
+    );
+}
+
+#[test]
+fn resolving_a_conflict_discards_the_waiting_upload_and_dispatches_the_choice() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    fixture.use_romm_save_store(ACCOUNT_ID, 201);
+    fixture.on_sequence(
+        "POST",
+        "/api/saves?rom_id=7&slot=",
+        vec![
+            ResponseSpec::JsonWithHeaders {
+                status: 503,
+                body: r#"{"detail":"retry old upload later"}"#.into(),
+                headers: vec![("Retry-After".into(), "70".into())],
+            },
+            ResponseSpec::RomMSaveUpload {
+                status: 201,
+                user_id: ACCOUNT_ID,
+            },
+        ],
+    );
+    let case = case(directory.path(), &fixture, true);
+    let discarded = case.snapshot.as_ref().unwrap().revision.clone();
+    let (sink, events) = channel();
+    let mut agent = start_agent(&case, &fixture, 0, Arc::new(AtomicBool::new(true)), sink);
+    assert!(
+        wait_for_log(&events, Duration::from_secs(5), |message| message
+            .contains("retry old upload later"))
+        .is_some()
+    );
+    seed_remote(
+        &fixture,
+        93,
+        "550e8400-e29b-41d4-a716-446655440000",
+        b"competing remote",
+        "2026-10-05T12:34:56Z",
+    );
+    // Exercise the normal periodic reconciliation while the upload is still waiting.
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(65), |status| status
+            .attention_games
+            > 0)
+        .is_some()
+    );
+    agent
+        .resolve_conflict(
+            1,
+            case.mapping.rom_key.clone(),
+            Some(sha256_content_hash(SAVE_BYTES)),
+            None,
+        )
+        .unwrap();
+    assert!(
+        wait_for_log(&events, Duration::from_secs(5), |message| message
+            .contains("verified upload revision"))
+        .is_some()
+    );
+    assert!(
+        wait_for_queue_status(&events, Duration::from_secs(15), |status| status
+            .reconciled_games
+            == 1
+            && status.attention_games == 0
+            && status.pending_outbound == 0)
+        .is_some()
+    );
+    // Observe past the discarded job's original retry deadline.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while Instant::now() < deadline {
+        if let Ok(AppEvent::SaveSyncQueueUpdated(status)) =
+            events.recv_timeout(Duration::from_millis(100))
+        {
+            assert_eq!(status.attention_games, 0);
+        }
+    }
+    agent.stop();
+    let journal = SaveSyncJournal::open(&case.database, &case.spool, case.scope.clone()).unwrap();
+    assert_eq!(
+        journal
+            .snapshots()
+            .unwrap()
+            .iter()
+            .find(|snapshot| snapshot.revision == discarded)
+            .unwrap()
+            .state,
+        SnapshotState::Superseded
+    );
+    assert!(
+        !journal
+            .slot(&case.mapping.rom_key)
+            .unwrap()
+            .unwrap()
+            .needs_attention
+    );
+    assert_eq!(fixture.saved_saves().len(), 2);
+    assert!(!fixture
+        .saved_saves()
+        .iter()
+        .any(|save| save.file_name.contains(&discarded)));
 }

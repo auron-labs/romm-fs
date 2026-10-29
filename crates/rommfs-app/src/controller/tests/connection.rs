@@ -817,3 +817,65 @@ fn toggling_hide_owned_copies_persists_and_reports_the_state() {
         }
     )));
 }
+
+#[cfg(unix)]
+#[test]
+fn retrobat_setup_remembers_games_folder_and_allows_healthy_platforms_with_skips() {
+    let directory = tempfile::tempdir().unwrap();
+    let install = directory.path().join("RetroBat");
+    let managed = directory.path().join("games");
+    create_test_retrobat_install(&install, false);
+    std::fs::write(install.join("retrobat.exe"), b"fixture").unwrap();
+    std::fs::write(install.join("emulationstation/.emulationstation/es_systems.cfg"),
+        "<systemList><system><name>gb</name><path>~/../roms/gb</path><extension>.gb</extension></system><system><name>snes</name><path>~/../roms/snes</path><extension>.sfc</extension></system></systemList>").unwrap();
+    std::fs::create_dir_all(install.join("roms/snes/RomM")).unwrap();
+    std::fs::write(install.join("roms/snes/RomM/user.sfc"), b"user ROM").unwrap();
+    let (sink, events) = rommfs_core::events::channel();
+    let mut worker = Worker::new(sink);
+    worker.connection_settings =
+        Some(ConnectionSettings::open(&directory.path().join("connection.db")).unwrap());
+    worker.server_id = Some(server_id_of("https://romm.example"));
+    worker.preferences = Some(ConnectionPreferences {
+        server: "https://romm.example".into(),
+        account_id: 42,
+        device_identifier: "test".into(),
+        mount_root: None,
+        integration: IntegrationMode::Generic,
+        retrobat_root: None,
+        start_at_login: false,
+        save_root: None,
+        hide_owned_copies: true,
+    });
+    worker.setup_retrobat(&install, &managed);
+    let stored = worker
+        .connection_settings
+        .as_ref()
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.mount_root.as_deref(), Some(managed.as_path()));
+    assert_eq!(stored.retrobat_root.as_deref(), Some(install.as_path()));
+    worker.preferences = Some(stored);
+    worker.refresh_integration();
+    let updates: Vec<_> = events
+        .try_iter()
+        .filter_map(|event| match event {
+            AppEvent::IntegrationUpdated {
+                setup_complete,
+                setup_issues,
+                error,
+                ..
+            } => Some((setup_complete, setup_issues, error)),
+            _ => None,
+        })
+        .collect();
+    assert!(updates.len() >= 2);
+    assert!(updates
+        .iter()
+        .all(|(complete, issues, error)| *complete && issues.len() == 1 && error.is_none()));
+    assert_eq!(
+        std::fs::read(install.join("roms/snes/RomM/user.sfc")).unwrap(),
+        b"user ROM"
+    );
+}

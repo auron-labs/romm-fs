@@ -498,6 +498,29 @@ impl ActorState {
     }
 }
 
+fn start_transfer_thread(
+    client: &Arc<RommClient>,
+    enabled: &SaveSyncEnablement,
+) -> Result<(Sender<WorkerJob>, Receiver<TransferUpdate>, TransferThread)> {
+    let (tx, rx) = mpsc::channel();
+    let (updates, results) = mpsc::channel();
+    let active = Arc::new(AtomicBool::new(true));
+    let worker_active = active.clone();
+    let client = client.clone();
+    let enabled = enabled.clone();
+    let handle = thread::Builder::new()
+        .name("rommfs-save-upload".into())
+        .spawn(move || run_transfer_worker(rx, updates, client, enabled, worker_active))?;
+    Ok((
+        tx,
+        results,
+        TransferThread {
+            active,
+            handle: Some(handle),
+        },
+    ))
+}
+
 fn run_actor(
     config: ActorConfig,
     stop_rx: Receiver<()>,
@@ -556,26 +579,9 @@ fn run_actor(
     }
     let (watch_tx, watch_rx) = mpsc::channel();
     let mut watcher = create_watcher(watch_tx, &scope.effective_saves_root, &sink);
-    let (transfer_tx, transfer_updates) = mpsc::channel::<WorkerJob>();
-    let (result_tx, result_rx) = mpsc::channel();
-    let transfer_gate = enabled.clone();
-    let transfer_active = Arc::clone(&active);
-    let transfer_client = Arc::clone(&client);
-    let transfer_handle = thread::Builder::new()
-        .name("rommfs-save-upload".into())
-        .spawn(move || {
-            run_transfer_worker(
-                transfer_updates,
-                result_tx,
-                transfer_client,
-                transfer_gate,
-                transfer_active,
-            )
-        })?;
-    let _transfer_thread = TransferThread {
-        active: active.clone(),
-        handle: Some(transfer_handle),
-    };
+    let (mut transfer_tx, mut result_rx, transfer_thread) =
+        start_transfer_thread(&client, &enabled)?;
+    let mut transfer_thread = Some(transfer_thread);
 
     let mut scheduler = SaveSyncScheduler::with_seconds(debounce_secs);
     let restored = scheduler.restore_dirty(&mut journal, Instant::now())?;
@@ -614,12 +620,6 @@ fn run_actor(
                 mapping: mapping.clone(),
                 identity: identity.clone(),
                 scope: scope.clone(),
-                verify_reviewed_history: journal.slot(&mapping.rom_key)?.is_some_and(|slot| {
-                    matches!(
-                        slot.conflict_resolution.as_deref(),
-                        Some("keep_local" | "keep_local_ack" | "use_remote_ack")
-                    )
-                }),
             })))
             .is_ok()
         {
@@ -727,7 +727,6 @@ fn run_actor(
                             mapping: mapping.clone(),
                             identity: identity.clone(),
                             scope: scope.clone(),
-                            verify_reviewed_history: false,
                         })))
                         .is_ok()
                     {
@@ -778,22 +777,38 @@ fn run_actor(
                         "save-sync",
                         format!("applying save conflict decision for ROM {}", key.rom_id),
                     ));
-                    let result =
-                        if session_id != context.session_id || !is_active(&enabled, &active) {
-                            Err(Error::Cancelled)
-                        } else if let Some(mapping) = mappings.iter().find(|m| m.rom_key == key) {
-                            resolve_conflict_choice(
-                                &mut journal,
-                                mapping,
-                                &context,
-                                local_hash.as_deref(),
-                                incoming_id.as_deref(),
-                            )
-                        } else {
-                            Err(Error::Unsupported(
-                                "save mapping is no longer active".into(),
-                            ))
-                        };
+                    let result = if session_id != context.session_id
+                        || !is_active(&enabled, &active)
+                    {
+                        Err(Error::Cancelled)
+                    } else if let Some(mapping) = mappings.iter().find(|m| m.rom_key == key) {
+                        if !state.dispatched.is_empty() || state.inventory_dispatched.contains(&key)
+                        {
+                            // Drain active HTTP work and discard queued retries/results before changing the baseline.
+                            drop(transfer_thread.take());
+                            remaining.clear();
+                            state.dispatched.clear();
+                            state.transfer_failures.clear();
+                            state.paused_until.clear();
+                            state.inventory_dispatched.clear();
+                            let (tx, rx, worker) = start_transfer_thread(&client, &enabled)?;
+                            transfer_tx = tx;
+                            result_rx = rx;
+                            transfer_thread = Some(worker);
+                            state.next_inventory_poll = Instant::now();
+                        }
+                        resolve_conflict_choice(
+                            &mut journal,
+                            mapping,
+                            &context,
+                            local_hash.as_deref(),
+                            incoming_id.as_deref(),
+                        )
+                    } else {
+                        Err(Error::Unsupported(
+                            "save mapping is no longer active".into(),
+                        ))
+                    };
                     match &result {
                         Ok(()) => {
                             if let Some(mapping) = mappings.iter().find(|m| m.rom_key == key) {
@@ -1065,14 +1080,6 @@ fn run_actor(
                         mapping: mapping.clone(),
                         identity: identity.clone(),
                         scope: scope.clone(),
-                        verify_reviewed_history: journal.slot(&mapping.rom_key)?.is_some_and(
-                            |slot| {
-                                matches!(
-                                    slot.conflict_resolution.as_deref(),
-                                    Some("keep_local" | "keep_local_ack" | "use_remote_ack")
-                                )
-                            },
-                        ),
                     })))
                     .is_ok()
                 {

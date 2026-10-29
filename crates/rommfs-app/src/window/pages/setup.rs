@@ -21,7 +21,10 @@ impl RommfsWindow {
         let has_retrobat = self.settings_install_root(cx).is_some();
         let mount_path_ready = !self.mount_input.read(cx).value().trim().is_empty();
         let needs_retrobat_setup = self.integration_choice == 1
-            && (!self.state.retrobat_setup_ok || !self.state.retrobat_setup_issues.is_empty());
+            && !self.state.retrobat_ready_for(
+                self.settings_install_root(cx).as_deref(),
+                std::path::Path::new(self.mount_input.read(cx).value().trim()),
+            );
         v_flex()
             .gap_6()
             .child(page_header(

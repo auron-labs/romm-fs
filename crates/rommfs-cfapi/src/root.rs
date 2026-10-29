@@ -47,6 +47,29 @@ pub(crate) struct Manifest {
     pub root_security: String,
 }
 
+/// Keep ordinary frontend files and the owned directories required by them.
+#[cfg(any(windows, test))]
+pub(crate) fn preserved_local_entries(manifest: &Manifest) -> Vec<OwnedEntry> {
+    let files: Vec<_> = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.is_local() && !entry.directory)
+        .map(|entry| entry.path.to_lowercase())
+        .collect();
+    manifest
+        .entries
+        .iter()
+        .filter(|entry| {
+            (entry.is_local() && !entry.directory)
+                || (entry.directory
+                    && files
+                        .iter()
+                        .any(|path| path.starts_with(&format!("{}/", entry.path.to_lowercase()))))
+        })
+        .cloned()
+        .collect()
+}
+
 pub(crate) fn sibling(root: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
     let mut name = root
         .file_name()
@@ -1135,6 +1158,34 @@ mod tests {
             };
             assert!(validate_manifest(&manifest).is_err(), "{path}");
         }
+    }
+
+    #[test]
+    fn cleanup_manifest_keeps_nested_frontend_file_parents() {
+        let mut manifest = Manifest {
+            server_id: "server".into(),
+            ..Manifest::default()
+        };
+        for (path, kind, directory) in [
+            ("gb", OwnedKind::ManagedDirectory, true),
+            ("gb/images", OwnedKind::ManagedDirectory, true),
+            ("gb/images/game.png", OwnedKind::Artwork, false),
+            ("gb/gamelist.xml", OwnedKind::Gamelist, false),
+            ("gb/game.gb", OwnedKind::Placeholder, false),
+            ("nes", OwnedKind::ManagedDirectory, true),
+        ] {
+            manifest.entries.push(local_entry(path, kind, directory));
+        }
+        manifest.entries = preserved_local_entries(&manifest);
+        validate_manifest(&manifest).unwrap();
+        assert_eq!(
+            manifest
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["gb", "gb/images", "gb/images/game.png", "gb/gamelist.xml"]
+        );
     }
 
     /// Files a frontend legitimately writes between mounts are adopted into the

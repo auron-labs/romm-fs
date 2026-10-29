@@ -321,6 +321,23 @@ pub struct UiState {
 }
 
 impl UiState {
+    pub fn retrobat_ready_for(
+        &self,
+        installation: Option<&std::path::Path>,
+        games: &std::path::Path,
+    ) -> bool {
+        self.retrobat_setup_ok
+            && installation.is_some_and(|path| {
+                self.retrobat_root
+                    .as_deref()
+                    .is_some_and(|root| std::path::Path::new(root) == path)
+            })
+            && self
+                .configured_mount_root
+                .as_deref()
+                .is_some_and(|root| std::path::Path::new(root) == games)
+    }
+
     pub fn new(log_cap: usize) -> Self {
         Self {
             closing: false,
@@ -585,7 +602,6 @@ impl UiState {
                     self.foreign_entries.clear();
                     self.foreign_removal = None;
                 } else if error.is_none() {
-                    self.retrobat_setup_ok = true;
                     self.integration_notice = None;
                 }
             }

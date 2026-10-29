@@ -298,6 +298,16 @@ impl RommfsWindow {
             ));
         }
 
+        subscriptions.push(cx.subscribe_in(
+            &mount_input,
+            window,
+            |_view, _state, event, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        ));
+
         // The save-review table re-filters live and restarts at page one
         // whenever the query changes.
         subscriptions.push(cx.subscribe_in(

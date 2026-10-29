@@ -19,6 +19,7 @@ pub enum SnapshotState {
     RemoteInFlight,
     RemoteAmbiguous,
     RemoteComplete,
+    Superseded,
 }
 
 impl SnapshotState {
@@ -30,6 +31,7 @@ impl SnapshotState {
             Self::RemoteInFlight => "remote_in_flight",
             Self::RemoteAmbiguous => "remote_ambiguous",
             Self::RemoteComplete => "remote_complete",
+            Self::Superseded => "superseded",
         }
     }
 
@@ -41,6 +43,7 @@ impl SnapshotState {
             "remote_in_flight" => Ok(Self::RemoteInFlight),
             "remote_ambiguous" => Ok(Self::RemoteAmbiguous),
             "remote_complete" => Ok(Self::RemoteComplete),
+            "superseded" => Ok(Self::Superseded),
             _ => Err(Error::Unsupported(format!(
                 "unknown save snapshot state {value:?}"
             ))),

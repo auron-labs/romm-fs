@@ -91,6 +91,67 @@ fn confirmed_journal(dir: &Path, saves: &Path, target: &Path) -> (SaveSyncJourna
 }
 
 #[test]
+fn conflict_choices_retire_old_uploads_but_preserve_recovery_files() {
+    for use_remote in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let saves = dir.path().join("saves");
+        let target = saves.join("gb/Tetris.srm");
+        let (mut journal, mapping) = confirmed_journal(dir.path(), &saves, &target);
+        let first = journal
+            .observe_local_save_for_reconciliation(&mapping)
+            .unwrap();
+        let old = journal
+            .capture_snapshot(
+                &mapping,
+                first.generation,
+                first.content_hash.as_deref().unwrap(),
+            )
+            .unwrap();
+        fs::write(&target, b"reviewed local save").unwrap();
+        let current = journal
+            .observe_local_save_for_reconciliation(&mapping)
+            .unwrap();
+        let hash = current.content_hash.unwrap();
+        let ids = vec!["31".into()];
+        journal
+            .mark_reconciliation_attention_with_history(&mapping.rom_key, "review", &ids, "history")
+            .unwrap();
+        if use_remote {
+            let incoming = journal
+                .stage_incoming(&mapping, "31", b"remote save", "review", None, None, None)
+                .unwrap();
+            journal
+                .begin_incoming_publication(&incoming.id, &mapping)
+                .unwrap();
+            journal
+                .finish_incoming_publication_after_review(
+                    &incoming.id,
+                    &mapping,
+                    &ids,
+                    Some(&hash),
+                    "history",
+                )
+                .unwrap();
+        } else {
+            journal.keep_local_after_review(&mapping, &hash).unwrap();
+        }
+        drop(journal);
+        let journal = open(dir.path(), &saves);
+        let pending = journal.ready_snapshots().unwrap();
+        assert_eq!(pending.len(), usize::from(!use_remote));
+        assert!(pending.iter().all(|snapshot| snapshot.content_hash == hash));
+        let old_row = journal
+            .snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.revision == old.revision)
+            .unwrap();
+        assert_eq!(old_row.state, SnapshotState::Superseded);
+        assert_eq!(fs::read(old.path).unwrap(), b"initial SRAM");
+    }
+}
+
+#[test]
 fn confirmed_mapping_survives_restart_and_changed_target_needs_attention() {
     let dir = tempfile::tempdir().unwrap();
     let saves = dir.path().join("retrobat/saves");

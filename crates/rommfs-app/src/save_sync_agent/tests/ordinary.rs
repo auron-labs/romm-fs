@@ -176,7 +176,6 @@ fn reconcile(
         mapping: mapping.clone(),
         identity: identity(),
         scope: scope.clone(),
-        verify_reviewed_history: false,
     };
     let inventory = super::super::incoming_transfer::reconcile_attempt(
         client,

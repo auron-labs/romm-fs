@@ -383,7 +383,6 @@ fn reconciliation_job(case: &AgentCase) -> WorkerJob {
             scopes: vec!["assets.read".into(), "assets.write".into()],
         },
         scope: case.scope.clone(),
-        verify_reviewed_history: false,
     }))
 }
 

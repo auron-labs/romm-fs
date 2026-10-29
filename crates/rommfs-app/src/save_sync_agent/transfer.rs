@@ -226,6 +226,7 @@ pub(super) fn run_transfer_worker(
         match upload_attempt(
             &client,
             &retrying.job,
+            &mut incoming_cache,
             retrying.ambiguous,
             &enabled,
             &active,
@@ -396,6 +397,7 @@ enum UploadAttempt {
 fn upload_attempt(
     client: &RommClient,
     job: &TransferJob,
+    cache: &mut IncomingContentCache,
     already_ambiguous: bool,
     enabled: &SaveSyncEnablement,
     active: &Arc<AtomicBool>,
@@ -450,7 +452,7 @@ fn upload_attempt(
             return UploadAttempt::Attention(problem);
         }
         match verify_remote_bytes(client, remote, &job.snapshot.content_hash, enabled, active) {
-            Ok(true) => return post_upload_inventory(client, remote, job, enabled, active),
+            Ok(true) => return post_upload_inventory(client, remote, job, cache, enabled, active),
             Ok(false) => {
                 return UploadAttempt::Attention(format!(
                     "remote revision {} did not match its local SHA-256; review required",
@@ -461,7 +463,8 @@ fn upload_attempt(
         }
     }
 
-    if let Some(problem) = verify_existing_baseline(client, &inventory, job, enabled, active) {
+    if let Some(problem) = verify_existing_baseline(client, &inventory, job, cache, enabled, active)
+    {
         return problem;
     }
     if !is_active(enabled, active) {
@@ -542,7 +545,7 @@ fn upload_attempt(
         enabled,
         active,
     ) {
-        Ok(true) => post_upload_inventory(client, &response, job, enabled, active),
+        Ok(true) => post_upload_inventory(client, &response, job, cache, enabled, active),
         Ok(false) => UploadAttempt::Attention(format!(
             "remote read-back for revision {} did not match its local SHA-256",
             job.snapshot.revision
@@ -589,6 +592,7 @@ fn verify_existing_baseline(
     client: &RommClient,
     inventory: &[RemoteSave],
     job: &TransferJob,
+    cache: &mut IncomingContentCache,
     enabled: &SaveSyncEnablement,
     active: &AtomicBool,
 ) -> Option<UploadAttempt> {
@@ -605,10 +609,13 @@ fn verify_existing_baseline(
             )));
         }
         if let Some(problem) =
-            verify_reviewed_history(client, inventory, job, None, enabled, active)
+            verify_reviewed_history(client, inventory, job, None, cache, enabled, active)
         {
             return Some(problem);
         }
+    }
+    if job.conflict_resolution.as_deref() == Some("keep_local") {
+        return None;
     }
     let mut known_ids = HashSet::new();
     for record in &job.history {
@@ -698,7 +705,15 @@ fn verify_existing_baseline(
                     "save sync was disabled during baseline check".into(),
                 ));
             }
-            match verify_remote_bytes(client, remote, baseline_hash, enabled, active) {
+            match verify_cached_remote_bytes(
+                client,
+                remote,
+                baseline_hash,
+                job,
+                cache,
+                enabled,
+                active,
+            ) {
                 Ok(true) => None,
                 Ok(false) => Some(UploadAttempt::Attention(format!(
                     "remote baseline bytes changed for {}; local snapshot was preserved",
@@ -723,6 +738,7 @@ fn post_upload_inventory(
     client: &RommClient,
     uploaded: &RemoteSave,
     job: &TransferJob,
+    cache: &mut IncomingContentCache,
     enabled: &SaveSyncEnablement,
     active: &AtomicBool,
 ) -> UploadAttempt {
@@ -774,9 +790,15 @@ fn post_upload_inventory(
                 job.mapping.visible_rom_name
             ));
         }
-        if let Some(problem) =
-            verify_reviewed_history(client, &inventory, job, Some(uploaded.id), enabled, active)
-        {
+        if let Some(problem) = verify_reviewed_history(
+            client,
+            &inventory,
+            job,
+            Some(uploaded.id),
+            cache,
+            enabled,
+            active,
+        ) {
             return problem;
         }
     }
@@ -799,16 +821,22 @@ fn post_upload_inventory(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_reviewed_history(
     client: &RommClient,
     inventory: &[RemoteSave],
     job: &TransferJob,
     ignored_id: Option<i64>,
+    cache: &mut IncomingContentCache,
     enabled: &SaveSyncEnablement,
     active: &AtomicBool,
 ) -> Option<UploadAttempt> {
     let mut reviewed = HashMap::new();
-    for fingerprint in job.conflict_history_fingerprint.split(',') {
+    for fingerprint in job
+        .conflict_history_fingerprint
+        .split(',')
+        .filter(|entry| !entry.is_empty())
+    {
         let Some((metadata_fingerprint, content_hash)) = fingerprint.split_once('\t') else {
             return Some(UploadAttempt::Attention(
                 "stored save review history is invalid; review required".into(),
@@ -875,7 +903,8 @@ fn verify_reviewed_history(
         let Some(expected_hash) = expected_hash.filter(|hash| *hash != "-") else {
             continue;
         };
-        match verify_remote_bytes(client, remote, expected_hash, enabled, active) {
+        match verify_cached_remote_bytes(client, remote, expected_hash, job, cache, enabled, active)
+        {
             Ok(true) => {}
             Ok(false) => {
                 return Some(UploadAttempt::Attention(format!(
@@ -893,6 +922,29 @@ fn verify_reviewed_history(
         )));
     }
     None
+}
+
+fn verify_cached_remote_bytes(
+    client: &RommClient,
+    remote: &RemoteSave,
+    expected_hash: &str,
+    job: &TransferJob,
+    cache: &mut IncomingContentCache,
+    enabled: &SaveSyncEnablement,
+    active: &AtomicBool,
+) -> std::result::Result<bool, SaveApiFailure> {
+    cache.verify_hash(
+        client,
+        &IncomingJob {
+            mapping: job.mapping.clone(),
+            identity: job.identity.clone(),
+            scope: job.scope.clone(),
+        },
+        remote,
+        expected_hash,
+        enabled,
+        active,
+    )
 }
 
 fn verify_remote_bytes(

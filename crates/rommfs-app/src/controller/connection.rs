@@ -390,14 +390,14 @@ impl Worker {
             if self.startup_restoring {
                 if let Some(root) = &preferences.mount_root {
                     self.start_mount(&root.display().to_string());
+                } else {
+                    self.fail_mount(
+                        "automatic startup",
+                        "",
+                        &Error::Unsupported("no games folder configured".into()),
+                    );
                 }
                 self.startup_restoring = false;
-                if self.mount.is_some() {
-                    self.refresh_save_sync();
-                } else {
-                    self.log(Level::Warn,"startup","Automatic mount did not complete; save sync remains stopped. Open RomMFS to inspect the error.");
-                    self.sink.emit(AppEvent::StartupPreference { enabled:preferences.start_at_login,error:Some("The games folder did not start automatically. Start it before resuming save sync.".into()) });
-                }
             }
             Ok(())
         })();

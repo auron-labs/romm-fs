@@ -28,10 +28,31 @@ use rommfs_core::tree::RommTree;
 use rommfs_fixture::{contract, FixtureServer, ResponseSpec};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
-use std::os::windows::fs::MetadataExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+fn file_identity(path: &Path) -> (u32, u64) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_READ_ATTRIBUTES,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .open(path)
+        .unwrap();
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the live file handle and writable output buffer remain valid for the call.
+    assert_ne!(
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) },
+        0
+    );
+    (
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    )
+}
+
 /// Deterministic, nontrivial content: 64 KiB of a repeating ramp plus a
 /// recognizable header/footer so offset reads are verifiable.
 fn rom_bytes() -> Vec<u8> {
@@ -395,19 +416,10 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     assert_eq!(std::fs::read(&rom_path).unwrap(), bytes);
     assert_eq!(server.route_hit_count("GET", "/api/roms/"), 4);
 
-    let original_file_id = std::fs::metadata(&rom_path)
-        .unwrap()
-        .file_index()
-        .expect("NTFS file identity");
+    let original_file_id = file_identity(&rom_path);
     mount.stop();
     assert!(rom_path.exists(), "stop retains the projected ROM");
-    assert_eq!(
-        std::fs::metadata(&rom_path)
-            .unwrap()
-            .file_index()
-            .expect("NTFS file identity"),
-        original_file_id
-    );
+    assert_eq!(file_identity(&rom_path), original_file_id);
     assert!(gamelist.is_file(), "stop preserves frontend state");
     assert!(matches!(
         check_mount_root(&root, &server_id).unwrap(),
@@ -439,13 +451,7 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
         .unwrap()
         .contains("<playcount>7</playcount>"));
     assert_eq!(std::fs::read(&rom_path).unwrap(), bytes);
-    assert_eq!(
-        std::fs::metadata(&rom_path)
-            .unwrap()
-            .file_index()
-            .expect("NTFS file identity"),
-        original_file_id
-    );
+    assert_eq!(file_identity(&rom_path), original_file_id);
     assert_eq!(
         server.route_hit_count("GET", "/api/roms/"),
         4,
@@ -481,20 +487,14 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     let repaired_mount =
         WindowsMount::mount(Arc::clone(&fs), &root).expect("mount after link repair");
     assert_eq!(
-        std::fs::metadata(&rom_path)
-            .unwrap()
-            .file_index()
-            .expect("NTFS file identity"),
+        file_identity(&rom_path),
         original_file_id,
         "link repair preserves the retained ROM placeholder"
     );
     repaired_mount.stop();
 
     let unchanged_path = root.join("nes/Enumeration 0100.nes");
-    let unchanged_file_id = std::fs::metadata(&unchanged_path)
-        .unwrap()
-        .file_index()
-        .expect("NTFS file identity");
+    let unchanged_file_id = file_identity(&unchanged_path);
     let mut changed_catalogue = fs.catalogue().clone();
     let changed = changed_catalogue
         .entries
@@ -524,18 +524,12 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     ));
     let mount3 = WindowsMount::mount(changed_fs, &root).expect("mount changed catalogue");
     assert_eq!(
-        std::fs::metadata(&unchanged_path)
-            .unwrap()
-            .file_index()
-            .expect("NTFS file identity"),
+        file_identity(&unchanged_path),
         unchanged_file_id,
         "unchanged ROM keeps its file identity"
     );
     assert_ne!(
-        std::fs::metadata(&rom_path)
-            .unwrap()
-            .file_index()
-            .expect("NTFS file identity"),
+        file_identity(&rom_path),
         original_file_id,
         "changed ROM receives a new placeholder"
     );

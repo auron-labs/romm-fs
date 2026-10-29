@@ -35,6 +35,14 @@ fn retrobat_steps_unlock_in_order_with_one_primary() {
     assert_eq!(ui.retrobat_steps().link, StepStatus::Running);
     assert_eq!(ui.retrobat_steps().primary(), None);
 
+    ui.apply_event(&AppEvent::IntegrationUpdated {
+        mode: IntegrationMode::RetroBat,
+        retrobat_root: Some("C:\\RetroBat".into()),
+        setup_complete: true,
+        setup_migration: false,
+        setup_issues: Vec::new(),
+        error: None,
+    });
     ui.apply_event(&AppEvent::RetroBatSetup {
         running: false,
         detail: "linked".into(),
@@ -157,14 +165,14 @@ fn an_outdated_setup_record_is_a_migration_prompt_not_a_blocked_start() {
     assert!(!ui.retrobat_setup_ok);
     assert_eq!(ui.retrobat_steps().link, StepStatus::Ready);
 
-    // Running setup clears the prompt; the next verified event reports current.
+    // Completion alone cannot clear the prompt; inspection must verify the links.
     ui.apply_event(&AppEvent::RetroBatSetup {
         running: false,
         detail: "linked".into(),
         skipped: Vec::new(),
         error: None,
     });
-    assert!(ui.retrobat_setup_ok);
+    assert!(!ui.retrobat_setup_ok);
     ui.apply_event(&AppEvent::IntegrationUpdated {
         mode: IntegrationMode::RetroBat,
         retrobat_root: Some("C:\\RetroBat".into()),

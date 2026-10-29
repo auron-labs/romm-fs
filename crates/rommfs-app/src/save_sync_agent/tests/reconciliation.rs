@@ -396,3 +396,43 @@ fn tied_remote_history_requires_attention_without_publishing_either_save() {
         0
     );
 }
+
+#[test]
+fn unchanged_history_larger_than_memory_cache_does_not_redownload_payloads() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = FixtureServer::start();
+    fixture.use_romm_save_store(ACCOUNT_ID, 201);
+    for id in 1..=20 {
+        seed_remote(
+            &fixture,
+            id,
+            &uuid::Uuid::new_v4().to_string(),
+            SAVE_BYTES,
+            "2026-10-05T12:34:56Z",
+        );
+    }
+    let case = case(directory.path(), &fixture, false);
+    let (jobs, updates, active, worker, _) = start_reconciliation_worker(&fixture);
+    for _ in 0..3 {
+        jobs.send(reconciliation_job(&case)).unwrap();
+        let inventory = receive_inventory(&updates);
+        assert_eq!(inventory.saves.len(), 20);
+        for save in inventory.saves {
+            assert_eq!(save.content_hash, sha256_content_hash(SAVE_BYTES));
+            let bytes = save
+                .file
+                .map(|file| fs::read(file.path()).unwrap())
+                .unwrap_or(save.bytes);
+            assert_eq!(bytes, SAVE_BYTES);
+        }
+    }
+    for id in 1..=20 {
+        assert_eq!(
+            fixture.request_count("GET", &format!("/api/saves/{id}/content")),
+            1
+        );
+    }
+    active.store(false, std::sync::atomic::Ordering::SeqCst);
+    drop(jobs);
+    worker.join().unwrap();
+}
