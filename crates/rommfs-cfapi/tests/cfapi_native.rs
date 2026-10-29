@@ -480,9 +480,13 @@ fn cfapi_mount_lists_reads_once_and_stays_read_only() {
     let link = installation.join("roms/nes/RomM");
     std::fs::remove_dir(&link).unwrap();
     assert_eq!(setup_links().unwrap().linked, ["nes"]);
+    let norm = |p: &std::path::Path| {
+        let text = p.to_string_lossy().replace('\\', "/");
+        text.strip_prefix("//?/").unwrap_or(&text).to_owned()
+    };
     assert_eq!(
-        std::fs::read_link(&link).unwrap(),
-        root.join("nes").canonicalize().unwrap()
+        norm(&std::fs::read_link(&link).unwrap()),
+        norm(&root.join("nes").canonicalize().unwrap())
     );
     let repaired_mount =
         WindowsMount::mount(Arc::clone(&fs), &root).expect("mount after link repair");

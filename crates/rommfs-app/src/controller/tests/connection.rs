@@ -17,9 +17,13 @@ fn executable_reader_does_not_block_retrobat_setup() {
 
     let result = crate::retrobat_setup::setup(&install, &managed, "server").unwrap();
     assert!(result.skipped.is_empty());
+    let norm = |p: &std::path::Path| {
+        let text = p.to_string_lossy().replace('\\', "/");
+        text.strip_prefix("//?/").unwrap_or(&text).to_owned()
+    };
     assert_eq!(
-        std::fs::read_link(install.join("roms/gb/RomM")).unwrap(),
-        managed.join("gb")
+        norm(&std::fs::read_link(install.join("roms/gb/RomM")).unwrap()),
+        norm(&std::fs::canonicalize(&managed).unwrap().join("gb"))
     );
     assert_eq!(reader.metadata().unwrap().len(), b"fixture".len() as u64);
 }
@@ -57,6 +61,7 @@ fn application_owner_keeps_worker_alive_after_view_handle_drops_and_quit_joins_o
 use std::time::Duration;
 
 /// Publication runs off the worker loop, so tests poll it to completion.
+#[cfg(unix)]
 fn poll_metadata_until(worker: &mut Worker, done: impl Fn(&Worker) -> bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {

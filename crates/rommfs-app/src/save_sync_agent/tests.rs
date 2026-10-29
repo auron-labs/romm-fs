@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 use super::incoming_transfer::IncomingJob;
 use super::transfer::{run_transfer_worker, TransferUpdate, WorkerJob};
+#[path = "tests/cards.rs"]
+mod cards;
 #[path = "tests/exports.rs"]
 mod exports;
 #[path = "tests/incoming.rs"]

@@ -100,18 +100,15 @@ fn run(config: MemoryCardConfig, stop_rx: Receiver<()>, active: Arc<AtomicBool>,
             break;
         }
         // A shared card is written for a whole session, so the DuckStation and
-        // PCSX2 images must be closed. Exclusive handles are held for the pass;
-        // when the guard cannot be established nothing syncs and the reason is
-        // reported.
-        let (emulator_running, _guard, unavailable) =
-            match crate::controller::card_emulator_state(&config.scope.installation_root) {
-                crate::controller::CardEmulatorState::Stopped(guards) => {
-                    (false, Some(guards), None)
-                }
-                crate::controller::CardEmulatorState::Running => (true, None, None),
-                crate::controller::CardEmulatorState::Unavailable(reason) => {
-                    (true, None, Some(reason))
-                }
+        // PCSX2 images must be closed. The probe is transient — it reports a
+        // running emulator without keeping its image locked, so card sync can
+        // never block launching; individual card publications re-check the
+        // target file is not held open.
+        let (emulator_running, unavailable) =
+            match crate::controller::card_emulator_state_for_scope(&config.scope) {
+                crate::controller::CardEmulatorState::Stopped => (false, None),
+                crate::controller::CardEmulatorState::Running => (true, None),
+                crate::controller::CardEmulatorState::Unavailable(reason) => (true, Some(reason)),
             };
         let mut report = reconcile_once(&config, &journal, emulator_running, &active, &sink);
         if let Some(reason) = unavailable {
@@ -325,14 +322,22 @@ fn sync_local_card(
                         .id
                 }
             };
+            // Never snapshot a card another process holds open — the emulator
+            // may have launched mid-pass and be writing it right now.
+            if crate::controller::card_path_in_use(&path) {
+                return Ok(None);
+            }
             let mut archive = temp_archive(config)?;
             write_card_archive(&path, archive.as_file_mut())?;
+            // Windows temp files are created with share_mode(0): the upload
+            // re-opens by path, so the writer handle must be closed first.
+            let archive = archive.into_temp_path();
             let version = config
                 .client
                 .upload_memory_card_version(
                     card_id,
                     &format!("{}.card.zip", card.name),
-                    archive.path(),
+                    &archive,
                     active,
                 )
                 .map_err(|failure| failure.error)?;
@@ -370,7 +375,11 @@ fn sync_local_card(
                     &archive,
                 );
             }
-            extract_card_archive(archive.path(), &path, card.folder)?;
+            // Never overwrite a card another process holds open.
+            if crate::controller::card_path_in_use(&path) {
+                return Ok(None);
+            }
+            extract_card_archive(&archive, &path, card.folder)?;
             let new_hash = hash_local_card(&path)?;
             journal.record(
                 emulator,
@@ -394,7 +403,7 @@ fn sync_local_card(
                 if !active.load(Ordering::Acquire) {
                     return Ok(None);
                 }
-                extract_card_archive(archive.path(), &sibling, card.folder)?;
+                extract_card_archive(&archive, &sibling, card.folder)?;
             }
             journal.record_failure(emulator, &card.name, &relative, CONFLICT_REASON)?;
             Ok(Some(MemoryCardConflictStatus {
@@ -438,7 +447,7 @@ fn restore_remote_card(
     if !active.load(Ordering::Acquire) {
         return Ok(None);
     }
-    let restore = remote_card_restore_target(archive.path(), folder.emulator, &remote.name)?;
+    let restore = remote_card_restore_target(&archive, folder.emulator, &remote.name)?;
     let path = config
         .scope
         .effective_saves_root
@@ -458,7 +467,7 @@ fn restore_remote_card(
             &archive,
         );
     }
-    extract_card_archive(archive.path(), &path, restore.folder)?;
+    extract_card_archive(&archive, &path, restore.folder)?;
     let new_hash = hash_local_card(&path)?;
     journal.record(
         emulator,
@@ -485,7 +494,7 @@ fn preserve_conflict(
     path: &Path,
     folder_card: bool,
     version: &MemoryCardVersion,
-    archive: &tempfile::NamedTempFile,
+    archive: &tempfile::TempPath,
 ) -> Result<Option<MemoryCardConflictStatus>> {
     // A folder card's name is its whole folder name; a file card drops only its
     // final extension. `file_stem` would truncate a dotted folder name.
@@ -503,7 +512,7 @@ fn preserve_conflict(
     let relative = portable(path.strip_prefix(saves_root).unwrap_or(path));
     let sibling = conflict_sibling(path, folder_card, version.id)?;
     if !sibling.exists() {
-        extract_card_archive(archive.path(), &sibling, folder_card)?;
+        extract_card_archive(archive, &sibling, folder_card)?;
     }
     journal.record_failure(
         folder.emulator.name(),
@@ -553,7 +562,7 @@ fn download_archive(
     config: &MemoryCardConfig,
     version: &MemoryCardVersion,
     active: &Arc<AtomicBool>,
-) -> Result<tempfile::NamedTempFile> {
+) -> Result<tempfile::TempPath> {
     let mut archive = temp_archive(config)?;
     {
         let mut file = archive.as_file_mut();
@@ -567,7 +576,9 @@ fn download_archive(
             )
             .map_err(|failure| failure.error)?;
     }
-    Ok(archive)
+    // Close the handle: Windows temp files carry share_mode(0), and every
+    // consumer below re-opens the archive by path.
+    Ok(archive.into_temp_path())
 }
 
 fn temp_archive(config: &MemoryCardConfig) -> Result<tempfile::NamedTempFile> {

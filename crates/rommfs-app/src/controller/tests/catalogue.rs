@@ -733,3 +733,50 @@ fn connected_session_catalogue_poll_fires_only_when_due() {
     worker.poll_catalogue_refresh_timer();
     assert!(worker.refresh_result.is_none(), "polled while disconnected");
 }
+
+#[test]
+fn hydration_names_use_the_api_content_name_for_folder_roms() {
+    use rommfs_fixture::contract;
+    // A folder-layout ROM: the projected tree path carries the folder prefix,
+    // while the content URL needs the API file_name alone.
+    let rom = serde_json::json!({
+        "id": 7,
+        "platform_fs_slug": "gb",
+        "platform_slug": "gb",
+        "fs_name": "foldertest",
+        "fs_path": "roms/gb",
+        "fs_size_bytes": 39,
+        "has_simple_single_file": false,
+        "has_nested_single_file": false,
+        "has_multiple_files": true,
+        "missing_from_fs": false,
+        "is_physical": true,
+        "updated_at": "2026-10-01T00:00:00",
+        "files": [{
+            "id": 700,
+            "file_name": "foldertest.gb",
+            "file_path": "roms/gb/foldertest",
+            "file_size_bytes": 39,
+            "last_modified": "2026-10-01T00:00:00",
+            "crc_hash": null,
+            "md5_hash": null,
+            "sha1_hash": null,
+            "is_top_level": false,
+        }],
+    });
+    let snapshot = CatalogueSnapshot {
+        platforms: serde_json::from_str(&contract::platforms(&[(1, "gb", "gb", "Game Boy")]))
+            .unwrap(),
+        roms: vec![serde_json::from_value(rom).unwrap()],
+        refreshed_at: 0,
+        full_refreshed_at: 0,
+    };
+    let (sink, _events) = rommfs_core::events::channel();
+    let mut worker = Worker::new(sink);
+    worker.server_id = Some("s".into());
+    worker.store_catalogue(worker.project_snapshot(&snapshot).unwrap());
+    let entry = worker.catalogue.as_ref().unwrap().entries.first().unwrap();
+    assert_eq!(entry.file_name, "foldertest/foldertest.gb");
+    assert_eq!(entry.content_name, "foldertest.gb");
+    assert_eq!(worker.names.get(&entry.key).unwrap(), "foldertest.gb");
+}
