@@ -1214,12 +1214,12 @@ fn running_frontend(installation: &Path) -> anyhow::Result<Option<PathBuf>> {
 
 /// Whether a PS1/PS2 card emulator image is clear to touch a card.
 pub(crate) enum CardEmulatorState {
-    /// Exclusive handles are held for the pass.
-    Stopped(Vec<std::fs::File>),
+    /// No emulator image was locked at probe time.
+    Stopped,
     /// An emulator image is open, so a shared card may be in use.
     #[cfg_attr(not(windows), allow(dead_code))]
     Running,
-    /// The guard could not be established; the caller must not sync.
+    /// The probe could not be established; the caller must not sync.
     Unavailable(String),
 }
 
@@ -1236,12 +1236,11 @@ pub(crate) fn card_emulator_state_for_scope(scope: &SaveSyncScope) -> CardEmulat
     if let Some(parent) = scope.installation_root.parent() {
         roots.push(parent.to_path_buf());
     }
-    let mut guards = Vec::new();
     let mut unavailable = None;
     for root in roots {
         match card_emulator_state(&root) {
             CardEmulatorState::Running => return CardEmulatorState::Running,
-            CardEmulatorState::Stopped(found) => guards.extend(found),
+            CardEmulatorState::Stopped => {}
             CardEmulatorState::Unavailable(reason) => {
                 unavailable.get_or_insert(reason);
             }
@@ -1249,7 +1248,45 @@ pub(crate) fn card_emulator_state_for_scope(scope: &SaveSyncScope) -> CardEmulat
     }
     match unavailable {
         Some(reason) => CardEmulatorState::Unavailable(reason),
-        None => CardEmulatorState::Stopped(guards),
+        None => CardEmulatorState::Stopped,
+    }
+}
+
+/// Whether a card file (or every file inside a folder card) is held open by
+/// another process. The probe opens exclusively and releases immediately, so
+/// it never blocks the owner or a launching emulator.
+pub(crate) fn card_path_in_use(path: &Path) -> bool {
+    if std::fs::symlink_metadata(path).is_err() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let files: Vec<PathBuf> = if path.is_dir() {
+            match std::fs::read_dir(path) {
+                Ok(entries) => entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|p| p.is_file())
+                    .collect(),
+                Err(_) => return true,
+            }
+        } else {
+            vec![path.to_path_buf()]
+        };
+        return files.iter().any(|file| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(file)
+                .is_err()
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
     }
 }
 
@@ -1260,6 +1297,8 @@ pub(crate) fn card_emulator_state(installation: &Path) -> CardEmulatorState {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
+        // Probe only: a locked image reports Running, but handles are released
+        // immediately so card sync never blocks the emulator from launching.
         let mut guards = Vec::new();
         for emulator in ["duckstation", "pcsx2"] {
             let directory = installation.join("emulators").join(emulator);
@@ -1307,11 +1346,12 @@ pub(crate) fn card_emulator_state(installation: &Path) -> CardEmulatorState {
                 }
             }
         }
-        CardEmulatorState::Stopped(guards)
+        drop(guards);
+        CardEmulatorState::Stopped
     }
     #[cfg(not(windows))]
     {
-        CardEmulatorState::Stopped(Vec::new())
+        CardEmulatorState::Stopped
     }
 }
 

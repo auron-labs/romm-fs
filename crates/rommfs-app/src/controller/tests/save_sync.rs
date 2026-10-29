@@ -586,6 +586,15 @@ fn a_saves_folder_scope_holds_the_card_gate_at_its_parent_install() {
     drop(_held);
     assert!(matches!(
         card_emulator_state_for_scope(&scope),
-        CardEmulatorState::Stopped(_)
+        CardEmulatorState::Stopped
     ));
+
+    // The probe must not keep the image locked: an emulator has to be able to
+    // launch while card sync is enabled and idle.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(&exe)
+        .expect("emulator image must stay launchable while sync is idle");
 }

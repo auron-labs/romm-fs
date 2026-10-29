@@ -100,18 +100,15 @@ fn run(config: MemoryCardConfig, stop_rx: Receiver<()>, active: Arc<AtomicBool>,
             break;
         }
         // A shared card is written for a whole session, so the DuckStation and
-        // PCSX2 images must be closed. Exclusive handles are held for the pass;
-        // when the guard cannot be established nothing syncs and the reason is
-        // reported.
-        let (emulator_running, _guard, unavailable) =
+        // PCSX2 images must be closed. The probe is transient — it reports a
+        // running emulator without keeping its image locked, so card sync can
+        // never block launching; individual card publications re-check the
+        // target file is not held open.
+        let (emulator_running, unavailable) =
             match crate::controller::card_emulator_state_for_scope(&config.scope) {
-                crate::controller::CardEmulatorState::Stopped(guards) => {
-                    (false, Some(guards), None)
-                }
-                crate::controller::CardEmulatorState::Running => (true, None, None),
-                crate::controller::CardEmulatorState::Unavailable(reason) => {
-                    (true, None, Some(reason))
-                }
+                crate::controller::CardEmulatorState::Stopped => (false, None),
+                crate::controller::CardEmulatorState::Running => (true, None),
+                crate::controller::CardEmulatorState::Unavailable(reason) => (true, Some(reason)),
             };
         let mut report = reconcile_once(&config, &journal, emulator_running, &active, &sink);
         if let Some(reason) = unavailable {
@@ -325,6 +322,11 @@ fn sync_local_card(
                         .id
                 }
             };
+            // Never snapshot a card another process holds open — the emulator
+            // may have launched mid-pass and be writing it right now.
+            if crate::controller::card_path_in_use(&path) {
+                return Ok(None);
+            }
             let mut archive = temp_archive(config)?;
             write_card_archive(&path, archive.as_file_mut())?;
             // Windows temp files are created with share_mode(0): the upload
@@ -372,6 +374,10 @@ fn sync_local_card(
                     version,
                     &archive,
                 );
+            }
+            // Never overwrite a card another process holds open.
+            if crate::controller::card_path_in_use(&path) {
+                return Ok(None);
             }
             extract_card_archive(&archive, &path, card.folder)?;
             let new_hash = hash_local_card(&path)?;
