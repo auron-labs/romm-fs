@@ -247,7 +247,9 @@ impl Worker {
         self.names = cat
             .entries
             .iter()
-            .map(|e| (e.key.clone(), e.file_name.clone()))
+            // content_name is the API-side name; the projected file_name may
+            // carry a folder prefix for multi-file ROMs and would 404 here.
+            .map(|e| (e.key.clone(), e.content_name.clone()))
             .collect();
         self.catalogue = Some(cat);
     }

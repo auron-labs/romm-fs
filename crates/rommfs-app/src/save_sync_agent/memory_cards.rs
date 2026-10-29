@@ -327,12 +327,15 @@ fn sync_local_card(
             };
             let mut archive = temp_archive(config)?;
             write_card_archive(&path, archive.as_file_mut())?;
+            // Windows temp files are created with share_mode(0): the upload
+            // re-opens by path, so the writer handle must be closed first.
+            let archive = archive.into_temp_path();
             let version = config
                 .client
                 .upload_memory_card_version(
                     card_id,
                     &format!("{}.card.zip", card.name),
-                    archive.path(),
+                    &archive,
                     active,
                 )
                 .map_err(|failure| failure.error)?;
@@ -370,7 +373,7 @@ fn sync_local_card(
                     &archive,
                 );
             }
-            extract_card_archive(archive.path(), &path, card.folder)?;
+            extract_card_archive(&archive, &path, card.folder)?;
             let new_hash = hash_local_card(&path)?;
             journal.record(
                 emulator,
@@ -394,7 +397,7 @@ fn sync_local_card(
                 if !active.load(Ordering::Acquire) {
                     return Ok(None);
                 }
-                extract_card_archive(archive.path(), &sibling, card.folder)?;
+                extract_card_archive(&archive, &sibling, card.folder)?;
             }
             journal.record_failure(emulator, &card.name, &relative, CONFLICT_REASON)?;
             Ok(Some(MemoryCardConflictStatus {
@@ -438,7 +441,7 @@ fn restore_remote_card(
     if !active.load(Ordering::Acquire) {
         return Ok(None);
     }
-    let restore = remote_card_restore_target(archive.path(), folder.emulator, &remote.name)?;
+    let restore = remote_card_restore_target(&archive, folder.emulator, &remote.name)?;
     let path = config
         .scope
         .effective_saves_root
@@ -458,7 +461,7 @@ fn restore_remote_card(
             &archive,
         );
     }
-    extract_card_archive(archive.path(), &path, restore.folder)?;
+    extract_card_archive(&archive, &path, restore.folder)?;
     let new_hash = hash_local_card(&path)?;
     journal.record(
         emulator,
@@ -485,7 +488,7 @@ fn preserve_conflict(
     path: &Path,
     folder_card: bool,
     version: &MemoryCardVersion,
-    archive: &tempfile::NamedTempFile,
+    archive: &tempfile::TempPath,
 ) -> Result<Option<MemoryCardConflictStatus>> {
     // A folder card's name is its whole folder name; a file card drops only its
     // final extension. `file_stem` would truncate a dotted folder name.
@@ -503,7 +506,7 @@ fn preserve_conflict(
     let relative = portable(path.strip_prefix(saves_root).unwrap_or(path));
     let sibling = conflict_sibling(path, folder_card, version.id)?;
     if !sibling.exists() {
-        extract_card_archive(archive.path(), &sibling, folder_card)?;
+        extract_card_archive(archive, &sibling, folder_card)?;
     }
     journal.record_failure(
         folder.emulator.name(),
@@ -553,7 +556,7 @@ fn download_archive(
     config: &MemoryCardConfig,
     version: &MemoryCardVersion,
     active: &Arc<AtomicBool>,
-) -> Result<tempfile::NamedTempFile> {
+) -> Result<tempfile::TempPath> {
     let mut archive = temp_archive(config)?;
     {
         let mut file = archive.as_file_mut();
@@ -567,7 +570,9 @@ fn download_archive(
             )
             .map_err(|failure| failure.error)?;
     }
-    Ok(archive)
+    // Close the handle: Windows temp files carry share_mode(0), and every
+    // consumer below re-opens the archive by path.
+    Ok(archive.into_temp_path())
 }
 
 fn temp_archive(config: &MemoryCardConfig) -> Result<tempfile::NamedTempFile> {
