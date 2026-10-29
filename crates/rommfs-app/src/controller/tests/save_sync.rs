@@ -549,3 +549,43 @@ fn disable_during_connect_prevents_the_older_scope_refresh_from_starting_sync() 
     let settings = SaveSyncSettingsStore::open(settings_dir.join("save-sync.db")).unwrap();
     assert!(!settings.load_files(&scope).unwrap().enabled);
 }
+
+#[test]
+#[cfg(windows)]
+fn a_saves_folder_scope_holds_the_card_gate_at_its_parent_install() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("install");
+    let saves = install.join("saves");
+    let emulator = install.join("emulators").join("duckstation");
+    std::fs::create_dir_all(&emulator).unwrap();
+    let exe = emulator.join("duckstation.exe");
+    std::fs::write(&exe, b"stub").unwrap();
+    std::fs::create_dir_all(&saves).unwrap();
+
+    // The card gate fails closed while the emulator image is locked.
+    let _held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(&exe)
+        .unwrap();
+    let scope = SaveSyncScope {
+        server_id: "https://romm.example".into(),
+        account_id: "1".into(),
+        installation_root: saves.clone(),
+        effective_saves_root: saves,
+    };
+    assert!(matches!(
+        card_emulator_state_for_scope(&scope),
+        CardEmulatorState::Running
+    ));
+
+    // And it clears once the emulator releases the image.
+    drop(_held);
+    assert!(matches!(
+        card_emulator_state_for_scope(&scope),
+        CardEmulatorState::Stopped(_)
+    ));
+}

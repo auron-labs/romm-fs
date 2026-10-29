@@ -1050,15 +1050,13 @@ pub fn run() {
                         ..Default::default()
                     }),
                     show: {
-                        #[cfg(windows)]
-                        {
-                            !startup || tray.is_none()
-                        }
                         #[cfg(not(windows))]
-                        {
-                            let _ = startup;
-                            true
-                        }
+                        let _ = startup;
+                        // Never create the window hidden: children measured on
+                        // first layout (the sidebar's virtualised menu list)
+                        // stay empty if the first frame runs while hidden, so
+                        // --startup hides the window after one real frame.
+                        true
                     },
                     ..Default::default()
                 },
@@ -1075,6 +1073,9 @@ pub fn run() {
                             _ => panic!("Windows window has no HWND"),
                         };
                         crate::desktop::tray::set_window_icon(hwnd);
+                        if startup && tray.is_some() {
+                            window.on_next_frame(move |_, _| crate::desktop::tray::hide(hwnd));
+                        }
                         if tray.is_some() {
                             window.on_window_should_close(cx, move |_, _| {
                                 crate::desktop::tray::hide(hwnd);

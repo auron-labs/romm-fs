@@ -1227,6 +1227,32 @@ pub(crate) enum CardEmulatorState {
 /// guessing executable names, every executable inside each installed emulator
 /// folder is opened exclusively; an installed folder with no executable yields
 /// [`CardEmulatorState::Unavailable`], never a silent pass.
+///
+/// A saves-folder scope records its `installation_root` as the saves folder
+/// itself (`<install>\saves`), so the emulator folders sit at the parent —
+/// probe both.
+pub(crate) fn card_emulator_state_for_scope(scope: &SaveSyncScope) -> CardEmulatorState {
+    let mut roots = vec![scope.installation_root.clone()];
+    if let Some(parent) = scope.installation_root.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    let mut guards = Vec::new();
+    let mut unavailable = None;
+    for root in roots {
+        match card_emulator_state(&root) {
+            CardEmulatorState::Running => return CardEmulatorState::Running,
+            CardEmulatorState::Stopped(found) => guards.extend(found),
+            CardEmulatorState::Unavailable(reason) => {
+                unavailable.get_or_insert(reason);
+            }
+        }
+    }
+    match unavailable {
+        Some(reason) => CardEmulatorState::Unavailable(reason),
+        None => CardEmulatorState::Stopped(guards),
+    }
+}
+
 pub(crate) fn card_emulator_state(installation: &Path) -> CardEmulatorState {
     if let Err(error) = rommfs_core::save_sync::ensure_no_reparse_components(installation) {
         return CardEmulatorState::Unavailable(error.to_string());

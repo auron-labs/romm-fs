@@ -104,7 +104,7 @@ fn run(config: MemoryCardConfig, stop_rx: Receiver<()>, active: Arc<AtomicBool>,
         // when the guard cannot be established nothing syncs and the reason is
         // reported.
         let (emulator_running, _guard, unavailable) =
-            match crate::controller::card_emulator_state(&config.scope.installation_root) {
+            match crate::controller::card_emulator_state_for_scope(&config.scope) {
                 crate::controller::CardEmulatorState::Stopped(guards) => {
                     (false, Some(guards), None)
                 }
