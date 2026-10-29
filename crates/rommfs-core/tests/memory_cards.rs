@@ -4,11 +4,13 @@
 
 use rommfs_core::catalogue::build_catalogue;
 use rommfs_core::romm::RommClient;
+#[cfg(unix)]
+use rommfs_core::save_sync::read_local_card_hash;
 use rommfs_core::save_sync::{
     conflict_sibling, discover_card_folders, extract_card_archive, hash_local_card,
-    plan_card_action, read_local_card_hash, remote_card_restore_target, write_card_archive,
-    CardBaseline, CardDecision, MemoryCardEmulator, RemoteCardVersion, SaveFileRules,
-    SaveSyncScope, SaveSyncSettingsStore, MEMORY_CARD_MAX_BYTES,
+    plan_card_action, remote_card_restore_target, write_card_archive, CardBaseline, CardDecision,
+    MemoryCardEmulator, RemoteCardVersion, SaveFileRules, SaveSyncScope, SaveSyncSettingsStore,
+    MEMORY_CARD_MAX_BYTES,
 };
 use rommfs_fixture::FixtureServer;
 use std::collections::BTreeMap;

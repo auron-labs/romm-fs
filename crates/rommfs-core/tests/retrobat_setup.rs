@@ -1,8 +1,6 @@
-use rommfs_core::retrobat::{
-    configure_switch_saves, setup_roms_link, setup_roms_link_with_root_guard, switch_save_setting,
-};
+use rommfs_core::retrobat::{configure_switch_saves, setup_roms_link, switch_save_setting};
 #[cfg(unix)]
-use rommfs_core::retrobat::{verify_setup_link, ROMM_FOLDER};
+use rommfs_core::retrobat::{setup_roms_link_with_root_guard, verify_setup_link, ROMM_FOLDER};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +27,7 @@ fn installation(parent: &Path) -> (PathBuf, PathBuf) {
     (install, managed)
 }
 
+#[cfg(unix)]
 const STOCK_SYSTEMS: &str = "<systemList>\
 <system><name>gb</name><path>~/../roms/gb</path><extension>.gb</extension></system>\
 <system><name>snes</name><path>~/../roms/snes</path><extension>.sfc</extension></system>\
@@ -39,6 +38,7 @@ const STOCK_SYSTEMS: &str = "<systemList>\
 
 /// Compact subset of a pristine RetroBat 8.3.0 `roms` tree (see the
 /// clean-machine file listing): singe, ports and halflife ship content.
+#[cfg(unix)]
 fn write_stock_roms(install: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     fs::write(
         install.join("emulationstation/.emulationstation/es_systems.cfg"),
@@ -72,6 +72,7 @@ fn write_stock_roms(install: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 }
 
 /// Every stock file, byte for byte, plus the folders that held them.
+#[cfg(unix)]
 fn assert_untouched(existing: &[(PathBuf, Vec<u8>)]) {
     for (path, bytes) in existing {
         assert_eq!(&fs::read(path).unwrap(), bytes, "{}", path.display());
@@ -298,10 +299,6 @@ fn backend_root_guard_can_hold_a_managed_reparse_while_default_setup_stays_stric
 #[cfg(unix)]
 fn path_is_link(path: &Path) -> bool {
     fs::symlink_metadata(path).unwrap().file_type().is_symlink()
-}
-#[cfg(not(unix))]
-fn path_is_link(path: &Path) -> bool {
-    rommfs_core::save_sync::path_is_reparse_point(&fs::symlink_metadata(path).unwrap())
 }
 
 #[cfg(unix)]
